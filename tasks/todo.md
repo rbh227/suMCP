@@ -16,7 +16,7 @@ Source of truth for detail: `tasks/plan.md`. Check items off as they land.
 - [~] CHECKPOINT B — parse gate: fixture parses clean + deterministic + unknown types counted. ccusage cross-check still TODO (ccusage reads ~/.claude, not arbitrary fixtures; verify on a live local session)
 
 ## Phase 3 — Signals
-- [ ] T3.1 Edit-shape signals (churn, rework, thrash, large writes, blind-write attempts)
+- [x] T3.1 Edit-shape signals: churn, rework (patch-hunk overlap), re-read thrash, blind-write attempts. Finding/Tier/Confidence types added; ingest now joins tool_result error text + structuredPatch hunks back to actions. Fires on real donor with evidence. (large single-shot writes moved to T3.4 where it pairs with approval latency → large_write_instant_accept, staying within the frozen payload enum)
 - [ ] T3.2 Failure signals (error rates, validation share, attribution chain, failure chains)
 - [ ] T3.3 Dynamics signals (revert/flip/user_corrected, opening move, interruptions, loops)
 - [ ] T3.4 Comprehension signals (approval latency, large-write-instant-accept)

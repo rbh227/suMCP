@@ -13,8 +13,7 @@ fn fixture(name: &str) -> String {
     let path: PathBuf = [env!("CARGO_MANIFEST_DIR"), "..", "..", "fixtures", name]
         .iter()
         .collect();
-    std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 
 #[test]
@@ -45,4 +44,18 @@ fn edge_cases_bad_line_is_counted_not_fatal() {
     let s = ingest_str(&fixture("edge-cases.jsonl"), Lane::Main);
     assert_eq!(s.parse_errors, 1, "the one non-JSON line is counted");
     assert!(!s.actions.is_empty(), "the good lines still parse");
+}
+
+#[test]
+fn edit_shape_signals_fire_on_the_real_donor() {
+    use sumcp_core::signals::edit_shape;
+    let s = ingest_str(&fixture("session-2_1_210-subagents.jsonl"), Lane::Main);
+    let findings = edit_shape(&s);
+    // A real 1682-line session should surface at least some struggle.
+    assert!(
+        !findings.is_empty(),
+        "edit-shape signals should fire on a real working session"
+    );
+    // Every finding must carry evidence — the honesty invariant.
+    assert!(findings.iter().all(|f| !f.idxs.is_empty()));
 }

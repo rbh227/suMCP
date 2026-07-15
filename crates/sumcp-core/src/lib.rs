@@ -10,6 +10,7 @@ pub mod ingest;
 pub mod locate;
 pub mod model;
 pub mod report;
+pub mod signals;
 
 use std::path::Path;
 

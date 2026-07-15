@@ -86,6 +86,12 @@ pub struct Action {
     pub file_path: Option<String>,
     /// Whether the tool result was an error (`is_error: true`), if known.
     pub is_error: Option<bool>,
+    /// Size in chars of a Write/Edit's new content, if known (large-write signal).
+    pub write_len: Option<usize>,
+    /// Error text from the tool result, if it errored (drives fumble detection).
+    pub error: Option<String>,
+    /// Edited line ranges `(start, end)` from `structuredPatch` (rework signal).
+    pub hunks: Vec<(u32, u32)>,
 }
 
 /// Token accounting, summed once per `message.id` (dedup layer a).
@@ -113,6 +119,73 @@ impl Tokens {
             Some(self.cache_read as f64 / denom as f64)
         }
     }
+}
+
+/// Field-reliability tier (metrics-spec parser rules): T1 stable, T2 needs
+/// edge handling, T3 unstable. Every finding declares the tier of the data it
+/// rests on, so a schema break is triaged by blast radius.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Tier {
+    /// Stable fields.
+    #[serde(rename = "T1")]
+    T1,
+    /// Fields needing edge handling.
+    #[serde(rename = "T2")]
+    T2,
+    /// Unstable/undocumented fields.
+    #[serde(rename = "T3")]
+    T3,
+}
+
+/// Confidence in a finding; low-confidence findings count ×0.5 in ranking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Confidence {
+    /// Directly evidenced.
+    High,
+    /// Reasonable inference.
+    Medium,
+    /// Weak attribution.
+    Low,
+}
+
+/// The kind of finding — serializes to the exact strings in the payload enum
+/// (`docs/payload-schema.md`), so Rust output matches the frozen contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FindingKind {
+    /// Repeat edits to one file.
+    Churn,
+    /// A later edit overlapping an earlier edit's lines.
+    Rework,
+    /// A file re-read many times.
+    Thrash,
+    /// An edit attempted before the file was read (harness-blocked).
+    BlindWriteAttempt,
+}
+
+/// One evidence-backed observation about the session.
+///
+/// Every finding carries the action `idxs` proving it — the honesty invariant.
+/// `note` explains heuristics; `file` scopes file-level findings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Finding {
+    /// What was observed.
+    pub kind: FindingKind,
+    /// Reliability tier of the underlying fields.
+    pub tier: Tier,
+    /// True = deterministic count; false = heuristic (requires a `note`).
+    pub exact: bool,
+    /// Confidence in the finding.
+    pub confidence: Confidence,
+    /// Action indices proving it (dereferenceable via `evidence()`).
+    pub idxs: Vec<Idx>,
+    /// The file this finding is about, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    /// Human-readable explanation (required when `exact` is false).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 /// A fully parsed session: ordered actions plus parse-health counters.
