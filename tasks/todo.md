@@ -9,7 +9,7 @@ Source of truth for detail: `tasks/plan.md`. Check items off as they land.
 
 ## Phase 1 — Foundation
 - [x] T1.1 rustup + workspace scaffold (Rust 1.97; core/cli/mcp crates; fmt/clippy/test green; rmcp deferred to T4.1 to avoid pre-1.0 churn)
-- [ ] T1.2 `scripts/sanitize.py` + fixture corpus (2.1.56, 2.1.183, subagents, streaming dups, edge-case)
+- [x] T1.2 `scripts/sanitize.py` (default-deny, scrubs keys+values) + fixtures (sanitized 2.1.210 donor, edge-cases); `check_sanitizer.py` canary test. NOTE: only 2.1.210 + edge fixtures so far (no local 2.1.56/183 donor); subagent child files unrecoverable (donor cwd was remote /media)
 
 ## Phase 2 — First vertical slice
 - [ ] T2.1 locate + ingest + model + session_overview + bare `sumcp` CLI

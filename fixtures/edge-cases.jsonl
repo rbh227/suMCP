@@ -1,0 +1,8 @@
+{"type":"user","uuid":"e1","parentUuid":null,"sessionId":"edge","timestamp":"2026-07-01T00:00:00Z","message":{"role":"user","content":"start"}}
+not valid json at all — parser must count this, not die
+{"type":"assistant","uuid":"e2","parentUuid":"e1","sessionId":"edge","requestId":"r1","timestamp":"2026-07-01T00:00:01Z","message":{"id":"m1","role":"assistant","usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"tool_use","id":"tu1","name":"Read","input":{"file_path":"/work/proj/a.ts"}}]}}
+{"type":"assistant","uuid":"e2","parentUuid":"e1","sessionId":"edge","requestId":"r1","timestamp":"2026-07-01T00:00:01Z","message":{"id":"m1","role":"assistant","usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"tool_use","id":"tu1","name":"Read","input":{"file_path":"/work/proj/a.ts"}}]}}
+{"type":"totally-unknown-future-type","uuid":"e3","timestamp":"2026-07-01T00:00:02Z","nested":{"unknown":{"deep":true}}}
+{"type":"permission-mode","mode":"acceptEdits","sessionId":"edge"}
+{"type":"user","uuid":"e4","parentUuid":"e2","sessionId":"edge","timestamp":"2026-07-01T00:00:02Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu1","is_error":false,"content":"file contents"}]}}
+{"type":"assistant","uuid":"e5","parentUuid":"e4","sessionId":"edge","timestamp":"2026-07-01T00:00:02Z","message":{"id":"m2","role":"assistant","content":[{"type":"tool_use","id":"tu2","name":"Edit","input":{"file_path":"/work/proj/b.ts","old_string":"x","new_string":"y"}}]}}
