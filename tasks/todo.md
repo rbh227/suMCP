@@ -12,8 +12,8 @@ Source of truth for detail: `tasks/plan.md`. Check items off as they land.
 - [x] T1.2 `scripts/sanitize.py` (default-deny, scrubs keys+values) + fixtures (sanitized 2.1.210 donor, edge-cases); `check_sanitizer.py` canary test. NOTE: only 2.1.210 + edge fixtures so far (no local 2.1.56/183 donor); subagent child files unrecoverable (donor cwd was remote /media)
 
 ## Phase 2 — First vertical slice
-- [ ] T2.1 locate + ingest + model + session_overview + bare `sumcp` CLI
-- [ ] CHECKPOINT B — parse gate: token totals match ccusage ±few % on all fixtures + one live session
+- [x] T2.1 locate + ingest + model + overview + `sumcp --file` CLI (14 tests; runs on real fixture: 258 actions, 97% cache hit, 337 untimestamped handled; deterministic across runs). Deferred within T2.1: is_error wiring to tool_result, external-file-ref following, full A9 resource caps (next tasks)
+- [~] CHECKPOINT B — parse gate: fixture parses clean + deterministic + unknown types counted. ccusage cross-check still TODO (ccusage reads ~/.claude, not arbitrary fixtures; verify on a live local session)
 
 ## Phase 3 — Signals
 - [ ] T3.1 Edit-shape signals (churn, rework, thrash, large writes, blind-write attempts)
