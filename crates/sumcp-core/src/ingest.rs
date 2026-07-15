@@ -37,6 +37,7 @@ pub fn ingest_str(raw: &str, default_lane: Lane) -> Session {
     let mut pending: Vec<PendingAction> = Vec::new();
     let mut user_texts: Vec<UserText> = Vec::new();
     let mut interrupts = 0u64;
+    let mut auto_accept = false;
     // tool_use id -> the result that came back for it (error text, patch hunks).
     let mut results: HashMap<String, ResultInfo> = HashMap::new();
 
@@ -54,6 +55,15 @@ pub fn ingest_str(raw: &str, default_lane: Lane) -> Session {
 
         if let Some(t) = v.get("type").and_then(Value::as_str) {
             *type_counts.entry(t.to_string()).or_insert(0) += 1;
+        }
+
+        // Auto-accept permission modes make approval latency meaningless.
+        let mode = v
+            .get("permissionMode")
+            .or_else(|| v.get("mode"))
+            .and_then(Value::as_str);
+        if matches!(mode, Some("acceptEdits") | Some("bypassPermissions")) {
+            auto_accept = true;
         }
 
         // effective timestamp: own, else carry forward the last one we saw.
@@ -186,6 +196,7 @@ pub fn ingest_str(raw: &str, default_lane: Lane) -> Session {
                                     error,
                                     hunks,
                                     user_modified,
+                                    result_ts: effective_ts.clone(),
                                 },
                             );
                         }
@@ -207,6 +218,13 @@ pub fn ingest_str(raw: &str, default_lane: Lane) -> Session {
         .map(|(i, p)| {
             // Join in the result that came back for this tool call, if any.
             let r = p.tool_use_id.as_deref().and_then(|id| results.get(id));
+            // Approval latency: only for Edit/Write, only same-day (execution
+            // is ~instant, so proposal→result delta ≈ human decision time).
+            let approval_latency_s = if matches!(p.kind, ActionKind::Edit | ActionKind::Write) {
+                r.and_then(|r| latency_secs(&p.effective_ts, &r.result_ts))
+            } else {
+                None
+            };
             Action {
                 idx: Idx(i as u32),
                 effective_ts: p.effective_ts,
@@ -223,6 +241,7 @@ pub fn ingest_str(raw: &str, default_lane: Lane) -> Session {
                 user_modified: r.map(|r| r.user_modified).unwrap_or(false),
                 edit_old: p.edit_old,
                 edit_new: p.edit_new,
+                approval_latency_s,
             }
         })
         .collect();
@@ -243,7 +262,32 @@ pub fn ingest_str(raw: &str, default_lane: Lane) -> Session {
         parse_errors,
         untimestamped_lines: untimestamped,
         interrupts,
+        auto_accept,
     }
+}
+
+/// Parse `YYYY-MM-DDTHH:MM:SS(.fff)Z` into `(date, seconds-of-day)`.
+/// Best-effort; returns `None` on anything unexpected.
+fn parse_iso(ts: &str) -> Option<(&str, f64)> {
+    let (date, rest) = ts.split_once('T')?;
+    let time = rest.trim_end_matches('Z');
+    let mut parts = time.split(':');
+    let h: f64 = parts.next()?.parse().ok()?;
+    let m: f64 = parts.next()?.parse().ok()?;
+    let s: f64 = parts.next()?.parse().ok()?; // "07.117" parses fine as f64
+    Some((date, h * 3600.0 + m * 60.0 + s))
+}
+
+/// Seconds between two ISO timestamps, or `None` if they cross a day boundary
+/// (can't be "instant") or don't parse.
+fn latency_secs(proposal: &str, result: &str) -> Option<f64> {
+    let (pd, ps) = parse_iso(proposal)?;
+    let (rd, rs) = parse_iso(result)?;
+    if pd != rd {
+        return None;
+    }
+    let d = rs - ps;
+    (d >= 0.0).then_some(d)
 }
 
 /// Normalize whitespace and cap length, for edit-string equality comparison.
@@ -294,6 +338,7 @@ struct ResultInfo {
     error: Option<String>,
     hunks: Vec<(u32, u32)>,
     user_modified: bool,
+    result_ts: String,
 }
 
 /// Read a `usage` object into [`Tokens`], tolerating missing fields.

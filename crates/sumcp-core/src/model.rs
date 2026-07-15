@@ -100,6 +100,9 @@ pub struct Action {
     pub edit_old: Option<String>,
     /// Normalized+capped `new_string` of an Edit (revert detection).
     pub edit_new: Option<String>,
+    /// Seconds from proposing this Edit/Write to its result — the approval
+    /// latency heuristic (execution ≈ instant, so this ≈ human decision time).
+    pub approval_latency_s: Option<f64>,
 }
 
 /// Token accounting, summed once per `message.id` (dedup layer a).
@@ -180,6 +183,8 @@ pub enum FindingKind {
     UserCorrected,
     /// The session's opening move (read-first vs patch-first).
     OpeningMove,
+    /// A large write accepted almost instantly (comprehension debt).
+    LargeWriteInstantAccept,
 }
 
 /// One evidence-backed observation about the session.
@@ -235,6 +240,9 @@ pub struct Session {
     pub untimestamped_lines: u64,
     /// User interruptions (`[Request interrupted by user`).
     pub interrupts: u64,
+    /// Whether an auto-accept permission mode was ever seen. When true,
+    /// approval-latency signals are suppressed (the delta means nothing).
+    pub auto_accept: bool,
 }
 
 #[cfg(test)]

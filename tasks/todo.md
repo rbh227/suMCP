@@ -19,7 +19,7 @@ Source of truth for detail: `tasks/plan.md`. Check items off as they land.
 - [x] T3.1 Edit-shape signals: churn, rework (patch-hunk overlap), re-read thrash, blind-write attempts. Finding/Tier/Confidence types added; ingest now joins tool_result error text + structuredPatch hunks back to actions. Fires on real donor with evidence. (large single-shot writes moved to T3.4 where it pairs with approval latency → large_write_instant_accept, staying within the frozen payload enum)
 - [x] T3.2 Failure signals: failure_loops with 4-step attribution chain (path-in-output → path-in-command → last-edit-within-5 → unattributed/dropped) + confidence tiers (PathMatch=High, Proximity=Low); tool_error_rates + validation_share helpers. Attribution matches only session-touched files (ADR A9, no fs access)
 - [x] T3.3 Dynamics signals: opening_move (read-first vs patch-first), true_revert (later.new==earlier.old), flip (revert + intervening user pushback), user_corrected (userModified), read_before_edit_share stat, interrupts counter. ingest now captures user text, edit old/new (normalized+capped), userModified. Deferred: n-gram action-loop repetition (lower value)
-- [ ] T3.4 Comprehension signals (approval latency, large-write-instant-accept)
+- [x] T3.4 Comprehension signals: large_write_instant_accept (>=2000 chars accepted <=3s), all exact:false (heuristic). Suppressed entirely under auto-accept permissionMode. ingest computes approval_latency_s (same-day proposal->result delta, Edit/Write only) + detects auto_accept. approval_latency_active() for the suppression payload field
 - [ ] T3.5 Weights config + transparent ranking + six payload builders with caps
 - [ ] CHECKPOINT C — Report reproduces gate-1 Python findings; weights echoed in payloads
 
