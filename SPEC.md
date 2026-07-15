@@ -36,10 +36,10 @@ engineering contract.
 | # | Decision | Resolution |
 |---|----------|------------|
 | 1 | Debrief timing | **In-session, Stop-hook nudge.** SessionEnd is dropped (no agent left to answer). Manual `/debrief` also works on any past session. |
-| 2 | Subagents | **Full ingest, flat-merge by timestamp.** Every `Action` carries `agent_id`. Both layouts supported: `<session-uuid>/subagents/agent-*.jsonl` (2.1.x, has `sessionId` back-pointer) and legacy sibling `agent-<agentId>.jsonl` (linked via `toolUseResult.agentId`). |
+| 2 | Subagents | **Full ingest, flat-merge with a total ordering contract.** Every `Action` carries `agent_id`. Both layouts supported: `<session-uuid>/subagents/agent-*.jsonl` (2.1.x, has `sessionId` back-pointer) and legacy sibling `agent-<agentId>.jsonl` (linked via `toolUseResult.agentId`). Sort key is `(timestamp, agent lane [main first, then agent_id lexicographic], source line number)` — deterministic regardless of filesystem enumeration. Cross-agent pairs with equal timestamps are marked **order-uncertain** and excluded from findings that need strict before/after semantics (flip, attribution windows); within one agent, line order is always authoritative. |
 | 3 | Revert/flip rules | Four Finding kinds: `rework` (patch-hunk overlap with earlier edit), `true_revert` (whitespace-normalized `new_string` == earlier `old_string`), `flip` (true revert + intervening user pushback and/or capitulation phrase, no new evidence gathered between), `user_corrected` (`userModified: true`). |
 | 4 | Failure attribution | Four-step chain: stderr/stdout paths → command-string paths → last-edited-within-5-actions → unattributed. Confidence `high/medium/low` stored on the Finding; low counts ×0.5 in ranking; unattributed never pinned to a file. |
-| 5 | v0.1 scope | Metrics-spec staging **L1 + L2**, plus **#15 approval latency** and **#16 large-write-then-instant-accept** pulled forward from L3 (they are the comprehension-debt thesis and are cheap timestamp deltas). Deferred: #4 context waste, #17 human-engagement (v0.2); L4 cross-session (v2, seam only). |
+| 5 | v0.1 scope | Metrics-spec staging **L1 + L2**, plus **#15 approval latency** and **#16 large-write-then-instant-accept** pulled forward from L3 (they are the comprehension-debt thesis). Both are **explicitly heuristic [P]**: latency = delta from the assistant `tool_use` proposal to its `tool_result`, measured only for Edit/Write (near-zero execution time, so the delta ≈ human decision time); **suppressed entirely** when `permissionMode` grants auto-accept or no permission event can exist, and never reported as exact. Deferred: #4 context waste, #17 human-engagement (v0.2); L4 cross-session (v2, seam only). |
 | 6 | Ranking | **Transparent weighted count.** Rank = Σ(config weight × evidence count) per Tier-1 category. Weights in config with documented defaults; payload always shows the per-category breakdown. Never a single opaque score; never session-length-based. |
 | 7 | MCP tools | **Six** (five + `evidence`). See §2. |
 | 8 | Name | **suMCP.** Binary names `sumcp` (CLI) and `sumcp-mcp` (server). |
@@ -50,11 +50,15 @@ engineering contract.
    enforces read-before-edit. Reframed as **blind-write attempts**: count
    `tool_use_error` results like `"File has not been read yet"`. Observed live
    (2–4 per struggling session).
-2. **Usage dedup nuance:** streaming writes one assistant response as multiple
-   lines sharing `requestId`/`message.id` (82–440 duplicate lines per large
-   file observed) but with **unique `uuid`s and distinct content blocks**.
-   Dedup applies to `usage` accounting (last-wins per `message.id`), **not** to
-   line/tool_use extraction — dropping lines wholesale loses tool calls.
+2. **Three distinct dedup layers** (conflating them corrupts counts):
+   (a) *usage accounting* — last-wins per `message.id` (streaming writes one
+   response as 82–440 lines sharing `requestId`/`message.id` but with unique
+   `uuid`s and distinct content blocks; dropping lines wholesale loses tool
+   calls); (b) *action extraction* — dedup by line `uuid` and `tool_use` id so
+   **resumed-session replays** don't inflate churn/error/loop counts or shift
+   evidence `Idx`s; (c) *content preservation* — streaming duplicates are kept
+   for evidence. Fixture required for the resumed-replay case; snapshot both
+   token totals AND action counts.
 3. **Empirical priors:** churn, rework, re-read thrash, failure loops, and tool
    fumbles fired strongly across real sessions; `true_revert`/`flip`/
    `user_corrected` fired zero times in five large sessions. Detectors stay
@@ -148,8 +152,10 @@ param exists from day one, used later for real-time tailing).
 ## 6. Testing strategy
 
 - **Fixture corpus:** sanitized real transcripts across harness versions,
-  including one with subagents and one with streaming duplicates. Snapshot
-  tests: fixtures → full Report JSON.
+  including one with subagents, one with streaming duplicates, one
+  resumed-session replay, and one with identical-timestamp cross-agent events
+  (must produce stable `Idx` values run-to-run). Snapshot tests: fixtures →
+  full Report JSON, asserting both token totals and action counts.
 - **Gate tests (from metrics-spec staging):** token totals match `ccusage`
   within a few % on real sessions; dedup invariants (usage counted once per
   `message.id`; no tool_use lost).
@@ -160,6 +166,10 @@ param exists from day one, used later for real-time tailing).
 - **Validation gates already passed:** gate 1 (signals fire and surprise on
   real data — passed 2026-07-14, findings in §1). Gate 2 (token ratio) —
   measure on fixtures and put the number in the README before v0.1 ships.
+- **External release gate (no escape hatch):** v0.1.0 does not tag until ≥2
+  external developers confirm the top-3 struggle files feel true on *their*
+  sessions. If weights or signals are adjusted in response to feedback, the
+  gate re-runs on held-out transcripts — tuning never substitutes for passing.
 
 ## 7. Boundaries
 
@@ -172,7 +182,9 @@ param exists from day one, used later for real-time tailing).
 
 **Ask first**
 - New dependencies beyond the budget in §5.
-- Any write path (v0.1 is read-only end to end).
+- Any write path beyond `sumcp install` (the analysis pipeline — MCP server,
+  CLI analysis, HTML report generation — is read-only end to end; `install` is
+  the sole sanctioned writer and is bound by the A8 write contract).
 - Publishing (crates.io, GitHub) or changing the six-tool MCP surface.
 
 **Never**
@@ -188,8 +200,8 @@ param exists from day one, used later for real-time tailing).
 | A1 | **Rust**, despite no local toolchain yet and a permissive-parsing workload | Distribution: a single static binary with zero runtime deps is a real adoption edge for an MCP server. Secondary: learning Rust is an explicit goal — accept slower iteration; put the learning value in `sumcp-core`, not plumbing. |
 | A2 | **rmcp** (official SDK, pinned) over hand-rolled JSON-RPC | Protocol correctness outsourced; MCP is still evolving. Tokio confined to the `sumcp-mcp` binary; core stays sync/pure; SDK wrapped thinly so swapping it later is one crate. |
 | A3 | **Memoized re-parse** for freshness | Transcript grows for hours under a long-lived server. Stat on each call; re-parse (~tens of ms for 6 MB) only if (mtime, size) changed. Always fresh, no mutable-model bugs. `byte_offset` param exists but is always 0 in v0.1 (real-time seam). |
-| A4 | **Self-identifying current session** | The calling session has already appended this very tool_use to its own transcript — scan recent files' tails for our tool_use id. Immune to concurrent sessions in one project (the mtime heuristic silently analyzes the wrong session — fatal for an honesty tool). Fallback: newest-mtime, labeled "inferred by recency" in the payload. Explicit `session_id` param everywhere. |
+| A4 | **Self-identifying current session, fail-closed for MCP** | The calling session has already appended this very tool_use to its own transcript — scan recent files' tails for our tool_use id (with bounded retry for flush delay). If no verified match and no explicit `session_id`: MCP tools **fail closed**, returning an `ambiguous_session` error payload listing candidate sessions — never a recency guess (a plausible-but-wrong debrief is fatal for an honesty tool). Newest-mtime inference exists only in the CLI's explicit `latest` mode, with a provenance field. Explicit `session_id` param everywhere. |
 | A5 | **Compact JSON payloads** | Agents parse it reliably, snapshot tests diff it, token caps enforceable by construction (`truncated: true` markers). CLI renders the same `Report` for humans — one Report type, two views. |
 | A6 | **Compiled default Weights + optional TOML** (`~/.config/sumcp/config.toml`) | Zero-setup adoption; payloads echo the weights used (transparency guardrail). |
 | A7 | **Sanitizer script + hand review for fixtures** | Real transcripts contain private code/prompts/paths. Structure-preserving rewrite (ids, ordering, usage, error shapes kept; content synthesized) keeps the repo publishable without losing the weirdness that breaks parsers. |
-| A8 | **`sumcp install` subcommand** | Registers the server, copies skill + hook, printing every write before making it (+ `uninstall`). On-thesis for the distribution motive. Plugin packaging deferred to v0.2. |
+| A8 | **`sumcp install` subcommand with a strict write contract** | The sole write path in the product. Dry-run by default (`--apply` to execute); every write atomic via temp+rename with a timestamped backup of any pre-existing file; rollback of completed steps on partial failure; idempotent reinstall; `uninstall` restores backups and removes only what install created (manifest-tracked). Tested against pre-existing `.mcp.json`, skills, and hooks. Plugin packaging deferred to v0.2. |
