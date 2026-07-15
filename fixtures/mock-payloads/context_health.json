@@ -1,0 +1,11 @@
+{"v":0,
+"session":{"id":"5717aaaa-1111-2222-3333-444455556666","identified_by":"tool_use_id"},
+"cache_hit_ratio":0.94,
+"window_fill":[{"turn":10,"pct":0.18},{"turn":40,"pct":0.42},{"turn":80,"pct":0.61},{"turn":120,"pct":0.77},{"turn":151,"pct":0.83}],
+"tokens":{"output":1382497,"input_uncached":41210,"cache_read":30549612,"cache_creation":700558},
+"read_never_referenced":[
+ {"kind":"read_unreferenced","tier":"T2","exact":false,"confidence":"medium","idxs":[22],"file":"docs/architecture.md","note":"informational, not a waste judgment"},
+ {"kind":"read_unreferenced","tier":"T2","exact":false,"confidence":"medium","idxs":[61],"file":"src/legacy/OldViewer.tsx"}],
+"read_never_referenced_total":27,
+"note":"v0.1 reports context economics as information only; token-level waste deferred (metrics-spec #4)",
+"truncated":true}

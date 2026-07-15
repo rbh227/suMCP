@@ -1,0 +1,22 @@
+{"v":0,
+"session":{"id":"5717aaaa-1111-2222-3333-444455556666","identified_by":"tool_use_id"},
+"weights":{"churn":1.0,"rework":2.0,"failure_loop":3.0,"thrash":1.5,"fumble":2.0,"low_confidence_factor":0.5,"source":"defaults"},
+"files":[
+ {"rank":1,"file":"src/scene/SceneManager.ts","score":63.5,
+  "breakdown":{"churn":24,"rework":9,"failure_loops":3,"thrash":4,"fumbles":1},
+  "findings":[
+   {"kind":"rework","tier":"T2","exact":true,"confidence":"high","idxs":[102,141],"note":"L120-160 re-edited 20m apart"},
+   {"kind":"failure_loop","tier":"T2","exact":false,"confidence":"high","idxs":[141,143,150],"note":"npm test failed 3x, stderr names this file"},
+   {"kind":"failure_loop","tier":"T2","exact":false,"confidence":"low","idxs":[201,203],"note":"attributed via last-edit window"},
+   {"kind":"thrash","tier":"T1","exact":true,"confidence":"high","idxs":[98,130,166,240],"note":"re-read 4x"}]},
+ {"rank":2,"file":"src/App.tsx","score":38.0,
+  "breakdown":{"churn":17,"rework":6,"failure_loops":1,"thrash":5,"fumbles":0},
+  "findings":[
+   {"kind":"rework","tier":"T2","exact":true,"confidence":"high","idxs":[210,236],"note":"router block rewritten"},
+   {"kind":"thrash","tier":"T1","exact":true,"confidence":"high","idxs":[88,120,208,231,290],"note":"re-read 5x"}]},
+ {"rank":3,"file":"src/viewer/ViewerCanvas.tsx","score":22.5,
+  "breakdown":{"churn":10,"rework":4,"failure_loops":1,"thrash":0,"fumbles":1},
+  "findings":[
+   {"kind":"fumble","tier":"T1","exact":true,"confidence":"high","idxs":[301],"note":"Edit rejected: File has not been read yet"}]}],
+"findings_per_file_cap":4,
+"truncated":true}

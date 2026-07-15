@@ -1,0 +1,17 @@
+{"v":0,
+"session":{"id":"5717aaaa-1111-2222-3333-444455556666","identified_by":"tool_use_id"},
+"file":"src/scene/SceneManager.ts",
+"events":[
+ {"idx":98,"t":"14:31:07","agent":"main","action":"read","detail":"full file, 412 lines"},
+ {"idx":102,"t":"14:33:40","agent":"main","action":"edit","outcome":"ok","region":"L120-160","detail":"camera init refactor"},
+ {"idx":110,"t":"14:36:19","agent":"main","action":"bash","outcome":"fail","detail":"npm test: TypeError SceneManager.ts:141","attribution":"high"},
+ {"idx":114,"t":"14:38:02","agent":"main","action":"edit","outcome":"ok","region":"L138-145"},
+ {"idx":118,"t":"14:39:55","agent":"main","action":"bash","outcome":"fail","detail":"npm test: same assertion","attribution":"high"},
+ {"idx":130,"t":"14:44:21","agent":"main","action":"read","detail":"re-read L100-200"},
+ {"idx":141,"t":"14:49:03","agent":"main","action":"edit","outcome":"ok","region":"L120-160","detail":"rework of idx 102 region"}],
+"elided":{"count":19,"between":[141,240],"note":"middle events elided; fetch via evidence(idxs)"},
+"tail":[
+ {"idx":240,"t":"15:52:44","agent":"agent-a470f907","action":"read","detail":"subagent verification pass"},
+ {"idx":251,"t":"16:01:12","agent":"main","action":"bash","outcome":"ok","detail":"npm test green"}],
+"summary_counts":{"edits":24,"reads":4,"bash_fails_attributed":3},
+"truncated":true}

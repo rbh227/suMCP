@@ -1,0 +1,7 @@
+{"v":0,
+"error":"ambiguous_session",
+"message":"Could not verify the calling session (own tool_use id not found after bounded retry). Refusing to guess.",
+"candidates":[
+ {"id":"5717aaaa-1111-2222-3333-444455556666","mtime":"2026-07-15T16:04:12Z","cwd_match":true},
+ {"id":"80b9a169-624f-4880-a2c3-24b96e2b4ea2","mtime":"2026-07-15T16:03:58Z","cwd_match":true}],
+"hint":"Pass session_id explicitly, e.g. session_overview(session_id=\"5717aaaa-...\")."}

@@ -3,7 +3,7 @@
 Source of truth for detail: `tasks/plan.md`. Check items off as they land.
 
 ## Phase 0 — Contract validation (no Rust)
-- [ ] T0.1 Freeze Report/payload JSON shapes (`docs/payload-schema.md` + `fixtures/mock-payloads/`)
+- [x] T0.1 Freeze Report/payload JSON shapes (`docs/payload-schema.md` + `fixtures/mock-payloads/`, enforced by `scripts/check_payloads.py`)
 - [ ] T0.2 Debrief skill vs mock payloads, live-session test (<500 tokens, 3 files, evidence)
 - [ ] CHECKPOINT A — payload schema frozen, narration contract proven
 
