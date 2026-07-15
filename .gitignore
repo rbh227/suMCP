@@ -11,5 +11,8 @@ CLAUDE.local.md
 # Rust build artifacts
 target/
 
+# Python bytecode from dev scripts
+__pycache__/
+
 # OS noise
 .DS_Store

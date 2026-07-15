@@ -65,9 +65,24 @@ engineering contract.
    (rare ⇒ high-signal when they fire) but ranking and demos must not depend on
    them.
 4. **Additional live schema types** beyond the metrics doc: `mode`,
-   `last-prompt`, `ai-title`, `file-history-snapshot`, `attachment`. Parser
-   treats all unknown types as data (already a parser rule); fixtures cover
-   versions 2.1.56 → 2.1.183.
+   `last-prompt`, `ai-title`, `file-history-snapshot`, `attachment`, and (in
+   2.1.2xx) `permission-mode`, `queue-operation`. Parser treats all unknown
+   types as data (already a parser rule); fixtures cover 2.1.56 → 2.1.210. The
+   type list is **open-ended by design** — never assumed exhaustive.
+5. **Untimestamped events break a naive timestamp sort** (donor evidence: ~20%
+   of lines — `mode`, `permission-mode`, `ai-title`, `last-prompt`,
+   `file-history-snapshot` — carry no `timestamp`, and `permission-mode`
+   drives approval-latency suppression). Ordering contract (supersedes
+   decision 2's phrasing): the total order key is
+   `(effective_timestamp, agent lane [main first, then agent_id], source line
+   number)`, where `effective_timestamp` is the line's own timestamp or, if
+   absent, the last-seen timestamp carried forward within that transcript.
+   **Source line number is always present and monotonic within a file**, so the
+   order is total and deterministic even under missing or tied timestamps.
+   Cross-agent pairs whose `effective_timestamp` ties are marked
+   `order_uncertain` and excluded from strict before/after findings (flip,
+   attribution windows). Requires a fixture with untimestamped and
+   identical-timestamp events asserting stable `Idx` run-to-run.
 
 ## 2. MCP tools (all read-only, hard payload caps, default to current session/cwd)
 
@@ -204,4 +219,5 @@ param exists from day one, used later for real-time tailing).
 | A5 | **Compact JSON payloads** | Agents parse it reliably, snapshot tests diff it, token caps enforceable by construction (`truncated: true` markers). CLI renders the same `Report` for humans — one Report type, two views. |
 | A6 | **Compiled default Weights + optional TOML** (`~/.config/sumcp/config.toml`) | Zero-setup adoption; payloads echo the weights used (transparency guardrail). |
 | A7 | **Sanitizer script + hand review for fixtures** | Real transcripts contain private code/prompts/paths. Structure-preserving rewrite (ids, ordering, usage, error shapes kept; content synthesized) keeps the repo publishable without losing the weirdness that breaks parsers. |
-| A8 | **`sumcp install` subcommand with a strict write contract** | The sole write path in the product. Dry-run by default (`--apply` to execute); every write atomic via temp+rename with a timestamped backup of any pre-existing file; rollback of completed steps on partial failure; idempotent reinstall; `uninstall` restores backups and removes only what install created (manifest-tracked). Tested against pre-existing `.mcp.json`, skills, and hooks. Plugin packaging deferred to v0.2. |
+| A8 | **`sumcp install` subcommand with a strict write contract** | The sole write path in the product. Dry-run by default (`--apply` to execute); every write atomic via temp+rename with a timestamped backup of any pre-existing file; rollback of completed steps on partial failure; idempotent reinstall; `uninstall` restores backups and removes only what install created (manifest-tracked). Tested against pre-existing `.mcp.json`, skills, and hooks. Files `0600`/dirs `0700`; refuse to follow symlinks at write targets; assert the resolved target is under `$HOME`. Plugin packaging deferred to v0.2. |
+| A9 | **Input is untrusted; the read boundary is allowlisted** (from /ship security audit) | Transcript content is attacker-influenceable (tool results, fetched web content, prompt injection all land in the JSONL), so ingestion is hardened at the `locate.rs`/`ingest.rs` boundary before any `open`: (1) `session_id` must match `^[0-9a-f-]{36}$`; `path`/`project` params are canonicalized and must resolve under `~/.claude/projects/` (reject `../` traversal and escaping symlinks — resolve *then* prefix-check). (2) External tool-output file references found inside transcript lines are followed **only** if they canonicalize under the analyzed session's project tree; anything else increments an unknown-reference counter, never a read (prevents `~/.ssh/id_rsa` disclosure via `evidence()`). (3) Resource caps: skip+count lines over 16 MB, bounded JSON recursion depth, a total-file ceiling. (4) `evidence()`/`report --html` run excerpts through a secret-redaction pass (common key/token/PEM patterns) — redacted by default in the shareable HTML. Each has a rejection fixture. |

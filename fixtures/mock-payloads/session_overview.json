@@ -1,12 +1,12 @@
 {"v":0,
-"session":{"id":"5717aaaa-1111-2222-3333-444455556666","project":"/Users/dev/Desktop/SplatAgent","identified_by":"tool_use_id","started":"2026-06-23T14:02:11Z","duration_min":142,"cc_version":"2.1.183"},
+"session":{"id":"5717aaaa-1111-2222-3333-444455556666","project":"/Users/dev/Desktop/example-app","identified_by":"tool_use_id","started":"2026-06-23T14:02:11Z","duration_min":142,"cc_version":"2.1.183"},
 "totals":{"actions":412,"edits":180,"writes":6,"reads":97,"bash":80,"files_touched":58,"subagent_runs":2,"user_messages":31,"interrupts":2},
 "tokens":{"output":1382497,"input_uncached":41210,"cache_read":30549612,"cache_creation":700558,"cache_hit_ratio":0.94},
 "opening_move":{"class":"read_first","reads_before_first_edit":6,"kind":"opening_move","tier":"T1","exact":true,"confidence":"high","idxs":[1,2,3,4,5,6,7]},
 "top_struggles":[
- {"file":"src/scene/SceneManager.ts","score":63.5,"breakdown":{"churn":24,"rework":9,"failure_loops":3,"thrash":4,"fumbles":1}},
+ {"file":"src/store/DataStore.ts","score":63.5,"breakdown":{"churn":24,"rework":9,"failure_loops":3,"thrash":4,"fumbles":1}},
  {"file":"src/App.tsx","score":38.0,"breakdown":{"churn":17,"rework":6,"failure_loops":1,"thrash":5,"fumbles":0}},
- {"file":"src/viewer/ViewerCanvas.tsx","score":22.5,"breakdown":{"churn":10,"rework":4,"failure_loops":1,"thrash":0,"fumbles":1}}],
+ {"file":"src/ui/DetailPanel.tsx","score":22.5,"breakdown":{"churn":10,"rework":4,"failure_loops":1,"thrash":0,"fumbles":1}}],
 "failures":{"bash_failed":10,"bash_total":80,"attributed":6,"longest_same_cmd_chain":3},
 "flags":{"unknown_event_types":{},"order_uncertain_pairs":0,"parse_errors":0},
 "truncated":false}

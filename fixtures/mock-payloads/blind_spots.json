@@ -1,10 +1,10 @@
 {"v":0,
 "session":{"id":"5717aaaa-1111-2222-3333-444455556666","identified_by":"tool_use_id"},
 "blind_write_attempts":[
- {"kind":"blind_write_attempt","tier":"T1","exact":true,"confidence":"high","idxs":[301],"file":"src/viewer/ViewerCanvas.tsx","error":"File has not been read yet"},
- {"kind":"blind_write_attempt","tier":"T1","exact":true,"confidence":"high","idxs":[344],"file":"src/scene/SceneManager.ts","error":"File has not been read yet"}],
+ {"kind":"blind_write_attempt","tier":"T1","exact":true,"confidence":"high","idxs":[301],"file":"src/ui/DetailPanel.tsx","error":"File has not been read yet"},
+ {"kind":"blind_write_attempt","tier":"T1","exact":true,"confidence":"high","idxs":[344],"file":"src/store/DataStore.ts","error":"File has not been read yet"}],
 "written_never_reread":[
- {"kind":"write_no_reread","tier":"T1","exact":true,"confidence":"high","idxs":[52],"file":"scripts/export_views.py","by":"main","note":"written once, never read or verified by any agent"}],
+ {"kind":"write_no_reread","tier":"T1","exact":true,"confidence":"high","idxs":[52],"file":"scripts/export_data.py","by":"main","note":"written once, never read or verified by any agent"}],
 "approval_outliers":[
  {"kind":"large_write_instant_accept","tier":"T2","exact":false,"confidence":"medium","idxs":[203,204],"file":"src/App.tsx","write_chars":9814,"latency_s":2.1,"note":"heuristic: Edit/Write only; delta ~= human decision time"}],
 "suppression":{"approval_latency":"active","reason":null,"suppressed_when":"permissionMode grants auto-accept"},

@@ -34,6 +34,16 @@ Source of truth for detail: `tasks/plan.md`. Check items off as they land.
 - [ ] T5.4 OSS readiness (LICENSE, README, CONTRIBUTING, CHANGELOG, docs/metrics.md, rustdoc, issue templates)
 - [ ] CHECKPOINT E — v0.1.0 tag (publishing = ask first)
 
+## /ship review findings — RESOLVED 2026-07-15
+Privacy leak (real project name/filenames in mocks+plan) scrubbed to synthetic;
+both contract checkers hardened (kind enum, non-empty idxs, note-when-heuristic,
+full error shape, ranking weights, chars/3.5; debrief idx cross-dereference,
+real signal vocab). SPEC amendment 5 (untimestamped-event total-ordering) and
+ADR A9 (untrusted-input allowlist: UUID/path validation, external-ref allowlist,
+resource caps, secret redaction) added. Remaining ship items folded into task
+acceptance: default-deny sanitizer (T1.2), resource-cap + path fixtures (T2.1),
+HTML secret redaction (T5.1), cargo-audit CI (T4.1), SECURITY.md (T5.4).
+
 ## Codex review findings (both rounds) — RESOLVED 2026-07-15
 All six folded into SPEC.md and tasks/plan.md: installer write contract (A8),
 fail-closed session identity (A4), total ordering contract for subagent merge

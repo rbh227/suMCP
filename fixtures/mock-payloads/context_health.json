@@ -5,7 +5,7 @@
 "tokens":{"output":1382497,"input_uncached":41210,"cache_read":30549612,"cache_creation":700558},
 "read_never_referenced":[
  {"kind":"read_unreferenced","tier":"T2","exact":false,"confidence":"medium","idxs":[22],"file":"docs/architecture.md","note":"informational, not a waste judgment"},
- {"kind":"read_unreferenced","tier":"T2","exact":false,"confidence":"medium","idxs":[61],"file":"src/legacy/OldViewer.tsx"}],
+ {"kind":"read_unreferenced","tier":"T2","exact":false,"confidence":"medium","idxs":[61],"file":"src/legacy/OldPanel.tsx","note":"read once, never referenced in a later edit"}],
 "read_never_referenced_total":27,
 "note":"v0.1 reports context economics as information only; token-level waste deferred (metrics-spec #4)",
 "truncated":true}

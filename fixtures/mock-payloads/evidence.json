@@ -1,9 +1,9 @@
 {"v":0,
 "session":{"id":"5717aaaa-1111-2222-3333-444455556666","identified_by":"tool_use_id"},
 "actions":[
- {"idx":102,"t":"14:33:40","agent":"main","type":"tool_use","tool":"Edit","file":"src/scene/SceneManager.ts","excerpt":"old: const cam = new Camera(fov, aspect) / new: const cam = this.initCamera(opts)"},
- {"idx":110,"t":"14:36:19","agent":"main","type":"tool_result","tool":"Bash","is_error":true,"excerpt":"npm test: TypeError: Cannot read properties of undefined (reading 'fov') at SceneManager.ts:141"},
- {"idx":141,"t":"14:49:03","agent":"main","type":"tool_use","tool":"Edit","file":"src/scene/SceneManager.ts","excerpt":"old: this.initCamera(opts) / new: this.initCamera(opts ?? DEFAULTS) -- reworks idx 102 region"}],
+ {"idx":102,"t":"14:33:40","agent":"main","type":"tool_use","tool":"Edit","file":"src/store/DataStore.ts","excerpt":"old: const cam = new Config(opts) / new: const cam = this.initConfig(opts)"},
+ {"idx":110,"t":"14:36:19","agent":"main","type":"tool_result","tool":"Bash","is_error":true,"excerpt":"npm test: TypeError: Cannot read properties of undefined (reading 'mode') at DataStore.ts:141"},
+ {"idx":141,"t":"14:49:03","agent":"main","type":"tool_use","tool":"Edit","file":"src/store/DataStore.ts","excerpt":"old: this.initConfig(opts) / new: this.initConfig(opts ?? DEFAULTS) -- reworks idx 102 region"}],
 "not_found":[],
 "caps":{"max_actions":10,"max_excerpt_chars":600},
 "truncated":false}

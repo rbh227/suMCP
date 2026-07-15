@@ -61,7 +61,7 @@ Design the compact-JSON response for all six tools (`session_overview`,
 `struggle_areas`, `file_story`, `blind_spots`, `context_health`, `evidence`)
 as `docs/payload-schema.md` + example payloads in `fixtures/mock-payloads/`.
 Derive realistic numbers from the gate-script findings already computed on the
-SplatAgent corpus (churn 24× SceneManager.ts, 6/10 attributable failures, etc.).
+example-app corpus (churn 24× DataStore.ts, 6/10 attributable failures, etc.).
 - Accept: every example payload ≤ its SPEC §2 token cap (measure with a
   tokenizer approximation: chars/4); every Finding carries kind, tier,
   exact-vs-heuristic, confidence, idxs.
@@ -90,7 +90,7 @@ Install rustup (stable). Create the workspace per SPEC §4: `crates/sumcp-core`
 Write `scripts/sanitize.py` (structure-preserving: keep ids, ordering, usage,
 error shapes, timestamps; synthesize paths/strings/prompts). Produce fixtures
 from the local corpus: one 2.1.56 session, one 2.1.183 session, one with
-subagents (`d62649db…/subagents/`), one with heavy streaming duplicates, one
+subagents (`aaaa1111…/subagents/`), one with heavy streaming duplicates, one
 tiny hand-built edge-case file (bad lines, unknown types).
 - Accept: hand review confirms no private content; each fixture documented in
   `fixtures/README.md` with version + what it exercises.
