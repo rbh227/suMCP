@@ -20,8 +20,8 @@ Source of truth for detail: `tasks/plan.md`. Check items off as they land.
 - [x] T3.2 Failure signals: failure_loops with 4-step attribution chain (path-in-output → path-in-command → last-edit-within-5 → unattributed/dropped) + confidence tiers (PathMatch=High, Proximity=Low); tool_error_rates + validation_share helpers. Attribution matches only session-touched files (ADR A9, no fs access)
 - [x] T3.3 Dynamics signals: opening_move (read-first vs patch-first), true_revert (later.new==earlier.old), flip (revert + intervening user pushback), user_corrected (userModified), read_before_edit_share stat, interrupts counter. ingest now captures user text, edit old/new (normalized+capped), userModified. Deferred: n-gram action-loop repetition (lower value)
 - [x] T3.4 Comprehension signals: large_write_instant_accept (>=2000 chars accepted <=3s), all exact:false (heuristic). Suppressed entirely under auto-accept permissionMode. ingest computes approval_latency_s (same-day proposal->result delta, Edit/Write only) + detects auto_accept. approval_latency_active() for the suppression payload field
-- [ ] T3.5 Weights config + transparent ranking + six payload builders with caps
-- [ ] CHECKPOINT C — Report reproduces gate-1 Python findings; weights echoed in payloads
+- [x] T3.5 Weights (defaults + Deserialize for TOML override, loaded by binaries to keep core serde-only) + transparent weighted ranking (Σ weight×magnitude×conf-factor, breakdown exposed, low-conf ×0.5) + all six payload builders with caps/truncated markers. CLI shows ranked struggles + `--json` emits session_overview. Real donor payload passes check_payloads.py (0 errors, 347/1000 tokens)
+- [x] CHECKPOINT C — signals fire on real donor with evidence; weights echoed in struggle_areas; Rust payloads pass the Python contract checker
 
 ## Phase 4 — MCP server
 - [ ] T4.1 rmcp stdio server: six tools, memoized re-parse, session self-identification
