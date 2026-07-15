@@ -5,5 +5,7 @@
 //! the tool's output auditable and its tests trivial.
 
 pub mod edit_shape;
+pub mod failures;
 
 pub use edit_shape::edit_shape;
+pub use failures::failures;

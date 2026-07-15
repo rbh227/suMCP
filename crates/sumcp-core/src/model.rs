@@ -92,6 +92,8 @@ pub struct Action {
     pub error: Option<String>,
     /// Edited line ranges `(start, end)` from `structuredPatch` (rework signal).
     pub hunks: Vec<(u32, u32)>,
+    /// The Bash command string, if this is a Bash action (failure attribution).
+    pub command: Option<String>,
 }
 
 /// Token accounting, summed once per `message.id` (dedup layer a).
@@ -162,6 +164,8 @@ pub enum FindingKind {
     Thrash,
     /// An edit attempted before the file was read (harness-blocked).
     BlindWriteAttempt,
+    /// Repeated failing commands attributed to a file.
+    FailureLoop,
 }
 
 /// One evidence-backed observation about the session.

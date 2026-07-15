@@ -17,7 +17,7 @@ Source of truth for detail: `tasks/plan.md`. Check items off as they land.
 
 ## Phase 3 — Signals
 - [x] T3.1 Edit-shape signals: churn, rework (patch-hunk overlap), re-read thrash, blind-write attempts. Finding/Tier/Confidence types added; ingest now joins tool_result error text + structuredPatch hunks back to actions. Fires on real donor with evidence. (large single-shot writes moved to T3.4 where it pairs with approval latency → large_write_instant_accept, staying within the frozen payload enum)
-- [ ] T3.2 Failure signals (error rates, validation share, attribution chain, failure chains)
+- [x] T3.2 Failure signals: failure_loops with 4-step attribution chain (path-in-output → path-in-command → last-edit-within-5 → unattributed/dropped) + confidence tiers (PathMatch=High, Proximity=Low); tool_error_rates + validation_share helpers. Attribution matches only session-touched files (ADR A9, no fs access)
 - [ ] T3.3 Dynamics signals (revert/flip/user_corrected, opening move, interruptions, loops)
 - [ ] T3.4 Comprehension signals (approval latency, large-write-instant-accept)
 - [ ] T3.5 Weights config + transparent ranking + six payload builders with caps

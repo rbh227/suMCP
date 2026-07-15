@@ -97,6 +97,10 @@ pub fn ingest_str(raw: &str, default_lane: Lane) -> Session {
                             .and_then(|i| i.get("content").or_else(|| i.get("new_string")))
                             .and_then(Value::as_str)
                             .map(str::len);
+                        let command = input
+                            .and_then(|i| i.get("command"))
+                            .and_then(Value::as_str)
+                            .map(str::to_string);
 
                         pending.push(PendingAction {
                             tool_use_id: tool_id.map(str::to_string),
@@ -107,6 +111,7 @@ pub fn ingest_str(raw: &str, default_lane: Lane) -> Session {
                             kind: ActionKind::from_tool(name),
                             file_path,
                             write_len,
+                            command,
                         });
                     }
                     Some("tool_result") => {
@@ -115,8 +120,16 @@ pub fn ingest_str(raw: &str, default_lane: Lane) -> Session {
                                 .get("is_error")
                                 .and_then(Value::as_bool)
                                 .unwrap_or(false);
+                            // On error, fold in stderr (Bash detail lives there,
+                            // not in the terse tool_result "Exit code N").
                             let error = if is_error {
-                                Some(content_to_string(block.get("content")))
+                                let content = content_to_string(block.get("content"));
+                                let stderr = v
+                                    .get("toolUseResult")
+                                    .and_then(|r| r.get("stderr"))
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("");
+                                Some(format!("{content} {stderr}").trim().to_string())
                             } else {
                                 None
                             };
@@ -162,6 +175,7 @@ pub fn ingest_str(raw: &str, default_lane: Lane) -> Session {
                 write_len: p.write_len,
                 error: r.and_then(|r| r.error.clone()),
                 hunks: r.map(|r| r.hunks.clone()).unwrap_or_default(),
+                command: p.command,
             }
         })
         .collect();
@@ -193,6 +207,7 @@ struct PendingAction {
     kind: ActionKind,
     file_path: Option<String>,
     write_len: Option<usize>,
+    command: Option<String>,
 }
 
 /// What came back for a tool call.
