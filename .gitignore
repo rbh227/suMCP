@@ -1,0 +1,15 @@
+# Raw Claude Code session transcripts — NEVER committed.
+# Drop donor sessions in fixtures/raw/; only sanitized, hand-reviewed
+# output of scripts/sanitize.py may be committed (to fixtures/).
+fixtures/raw/*
+!fixtures/raw/README.md
+
+# Local Claude Code state
+.claude/
+CLAUDE.local.md
+
+# Rust build artifacts
+target/
+
+# OS noise
+.DS_Store
