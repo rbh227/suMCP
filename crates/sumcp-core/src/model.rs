@@ -94,6 +94,12 @@ pub struct Action {
     pub hunks: Vec<(u32, u32)>,
     /// The Bash command string, if this is a Bash action (failure attribution).
     pub command: Option<String>,
+    /// Whether the user hand-modified this tool's result (`userModified: true`).
+    pub user_modified: bool,
+    /// Normalized+capped `old_string` of an Edit (revert detection).
+    pub edit_old: Option<String>,
+    /// Normalized+capped `new_string` of an Edit (revert detection).
+    pub edit_new: Option<String>,
 }
 
 /// Token accounting, summed once per `message.id` (dedup layer a).
@@ -166,6 +172,14 @@ pub enum FindingKind {
     BlindWriteAttempt,
     /// Repeated failing commands attributed to a file.
     FailureLoop,
+    /// A later edit restores content an earlier edit had removed.
+    TrueRevert,
+    /// A revert right after user pushback (a capitulation flip).
+    Flip,
+    /// The user hand-corrected the agent's edit.
+    UserCorrected,
+    /// The session's opening move (read-first vs patch-first).
+    OpeningMove,
 }
 
 /// One evidence-backed observation about the session.
@@ -192,11 +206,25 @@ pub struct Finding {
     pub note: Option<String>,
 }
 
+/// A user text message, placed in time so signals can ask "did the user push
+/// back between these two edits?".
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserText {
+    /// Effective timestamp (own or carried forward).
+    pub effective_ts: String,
+    /// Source line number (total-order tiebreak, same key as actions).
+    pub line_no: usize,
+    /// The message text.
+    pub text: String,
+}
+
 /// A fully parsed session: ordered actions plus parse-health counters.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     /// All actions, in the total order (so `actions[i].idx == Idx(i)`).
     pub actions: Vec<Action>,
+    /// User text messages, in source order (pushback/flip detection).
+    pub user_texts: Vec<UserText>,
     /// Token totals (deduped per `message.id`).
     pub tokens: Tokens,
     /// Histogram of every event `type` seen (including ones we don't model).
@@ -205,6 +233,8 @@ pub struct Session {
     pub parse_errors: u64,
     /// How many lines carried no timestamp (amendment 5 visibility).
     pub untimestamped_lines: u64,
+    /// User interruptions (`[Request interrupted by user`).
+    pub interrupts: u64,
 }
 
 #[cfg(test)]

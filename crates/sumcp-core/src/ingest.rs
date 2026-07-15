@@ -13,9 +13,15 @@
 //! that is the more robust choice: a surprising shape in one field costs us
 //! that field, not the whole line's type/uuid/timestamp.
 
-use crate::model::{Action, ActionKind, Idx, Lane, Session, Tokens};
+use crate::model::{Action, ActionKind, Idx, Lane, Session, Tokens, UserText};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
+
+/// Cap on stored edit strings — reverts are hunk-sized; this keeps a whole-file
+/// paste from bloating the model while still allowing equality comparison.
+const EDIT_CAP: usize = 2000;
+/// Prefix Claude Code writes when the user interrupts a turn.
+const INTERRUPT_PREFIX: &str = "[Request interrupted by user";
 
 /// Parse raw transcript text (one JSON object per line) into a [`Session`].
 ///
@@ -29,6 +35,8 @@ pub fn ingest_str(raw: &str, default_lane: Lane) -> Session {
     let mut last_ts = String::new(); // carried forward for untimestamped lines
     let mut seen_tool_ids = HashSet::new();
     let mut pending: Vec<PendingAction> = Vec::new();
+    let mut user_texts: Vec<UserText> = Vec::new();
+    let mut interrupts = 0u64;
     // tool_use id -> the result that came back for it (error text, patch hunks).
     let mut results: HashMap<String, ResultInfo> = HashMap::new();
 
@@ -61,6 +69,23 @@ pub fn ingest_str(raw: &str, default_lane: Lane) -> Session {
         };
 
         let message = v.get("message");
+
+        // Capture real user text (prompts, interrupts) — not tool_result echoes
+        // or meta lines. Placed in time so signals can ask "did the user push
+        // back between edit A and edit B?".
+        if v.get("type").and_then(Value::as_str) == Some("user")
+            && v.get("isMeta").and_then(Value::as_bool) != Some(true)
+            && let Some(text) = extract_user_text(message)
+        {
+            if text.starts_with(INTERRUPT_PREFIX) {
+                interrupts += 1;
+            }
+            user_texts.push(UserText {
+                effective_ts: effective_ts.clone(),
+                line_no,
+                text,
+            });
+        }
 
         // Dedup layer (a): usage last-wins per message.id (a let-chain).
         if let Some(msg) = message
@@ -101,6 +126,17 @@ pub fn ingest_str(raw: &str, default_lane: Lane) -> Session {
                             .and_then(|i| i.get("command"))
                             .and_then(Value::as_str)
                             .map(str::to_string);
+                        // normalized old/new strings for revert detection
+                        let edit_old = norm_cap(
+                            input
+                                .and_then(|i| i.get("old_string"))
+                                .and_then(Value::as_str),
+                        );
+                        let edit_new = norm_cap(
+                            input
+                                .and_then(|i| i.get("new_string"))
+                                .and_then(Value::as_str),
+                        );
 
                         pending.push(PendingAction {
                             tool_use_id: tool_id.map(str::to_string),
@@ -112,6 +148,8 @@ pub fn ingest_str(raw: &str, default_lane: Lane) -> Session {
                             file_path,
                             write_len,
                             command,
+                            edit_old,
+                            edit_new,
                         });
                     }
                     Some("tool_result") => {
@@ -136,12 +174,18 @@ pub fn ingest_str(raw: &str, default_lane: Lane) -> Session {
                             // structuredPatch (edit line ranges) lives at the
                             // top level of the same line, paired with this result.
                             let hunks = read_hunks(v.get("toolUseResult"));
+                            let user_modified = v
+                                .get("toolUseResult")
+                                .and_then(|r| r.get("userModified"))
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false);
                             results.insert(
                                 id.to_string(),
                                 ResultInfo {
                                     is_error,
                                     error,
                                     hunks,
+                                    user_modified,
                                 },
                             );
                         }
@@ -176,6 +220,9 @@ pub fn ingest_str(raw: &str, default_lane: Lane) -> Session {
                 error: r.and_then(|r| r.error.clone()),
                 hunks: r.map(|r| r.hunks.clone()).unwrap_or_default(),
                 command: p.command,
+                user_modified: r.map(|r| r.user_modified).unwrap_or(false),
+                edit_old: p.edit_old,
+                edit_new: p.edit_new,
             }
         })
         .collect();
@@ -190,10 +237,39 @@ pub fn ingest_str(raw: &str, default_lane: Lane) -> Session {
 
     Session {
         actions,
+        user_texts,
         tokens,
         type_counts,
         parse_errors,
         untimestamped_lines: untimestamped,
+        interrupts,
+    }
+}
+
+/// Normalize whitespace and cap length, for edit-string equality comparison.
+fn norm_cap(s: Option<&str>) -> Option<String> {
+    s.map(|s| {
+        let normalized: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
+        normalized.chars().take(EDIT_CAP).collect::<String>()
+    })
+    .filter(|s| !s.is_empty())
+}
+
+/// Pull real user text from a message: a plain string, or joined text blocks.
+/// Returns `None` for tool-result-only lines (no human text).
+fn extract_user_text(message: Option<&Value>) -> Option<String> {
+    let content = message?.get("content")?;
+    match content {
+        Value::String(s) if !s.is_empty() => Some(s.clone()),
+        Value::Array(arr) => {
+            let text: String = arr
+                .iter()
+                .filter_map(|b| b.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join(" ");
+            (!text.is_empty()).then_some(text)
+        }
+        _ => None,
     }
 }
 
@@ -208,6 +284,8 @@ struct PendingAction {
     file_path: Option<String>,
     write_len: Option<usize>,
     command: Option<String>,
+    edit_old: Option<String>,
+    edit_new: Option<String>,
 }
 
 /// What came back for a tool call.
@@ -215,6 +293,7 @@ struct ResultInfo {
     is_error: bool,
     error: Option<String>,
     hunks: Vec<(u32, u32)>,
+    user_modified: bool,
 }
 
 /// Read a `usage` object into [`Tokens`], tolerating missing fields.
