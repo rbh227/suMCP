@@ -1,0 +1,16 @@
+[package]
+name = "sumcp-mcp"
+description = "suMCP MCP server over stdio: six read-only session-forensics tools"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "sumcp-mcp"
+path = "src/main.rs"
+
+# rmcp (and tokio with it) is added and pinned in T4.1 when the server is
+# wired — pinning a pre-1.0 SDK weeks before use only invites churn (ADR A2).
+[dependencies]
+sumcp-core = { path = "../sumcp-core" }

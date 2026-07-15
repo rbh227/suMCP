@@ -8,7 +8,7 @@ Source of truth for detail: `tasks/plan.md`. Check items off as they land.
 - [x] CHECKPOINT A — payload schema frozen at v0, narration contract proven (2026-07-15)
 
 ## Phase 1 — Foundation
-- [ ] T1.1 rustup + workspace scaffold (core/cli/mcp crates; fmt/clippy/test green)
+- [x] T1.1 rustup + workspace scaffold (Rust 1.97; core/cli/mcp crates; fmt/clippy/test green; rmcp deferred to T4.1 to avoid pre-1.0 churn)
 - [ ] T1.2 `scripts/sanitize.py` + fixture corpus (2.1.56, 2.1.183, subagents, streaming dups, edge-case)
 
 ## Phase 2 — First vertical slice

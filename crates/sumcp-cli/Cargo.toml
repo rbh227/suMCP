@@ -1,0 +1,15 @@
+[package]
+name = "sumcp-cli"
+description = "suMCP command-line interface: instant session debrief, HTML report, install"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "sumcp"
+path = "src/main.rs"
+
+[dependencies]
+sumcp-core = { path = "../sumcp-core" }
+clap = { version = "4", features = ["derive"] }

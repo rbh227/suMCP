@@ -1,0 +1,12 @@
+[package]
+name = "sumcp-core"
+description = "Deterministic session-forensics core: parse Claude Code transcripts into evidence-backed findings"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# ADR A2: sumcp-core stays synchronous and pure — serde only, no async deps.
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
