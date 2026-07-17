@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "sumcp": {
+      "command": "cargo",
+      "args": ["run", "--quiet", "-p", "sumcp-mcp"]
+    }
+  }
+}

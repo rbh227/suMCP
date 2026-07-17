@@ -174,7 +174,14 @@ pub fn context_health(s: &Session, meta: &SessionMeta) -> Value {
 }
 
 /// `evidence(idxs)` — raw actions behind findings, capped.
+///
+/// Three caps stack here: ≤`EVIDENCE_MAX` actions, ≤`EXCERPT_MAX` chars per
+/// excerpt, and the 1500-token payload cap. Ten dense excerpts can bust the
+/// token cap even inside the first two, so the payload is shrunk tail-first
+/// until it fits — the cap is enforced by construction (ADR A5), not hoped
+/// about.
 pub fn evidence(s: &Session, idxs: &[Idx], meta: &SessionMeta) -> Value {
+    const TOKEN_CAP: usize = 1500;
     let mut found = Vec::new();
     let mut not_found = Vec::new();
     for &Idx(i) in idxs.iter().take(EVIDENCE_MAX) {
@@ -187,14 +194,24 @@ pub fn evidence(s: &Session, idxs: &[Idx], meta: &SessionMeta) -> Value {
             None => not_found.push(i),
         }
     }
-    json!({
-        "v": 0,
-        "session": {"id": meta.id, "identified_by": meta.identified_by},
-        "actions": found,
-        "not_found": not_found,
-        "caps": {"max_actions": EVIDENCE_MAX, "max_excerpt_chars": EXCERPT_MAX},
-        "truncated": idxs.len() > EVIDENCE_MAX
-    })
+    let mut dropped_for_cap = false;
+    loop {
+        let payload = json!({
+            "v": 0,
+            "session": {"id": meta.id, "identified_by": meta.identified_by},
+            "actions": found,
+            "not_found": not_found,
+            "caps": {"max_actions": EVIDENCE_MAX, "max_excerpt_chars": EXCERPT_MAX},
+            "truncated": idxs.len() > EVIDENCE_MAX || dropped_for_cap
+        });
+        // Under cap, or nothing left to drop (a pathological single excerpt
+        // still fits: 600 chars ≈ 172 tokens) — done either way.
+        if est_tokens(&payload) <= TOKEN_CAP || found.is_empty() {
+            return payload;
+        }
+        found.pop();
+        dropped_for_cap = true;
+    }
 }
 
 fn excerpt(a: &Action) -> String {
@@ -204,7 +221,11 @@ fn excerpt(a: &Action) -> String {
         .or(a.error.as_deref())
         .or(a.edit_new.as_deref())
         .unwrap_or("");
-    raw.chars().take(EXCERPT_MAX).collect()
+    let capped: String = raw.chars().take(EXCERPT_MAX).collect();
+    // ADR A9(4): everything excerpted to a caller passes the redaction pass.
+    // Redact AFTER capping so a PEM block cut by the cap still redacts to
+    // the excerpt's end (the truncated-block case redact() handles).
+    crate::redact::redact(&capped)
 }
 
 fn kind_str(k: &ActionKind) -> String {
@@ -271,6 +292,41 @@ mod tests {
             );
             assert!(est_tokens(&payload) <= cap, "over cap: {}", payload);
         }
+    }
+
+    #[test]
+    fn evidence_stays_under_its_token_cap_with_ten_dense_excerpts() {
+        // Ten Bash actions, each with a max-length command — the worst case
+        // that used to bust the 1500-token cap on real data.
+        let lines: Vec<String> = (0..10)
+            .map(|i| {
+                format!(
+                    r#"{{"type":"assistant","timestamp":"2026-01-01T00:00:0{i}Z","message":{{"content":[{{"type":"tool_use","id":"c{i}","name":"Bash","input":{{"command":"{}"}}}}]}}}}"#,
+                    "x".repeat(700)
+                )
+            })
+            .collect();
+        let s = ingest_str(&lines.join("\n"), Lane::Main);
+        let idxs: Vec<Idx> = (0..10).map(Idx).collect();
+        let p = evidence(&s, &idxs, &meta());
+        assert!(
+            est_tokens(&p) <= 1500,
+            "over cap: ~{} tokens",
+            est_tokens(&p)
+        );
+        assert_eq!(p["truncated"], true, "dropping for cap must be visible");
+        assert!(!p["actions"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn evidence_excerpts_are_redacted() {
+        // A Bash action whose command carries a secret assignment.
+        let line = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"tool_use","id":"b1","name":"Bash","input":{"command":"export API_KEY=abc123def456 && deploy"}}]}}"#;
+        let s = ingest_str(line, Lane::Main);
+        let p = evidence(&s, &[Idx(0)], &meta());
+        let text = p["actions"][0]["excerpt"].as_str().unwrap();
+        assert!(text.contains("[REDACTED]"), "secret must be masked: {text}");
+        assert!(!text.contains("abc123def456"), "raw secret leaked: {text}");
     }
 
     #[test]
