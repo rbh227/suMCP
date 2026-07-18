@@ -26,14 +26,19 @@ Every finding-like object (anything with a `kind`) carries:
 {"kind":"rework","tier":"T2","exact":true,"confidence":"high","idxs":[102,141]}
 ```
 
-- `kind` — churn | rework | failure_loop | thrash | fumble | blind_write_attempt |
-  true_revert | flip | user_corrected | write_no_reread | read_unreferenced |
-  large_write_instant_accept | opening_move
+- `kind` — churn | rework | failure_loop | re_read (renamed from thrash,
+  2026-07-18) | fumble | blind_write_attempt | true_revert | flip |
+  user_corrected | write_no_reread | read_unreferenced |
+  large_write_instant_accept | opening_move | action_loop | review_burden
 - `tier` — field-reliability tier T1–T3 (metrics-spec parser rules)
 - `exact` — `true` = deterministic count; `false` = heuristic (attribution,
   latency); heuristics also carry a human-readable `note`
 - `confidence` — high | medium | low (low counts ×0.5 in ranking)
 - `idxs` — action indices proving the finding, dereferenceable via `evidence()`
+- `nums` — optional map of numeric operationalizations (2026-07-18
+  re-grounding); present keys per kind: opening_move
+  `edit_fraction_first10`+`first_edit_index`, churn `relative_churn`,
+  action_loop `repeats`, review_burden `loc`+`band_hi`. Absent when empty.
 
 ## Tools, caps, truncation rules
 
@@ -62,7 +67,19 @@ Emitted when self-identification cannot verify the caller and no explicit
 
 `blind_spots.suppression` reports whether approval-latency metrics are active;
 when `permissionMode` grants auto-accept they are suppressed entirely rather
-than reported as meaningless numbers.
+than reported as meaningless numbers. `review_burden` (the comprehension-layer
+anchor, metrics-spec #27) is **never suppressed** — LOC-per-human-turn stays
+meaningful under auto-accept, which is exactly when it matters most; the
+suppression object says so explicitly.
+
+## 2026-07-18 additive fields (non-breaking, `v` stays 0)
+
+| payload | field | contents |
+|---|---|---|
+| `session_overview` | `patch_first_segment_share` | share of classified task segments opening patch-first (metrics-spec #9 roll-up); `null` when nothing classified |
+| `blind_spots` | `review_burden` | ReviewBurden findings (LOC per human turn > 400 band) |
+| `context_health` | `read_edit_file_ratio` | distinct files read ÷ distinct files edited, informational (#28); `null` for read-only sessions |
+| `struggle_areas.weights` | `re_read`, `action_loop` | `thrash` key renamed; advisory loop weight added |
 
 ## Versioning
 

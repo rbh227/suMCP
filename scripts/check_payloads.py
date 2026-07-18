@@ -33,10 +33,13 @@ FINDING_FIELDS = {"kind", "tier", "exact", "confidence", "idxs"}
 TIERS = {"T1", "T2", "T3"}
 CONFIDENCES = {"high", "medium", "low"}
 # closed set from docs/payload-schema.md
+# 2026-07-18 re-grounding: "thrash" renamed "re_read"; "action_loop" and
+# "review_burden" added (metrics-spec #21, #27).
 KINDS = {
-    "churn", "rework", "failure_loop", "thrash", "fumble", "blind_write_attempt",
+    "churn", "rework", "failure_loop", "re_read", "fumble", "blind_write_attempt",
     "true_revert", "flip", "user_corrected", "write_no_reread",
     "read_unreferenced", "large_write_instant_accept", "opening_move",
+    "action_loop", "review_burden",
 }
 
 

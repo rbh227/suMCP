@@ -37,20 +37,59 @@ fn by_file<'a>(s: &'a Session, want: &dyn Fn(&ActionKind) -> bool) -> BTreeMap<&
 }
 
 /// Churn: files edited (Edit/Write) `CHURN_MIN_EDITS`+ times.
+///
+/// When the file's size is known (see [`last_known_total_lines`]), the finding
+/// also carries `nums["relative_churn"]` = churned lines / file lines —
+/// size-normalized churn predicts defects where absolute churn does not
+/// (Nagappan & Ball, ICSE 2005; metrics-spec #7). Heuristic refinement: the
+/// denominator can be stale after edits, so raw count stays the headline.
 fn churn(s: &Session) -> Vec<Finding> {
     by_file(s, &|k| matches!(k, ActionKind::Edit | ActionKind::Write))
         .into_iter()
         .filter(|(_, idxs)| idxs.len() >= CHURN_MIN_EDITS)
-        .map(|(file, idxs)| Finding {
-            kind: FindingKind::Churn,
-            tier: Tier::T1,
-            exact: true,
-            confidence: Confidence::High,
-            note: Some(format!("edited {} times", idxs.len())),
-            idxs,
-            file: Some(file.to_string()),
+        .map(|(file, idxs)| {
+            let mut nums = BTreeMap::new();
+            if let Some(total) = last_known_total_lines(s, file) {
+                let churned: usize = s
+                    .actions
+                    .iter()
+                    .filter(|a| {
+                        matches!(a.kind, ActionKind::Edit | ActionKind::Write)
+                            && a.file_path.as_deref() == Some(file)
+                    })
+                    .filter_map(|a| a.write_lines)
+                    .sum();
+                if churned > 0 {
+                    nums.insert("relative_churn".into(), churned as f64 / total as f64);
+                }
+            }
+            Finding {
+                kind: FindingKind::Churn,
+                nums,
+                tier: Tier::T1,
+                exact: true,
+                confidence: Confidence::High,
+                note: Some(format!("edited {} times", idxs.len())),
+                idxs,
+                file: Some(file.to_string()),
+            }
         })
         .collect()
+}
+
+/// The most recent file size the harness reported for `file` — the
+/// `totalLines` of its latest Read result. `None` when the file was never
+/// read with a size-bearing result (then relative churn is unknowable).
+fn last_known_total_lines(s: &Session, file: &str) -> Option<usize> {
+    s.actions
+        .iter()
+        .rev() // latest Read wins — sizes drift as the session edits the file
+        .find(|a| {
+            matches!(a.kind, ActionKind::Read)
+                && a.file_path.as_deref() == Some(file)
+                && a.read_total_lines.is_some()
+        })
+        .and_then(|a| a.read_total_lines)
 }
 
 /// Thrash: files re-read `THRASH_MIN_READS`+ times (losing the mental model).
@@ -59,7 +98,8 @@ fn thrash(s: &Session) -> Vec<Finding> {
         .into_iter()
         .filter(|(_, idxs)| idxs.len() >= THRASH_MIN_READS)
         .map(|(file, idxs)| Finding {
-            kind: FindingKind::Thrash,
+            kind: FindingKind::ReRead,
+            nums: Default::default(),
             tier: Tier::T1,
             exact: true,
             confidence: Confidence::High,
@@ -91,6 +131,7 @@ fn rework(s: &Session) -> Vec<Finding> {
                 if hunks_overlap(&earlier.hunks, &later.hunks) {
                     findings.push(Finding {
                         kind: FindingKind::Rework,
+                        nums: Default::default(),
                         tier: Tier::T2,
                         exact: true,
                         confidence: Confidence::High,
@@ -127,6 +168,7 @@ fn blind_write_attempts(s: &Session) -> Vec<Finding> {
         })
         .map(|a| Finding {
             kind: FindingKind::BlindWriteAttempt,
+            nums: Default::default(),
             tier: Tier::T1,
             exact: true,
             confidence: Confidence::High,
@@ -166,6 +208,71 @@ mod tests {
         assert_eq!(f.len(), 1, "only /a.ts (edited twice) churns");
         assert_eq!(f[0].file.as_deref(), Some("/a.ts"));
         assert_eq!(f[0].idxs.len(), 2);
+    }
+
+    /// An Edit whose new_string has `lines` lines, plus a sized Read result.
+    fn edit_lines(id: &str, ts: &str, file: &str, lines: usize) -> String {
+        let content = vec!["x"; lines].join("\\n");
+        format!(
+            r#"{{"type":"assistant","timestamp":"{ts}","message":{{"content":[{{"type":"tool_use","id":"{id}","name":"Edit","input":{{"file_path":"{file}","new_string":"{content}"}}}}]}}}}"#
+        )
+    }
+    fn sized_read(id: &str, ts: &str, file: &str, total: usize) -> String {
+        format!(
+            concat!(
+                r#"{{"type":"assistant","timestamp":"{ts}","message":{{"content":[{{"type":"tool_use","id":"{id}","name":"Read","input":{{"file_path":"{file}"}}}}]}}}}"#,
+                "\n",
+                r#"{{"type":"user","timestamp":"{ts}","message":{{"content":[{{"type":"tool_result","tool_use_id":"{id}","is_error":false}}]}},"toolUseResult":{{"type":"text","file":{{"filePath":"{file}","totalLines":{total}}}}}}}"#,
+            ),
+            ts = ts,
+            id = id,
+            file = file,
+            total = total,
+        )
+    }
+
+    #[test]
+    fn relative_churn_uses_last_known_file_size() {
+        // 300-line file, three 10-line edits ⇒ relative churn 30/300 = 0.1
+        let raw = format!(
+            "{}\n{}\n{}\n{}",
+            sized_read("r1", "2026-01-01T00:00:01Z", "/a.ts", 300),
+            edit_lines("e1", "2026-01-01T00:00:02Z", "/a.ts", 10),
+            edit_lines("e2", "2026-01-01T00:00:03Z", "/a.ts", 10),
+            edit_lines("e3", "2026-01-01T00:00:04Z", "/a.ts", 10),
+        );
+        let f = churn(&ingest_str(&raw, Lane::Main));
+        assert_eq!(f.len(), 1);
+        assert!((f[0].nums["relative_churn"] - 0.1).abs() < 1e-9);
+    }
+
+    #[test]
+    fn relative_churn_absent_without_a_sized_read() {
+        let raw = format!(
+            "{}\n{}",
+            edit_lines("e1", "2026-01-01T00:00:01Z", "/a.ts", 10),
+            edit_lines("e2", "2026-01-01T00:00:02Z", "/a.ts", 10),
+        );
+        let f = churn(&ingest_str(&raw, Lane::Main));
+        assert_eq!(f.len(), 1);
+        assert!(
+            !f[0].nums.contains_key("relative_churn"),
+            "no denominator ⇒ raw count only"
+        );
+    }
+
+    #[test]
+    fn relative_churn_denominator_tracks_the_latest_read() {
+        // First read says 100 lines, a later one says 400 — the 400 wins.
+        let raw = format!(
+            "{}\n{}\n{}\n{}",
+            sized_read("r1", "2026-01-01T00:00:01Z", "/a.ts", 100),
+            edit_lines("e1", "2026-01-01T00:00:02Z", "/a.ts", 20),
+            edit_lines("e2", "2026-01-01T00:00:03Z", "/a.ts", 20),
+            sized_read("r2", "2026-01-01T00:00:04Z", "/a.ts", 400),
+        );
+        let f = churn(&ingest_str(&raw, Lane::Main));
+        assert!((f[0].nums["relative_churn"] - 0.1).abs() < 1e-9, "40/400");
     }
 
     #[test]

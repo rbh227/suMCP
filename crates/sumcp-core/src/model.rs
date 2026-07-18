@@ -88,6 +88,19 @@ pub struct Action {
     pub is_error: Option<bool>,
     /// Size in chars of a Write/Edit's new content, if known (large-write signal).
     pub write_len: Option<usize>,
+    /// Line count of a Write/Edit's FULL new content, counted at ingest
+    /// *before* `edit_new` gets capped — so it stays accurate for huge writes.
+    /// Consumers: review-burden (#27), relative churn (#7).
+    pub write_lines: Option<usize>,
+    /// For Read actions: the file's total line count as the harness reported
+    /// it (`toolUseResult.file.totalLines`, a T2 field). This is the file's
+    /// real size even when the Read itself was partial (offset/limit).
+    /// Consumer: relative-churn denominator (#7).
+    pub read_total_lines: Option<usize>,
+    /// Hash of (tool name + raw serialized input JSON). Byte-identical calls
+    /// hash equal — that's all the loop detector (#21) needs. Not a content
+    /// fingerprint; never surfaced in payloads.
+    pub input_hash: Option<u64>,
     /// Error text from the tool result, if it errored (drives fumble detection).
     pub error: Option<String>,
     /// Edited line ranges `(start, end)` from `structuredPatch` (rework signal).
@@ -169,8 +182,10 @@ pub enum FindingKind {
     Churn,
     /// A later edit overlapping an earlier edit's lines.
     Rework,
-    /// A file re-read many times.
-    Thrash,
+    /// A file re-read many times. Renamed from `Thrash` (2026-07-18) so our
+    /// corpus-grounded re-read count never masquerades as the literature's
+    /// stuck-in-loop metric (which is `ActionLoop`). Serializes as `re_read`.
+    ReRead,
     /// An edit attempted before the file was read (harness-blocked).
     BlindWriteAttempt,
     /// Repeated failing commands attributed to a file.
@@ -185,6 +200,14 @@ pub enum FindingKind {
     OpeningMove,
     /// A large write accepted almost instantly (comprehension debt).
     LargeWriteInstantAccept,
+    /// ≥3 consecutive byte-identical tool calls in one lane (metrics-spec
+    /// #21, SEAlign definition). Always advisory: emitted with
+    /// `Confidence::Low` so ranking applies `low_confidence_factor`.
+    ActionLoop,
+    /// More agent-written lines between two human turns than the 200–400 LOC
+    /// human review band (metrics-spec #27, the comprehension-layer anchor).
+    /// Frames risk ("plausibly could not have been reviewed"), never verdict.
+    ReviewBurden,
 }
 
 /// One evidence-backed observation about the session.
@@ -209,6 +232,13 @@ pub struct Finding {
     /// Human-readable explanation (required when `exact` is false).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// Numeric operationalizations backing the finding (e.g.
+    /// `edit_fraction_first10`, `first_edit_index`, `relative_churn`, `loc`).
+    /// One map instead of bespoke fields per kind — payloads stay uniform.
+    /// `skip_serializing_if` keeps existing findings' JSON unchanged (an
+    /// empty map serializes to nothing); `default` lets old JSON deserialize.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty", default)]
+    pub nums: std::collections::BTreeMap<String, f64>,
 }
 
 /// A user text message, placed in time so signals can ask "did the user push

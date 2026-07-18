@@ -128,10 +128,15 @@ pub fn ingest_str(raw: &str, default_lane: Lane) -> Session {
                             .and_then(Value::as_str)
                             .map(str::to_string);
                         // large-write size: Write uses `content`, Edit `new_string`.
-                        let write_len = input
+                        // Chars AND lines are counted here on the FULL string,
+                        // before `norm_cap` truncates what we store — a capped
+                        // copy would undercount exactly the large writes the
+                        // review-burden signal (#27) exists to catch.
+                        let new_content = input
                             .and_then(|i| i.get("content").or_else(|| i.get("new_string")))
-                            .and_then(Value::as_str)
-                            .map(str::len);
+                            .and_then(Value::as_str);
+                        let write_len = new_content.map(str::len);
+                        let write_lines = new_content.map(|s| s.lines().count());
                         let command = input
                             .and_then(|i| i.get("command"))
                             .and_then(Value::as_str)
@@ -157,6 +162,8 @@ pub fn ingest_str(raw: &str, default_lane: Lane) -> Session {
                             kind: ActionKind::from_tool(name),
                             file_path,
                             write_len,
+                            write_lines,
+                            input_hash: Some(hash_call(name, input)),
                             command,
                             edit_old,
                             edit_new,
@@ -189,6 +196,16 @@ pub fn ingest_str(raw: &str, default_lane: Lane) -> Session {
                                 .and_then(|r| r.get("userModified"))
                                 .and_then(Value::as_bool)
                                 .unwrap_or(false);
+                            // Read results report the file's REAL size
+                            // (`file.totalLines`) even for partial reads —
+                            // the relative-churn denominator (#7). T2 field:
+                            // absent on non-Read results, tolerated.
+                            let read_total_lines = v
+                                .get("toolUseResult")
+                                .and_then(|r| r.get("file"))
+                                .and_then(|f| f.get("totalLines"))
+                                .and_then(Value::as_u64)
+                                .map(|n| n as usize);
                             results.insert(
                                 id.to_string(),
                                 ResultInfo {
@@ -197,6 +214,7 @@ pub fn ingest_str(raw: &str, default_lane: Lane) -> Session {
                                     hunks,
                                     user_modified,
                                     result_ts: effective_ts.clone(),
+                                    read_total_lines,
                                 },
                             );
                         }
@@ -235,6 +253,9 @@ pub fn ingest_str(raw: &str, default_lane: Lane) -> Session {
                 file_path: p.file_path,
                 is_error: r.map(|r| r.is_error),
                 write_len: p.write_len,
+                write_lines: p.write_lines,
+                read_total_lines: r.and_then(|r| r.read_total_lines),
+                input_hash: p.input_hash,
                 error: r.and_then(|r| r.error.clone()),
                 hunks: r.map(|r| r.hunks.clone()).unwrap_or_default(),
                 command: p.command,
@@ -327,6 +348,8 @@ struct PendingAction {
     kind: ActionKind,
     file_path: Option<String>,
     write_len: Option<usize>,
+    write_lines: Option<usize>,
+    input_hash: Option<u64>,
     command: Option<String>,
     edit_old: Option<String>,
     edit_new: Option<String>,
@@ -339,6 +362,22 @@ struct ResultInfo {
     hunks: Vec<(u32, u32)>,
     user_modified: bool,
     result_ts: String,
+    read_total_lines: Option<usize>,
+}
+
+/// Hash (tool name + raw input JSON) for the loop detector: byte-identical
+/// calls hash equal, that's the whole contract. `DefaultHasher` is not stable
+/// across Rust versions — fine, the hash never leaves this process.
+fn hash_call(name: &str, input: Option<&Value>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::hash::DefaultHasher::new();
+    name.hash(&mut h);
+    // `to_string` on a serde_json::Value is deterministic for the same parsed
+    // input (keys keep their parse order), so equal lines ⇒ equal strings.
+    if let Some(i) = input {
+        i.to_string().hash(&mut h);
+    }
+    h.finish()
 }
 
 /// Read a `usage` object into [`Tokens`], tolerating missing fields.
@@ -452,5 +491,54 @@ mod tests {
             vec![(10, 15)],
             "structuredPatch joined by tool_use id"
         );
+    }
+
+    #[test]
+    fn write_lines_counted_on_full_content_before_cap() {
+        // 300 lines of 20 chars ≈ 6300 chars — far beyond the storage cap, so
+        // a post-cap count would be wrong. The count must use the full input.
+        let content: String = (0..300)
+            .map(|i| format!("line {i:04} xxxxxxxx\\n"))
+            .collect();
+        let raw = format!(
+            r#"{{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{{"content":[{{"type":"tool_use","id":"w1","name":"Write","input":{{"file_path":"/big.rs","content":"{content}"}}}}]}}}}"#
+        );
+        let s = ingest_str(&raw, Lane::Main);
+        assert_eq!(s.actions[0].write_lines, Some(300));
+    }
+
+    #[test]
+    fn read_total_lines_joined_from_tool_use_result() {
+        // Shape verified against fixtures/raw (toolUseResult.file.totalLines).
+        let raw = concat!(
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"tool_use","id":"r1","name":"Read","input":{"file_path":"/a.rs","offset":10,"limit":50}}]}}"#,
+            "\n",
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:01Z","message":{"content":[{"type":"tool_result","tool_use_id":"r1","is_error":false}]},"toolUseResult":{"type":"text","file":{"filePath":"/a.rs","numLines":50,"startLine":10,"totalLines":413}}}"#,
+        );
+        let s = ingest_str(raw, Lane::Main);
+        assert_eq!(
+            s.actions[0].read_total_lines,
+            Some(413),
+            "totalLines is the real file size even for a partial read"
+        );
+    }
+
+    #[test]
+    fn input_hash_equal_iff_calls_byte_identical() {
+        let grep = |id: &str, pat: &str| {
+            format!(
+                r#"{{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{{"content":[{{"type":"tool_use","id":"{id}","name":"Grep","input":{{"pattern":"{pat}"}}}}]}}}}"#
+            )
+        };
+        let raw = format!(
+            "{}\n{}\n{}",
+            grep("g1", "foo"),
+            grep("g2", "foo"),
+            grep("g3", "bar")
+        );
+        let s = ingest_str(&raw, Lane::Main);
+        assert_eq!(s.actions[0].input_hash, s.actions[1].input_hash);
+        assert_ne!(s.actions[0].input_hash, s.actions[2].input_hash);
+        assert!(s.actions[0].input_hash.is_some());
     }
 }

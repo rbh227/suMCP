@@ -84,6 +84,48 @@ engineering contract.
    attribution windows). Requires a fixture with untimestamped and
    identical-timestamp events asserting stable `Idx` run-to-run.
 
+### Research re-grounding amendments (grilled and locked 2026-07-18)
+
+Triggered by an independent literature review (top-10 evidence-ranked metrics);
+7 of 10 were already specced and implemented. The deltas and tightenings, all
+inside v0.1 **before** the external release gate runs (running the gate on
+metrics known to misfire wastes the testers):
+
+1. **Review-burden ratio is the comprehension-layer anchor** (metrics-spec
+   #27): agent LOC between consecutive substantive user messages vs the
+   200–400 LOC human review band (SmartBear/Cisco + Perry et al.). Works under
+   auto-accept, where approval latency is suppressed. #15/#16 demoted to
+   corroborating signals. Reported in `blind_spots()`; framed as risk, never
+   verdict.
+2. **Opening move goes per-task-segment** (metrics-spec #9): segments start at
+   each substantive user message; only segments with ≥5 tool actions are
+   classified; confidence Medium; leading user message cited as evidence.
+   Numeric fields added (edit-fraction of first 10, first-edit index).
+   Fixes the false-accusation case where the human directs an immediate edit.
+3. **Literature stuck-in-loop detector added** (metrics-spec #21): ≥3
+   consecutive byte-identical tool+input calls in one agent lane,
+   advisory-only (Low confidence, ×`low_confidence_factor`). Re-read Thrash is
+   renamed in payloads (corpus-grounded, distinct construct).
+4. **Relative churn refinement** (metrics-spec #7): `relative_churn` field
+   (lines churned / last full-Read line count) when a denominator is known;
+   used for within-category weighting; raw count fallback.
+5. **Localization dispersion** (metrics-spec #28): read:edit file ratio in
+   `context_health()`, informational-only, edits-only sessions; outlier
+   flagging is a v2 cross-session seam.
+6. **Weights get a documented ordinal rationale** (metrics-spec "Why these
+   default weights"): order research-derived, decimals editorial; payloads
+   never claim literature-derived weights. Validation share is
+   informational-only, never scored.
+7. **Bug (spec-vs-code):** the flip detector must also require **no new
+   evidence gathered between** pushback and reversal (locked decision #3;
+   FlipFlop caveat) — `dynamics.rs` currently checks pushback only.
+   Reversal after a failing test or new read is healthy revision, not a flip.
+8. **Token/efficiency layer confirmed as-is** (challenged, kept): raw totals
+   stay in `session_overview` (agent grounding + ccusage calibration gate);
+   cache-hit and window fill stay (context-rot grounding).
+
+No change to the six-tool MCP surface.
+
 ## 2. MCP tools (all read-only, hard payload caps, default to current session/cwd)
 
 | Tool | Returns | Cap |

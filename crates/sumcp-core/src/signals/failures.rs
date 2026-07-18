@@ -69,6 +69,7 @@ fn failure_loops(s: &Session) -> Vec<Finding> {
             };
             Finding {
                 kind: FindingKind::FailureLoop,
+                nums: Default::default(),
                 tier: Tier::T2,
                 exact: false, // attribution is always heuristic
                 confidence,

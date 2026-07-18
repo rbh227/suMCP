@@ -5,7 +5,7 @@
 //! evidence; the connected agent narrates. Every payload carries the ADR A4
 //! provenance in `session.identified_by`.
 
-use crate::model::{Action, ActionKind, Idx, Session};
+use crate::model::{Action, ActionKind, Finding, Idx, Session};
 use crate::report::Overview;
 use crate::score::{FileScore, Weights};
 use serde_json::{Value, json};
@@ -55,6 +55,11 @@ pub fn session_overview(s: &Session, ranked: &[FileScore], meta: &SessionMeta) -
             "cache_hit_ratio": o.cache_hit_ratio.map(round2)
         },
         "top_struggles": top,
+        // Session roll-up of the per-segment opening moves (metrics-spec #9):
+        // share of classified task segments that opened patch-first. Omitted
+        // (null) when no segment was big enough to classify.
+        "patch_first_segment_share":
+            crate::signals::dynamics::patch_first_segment_share(s).map(round2),
         "flags": {
             "unknown_event_types": s.type_counts,
             "parse_errors": o.parse_errors,
@@ -132,26 +137,25 @@ pub fn file_story(s: &Session, path: &str, meta: &SessionMeta) -> Value {
     })
 }
 
-/// `blind_spots()` — blind-write attempts and approval outliers.
+/// `blind_spots()` — blind-write attempts, review burden, approval outliers.
 pub fn blind_spots(s: &Session, meta: &SessionMeta) -> Value {
     use crate::model::FindingKind;
     let all = crate::score::all_findings(s);
-    let blind: Vec<_> = all
-        .iter()
-        .filter(|f| matches!(f.kind, FindingKind::BlindWriteAttempt))
-        .collect();
-    let approval: Vec<_> = all
-        .iter()
-        .filter(|f| matches!(f.kind, FindingKind::LargeWriteInstantAccept))
-        .collect();
+    let of_kind =
+        |kind: FindingKind| -> Vec<&Finding> { all.iter().filter(|f| f.kind == kind).collect() };
     json!({
         "v": 0,
         "session": {"id": meta.id, "identified_by": meta.identified_by},
-        "blind_write_attempts": blind,
-        "approval_outliers": approval,
+        "blind_write_attempts": of_kind(FindingKind::BlindWriteAttempt),
+        // The comprehension-layer anchor (metrics-spec #27): agent LOC per
+        // human turn vs the 200–400 LOC review band. Never suppressed —
+        // it is exactly the auto-accept mode where this matters most.
+        "review_burden": of_kind(FindingKind::ReviewBurden),
+        "approval_outliers": of_kind(FindingKind::LargeWriteInstantAccept),
         "suppression": {
             "approval_latency": if crate::signals::comprehension::approval_latency_active(s) {"active"} else {"suppressed"},
-            "suppressed_when": "permissionMode grants auto-accept"
+            "suppressed_when": "permissionMode grants auto-accept",
+            "review_burden": "never suppressed"
         },
         "truncated": false
     })
@@ -168,9 +172,35 @@ pub fn context_health(s: &Session, meta: &SessionMeta) -> Value {
             "output": s.tokens.output, "input_uncached": s.tokens.input,
             "cache_read": s.tokens.cache_read, "cache_creation": s.tokens.cache_creation
         },
+        // Localization dispersion (metrics-spec #28): distinct files read per
+        // distinct file edited. Informational only in v0.1 — TRAJEVAL's ~22×
+        // over-read baseline needs gold patches, and a personal cross-session
+        // baseline (the v2 seam) is what would make "unusually dispersed"
+        // meaningful. Omitted (null) for sessions that edited nothing:
+        // a read-only session's ratio carries no localization signal.
+        "read_edit_file_ratio": read_edit_file_ratio(s).map(round2),
         "note": "v0.1 reports context economics as information only; token-level waste deferred",
         "truncated": false
     })
+}
+
+/// Distinct-files-read : distinct-files-edited, `None` when nothing was edited.
+fn read_edit_file_ratio(s: &Session) -> Option<f64> {
+    use crate::model::ActionKind;
+    let distinct = |want: fn(&ActionKind) -> bool| {
+        s.actions
+            .iter()
+            .filter(|a| want(&a.kind))
+            .filter_map(|a| a.file_path.as_deref())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+    };
+    let edited = distinct(|k| matches!(k, ActionKind::Edit | ActionKind::Write));
+    if edited == 0 {
+        return None;
+    }
+    let read = distinct(|k| matches!(k, ActionKind::Read));
+    Some(read as f64 / edited as f64)
 }
 
 /// `evidence(idxs)` — raw actions behind findings, capped.
@@ -267,6 +297,36 @@ mod tests {
             ));
         }
         ingest_str(&lines.join("\n"), Lane::Main)
+    }
+
+    #[test]
+    fn dispersion_ratio_reads_over_edits() {
+        // 10 distinct files read, 2 distinct edited ⇒ 5.0
+        let mut lines = Vec::new();
+        for i in 0..10 {
+            lines.push(format!(
+                r#"{{"type":"assistant","timestamp":"2026-01-01T00:00:{i:02}Z","message":{{"content":[{{"type":"tool_use","id":"r{i}","name":"Read","input":{{"file_path":"/f{i}.rs"}}}}]}}}}"#
+            ));
+        }
+        for i in 0..2 {
+            lines.push(format!(
+                r#"{{"type":"assistant","timestamp":"2026-01-01T00:01:{i:02}Z","message":{{"content":[{{"type":"tool_use","id":"e{i}","name":"Edit","input":{{"file_path":"/f{i}.rs","new_string":"x"}}}}]}}}}"#
+            ));
+        }
+        let s = ingest_str(&lines.join("\n"), Lane::Main);
+        let p = context_health(&s, &meta());
+        assert_eq!(p["read_edit_file_ratio"], 5.0);
+    }
+
+    #[test]
+    fn dispersion_ratio_omitted_for_read_only_sessions() {
+        let raw = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"tool_use","id":"r0","name":"Read","input":{"file_path":"/f.rs"}}]}}"#;
+        let s = ingest_str(raw, Lane::Main);
+        let p = context_health(&s, &meta());
+        assert!(
+            p["read_edit_file_ratio"].is_null(),
+            "no edits ⇒ ratio is no localization signal"
+        );
     }
 
     #[test]

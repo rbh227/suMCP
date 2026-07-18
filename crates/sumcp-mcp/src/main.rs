@@ -124,7 +124,7 @@ mod tests {
         let w = load_weights_from(Some(path.clone()));
         assert_eq!(w.churn, 9.5);
         // Unspecified fields keep their defaults (serde(default) on Weights).
-        assert_eq!(w.rework, 2.0);
+        assert_eq!(w.rework, sumcp_core::score::Weights::default().rework);
         assert_eq!(w.source, path.display().to_string());
     }
 

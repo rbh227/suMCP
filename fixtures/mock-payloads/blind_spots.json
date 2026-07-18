@@ -5,7 +5,9 @@
  {"kind":"blind_write_attempt","tier":"T1","exact":true,"confidence":"high","idxs":[344],"file":"src/store/DataStore.ts","error":"File has not been read yet"}],
 "written_never_reread":[
  {"kind":"write_no_reread","tier":"T1","exact":true,"confidence":"high","idxs":[52],"file":"scripts/export_data.py","by":"main","note":"written once, never read or verified by any agent"}],
+"review_burden":[
+ {"kind":"review_burden","tier":"T1","exact":false,"confidence":"medium","idxs":[203,204,207,211],"nums":{"loc":612.0,"band_hi":400.0},"note":"612 lines written before the next human turn — above the 200–400 LOC review band"}],
 "approval_outliers":[
  {"kind":"large_write_instant_accept","tier":"T2","exact":false,"confidence":"medium","idxs":[203,204],"file":"src/App.tsx","write_chars":9814,"latency_s":2.1,"note":"heuristic: Edit/Write only; delta ~= human decision time"}],
-"suppression":{"approval_latency":"active","reason":null,"suppressed_when":"permissionMode grants auto-accept"},
+"suppression":{"approval_latency":"active","reason":null,"suppressed_when":"permissionMode grants auto-accept","review_burden":"never suppressed"},
 "truncated":false}
