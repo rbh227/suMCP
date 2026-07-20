@@ -8,6 +8,7 @@
 
 pub mod ingest;
 pub mod locate;
+pub mod merge;
 pub mod model;
 pub mod payloads;
 pub mod redact;
