@@ -246,8 +246,15 @@ fn reverts_and_flips(s: &Session) -> Vec<Finding> {
     let mut out = Vec::new();
     for (i, later) in edits.iter().enumerate() {
         for earlier in &edits[..i] {
-            // same file, and the later edit puts back what the earlier removed
-            if earlier.file_path == later.file_path && later.edit_new == earlier.edit_old {
+            // same LANE, same file, and the later edit puts back what the
+            // earlier removed. Lane guard (spec §5a): a revert is one actor
+            // undoing its own change — a cross-lane content coincidence on a
+            // shared path is not a revert, and a subagent edit's line_no
+            // indexes a different file than the main-lane pushback stream.
+            if earlier.lane == later.lane
+                && earlier.file_path == later.file_path
+                && later.edit_new == earlier.edit_old
+            {
                 // A flip needs BOTH: pushback in between, and no evidence
                 // gathered between that pushback and the reverting edit.
                 let is_flip = pushback_between(s, earlier.line_no, later.line_no)
@@ -534,6 +541,36 @@ mod tests {
             edit("2", "2026-01-01T00:00:02Z", "/a.ts", "baz", "qux"),
         );
         assert!(reverts_and_flips(&ingest_str(&raw, Lane::Main)).is_empty());
+    }
+
+    #[test]
+    fn cross_lane_revert_is_not_flagged() {
+        // A main edit and a subagent edit on the same path, where the sub's
+        // new_string restores the main's old_string. Different actors → not a
+        // revert. Same content within one lane WOULD fire (asserted below).
+        use crate::model::{Action, ActionKind, Idx, Lane};
+        let mk = |idx, lane, ts: &str, line, old: &str, new: &str| Action {
+            idx: Idx(idx), effective_ts: ts.into(), ts_inherited: false, lane,
+            line_no: line, kind: ActionKind::Edit, file_path: Some("/a".into()),
+            is_error: None, write_len: None, write_lines: None, read_total_lines: None,
+            input_hash: None, error: None, hunks: vec![], command: None,
+            user_modified: false, edit_old: Some(old.into()), edit_new: Some(new.into()),
+            approval_latency_s: None,
+        };
+        let mut s = crate::model::Session {
+            actions: vec![
+                mk(0, Lane::Main, "2026-01-01T00:00:01Z", 1, "foo", "bar"),
+                mk(1, Lane::Sub("x".into()), "2026-01-01T00:00:02Z", 1, "bar", "foo"),
+            ],
+            user_texts: vec![], tokens: Default::default(), type_counts: Default::default(),
+            parse_errors: 0, untimestamped_lines: 0, interrupts: 0, auto_accept: false,
+            spawns: vec![], subagent_files_missing: 0,
+        };
+        assert!(reverts_and_flips(&s).is_empty(), "cross-lane pair must not be a revert");
+
+        // Same pair, both main lane → a true_revert fires.
+        s.actions[1].lane = Lane::Main;
+        assert_eq!(reverts_and_flips(&s).len(), 1, "same-lane revert must fire");
     }
 
     fn grep(id: &str, ts: &str, pattern: &str) -> String {
