@@ -11,9 +11,16 @@ record. Never answer from memory what the tools can answer from evidence.
 
 ## Procedure
 
-1. Call `session_overview()`. If it returns `error: ambiguous_session`, pick
-   the candidate matching this session's cwd and pass `session_id` explicitly —
-   never guess between candidates yourself.
+1. If the invocation context provides a session id (the Stop-hook nudge
+   includes one; a user request may name one), call
+   `session_overview(session_id=...)` with it from the start. Otherwise call
+   `session_overview()` bare — the server may verify you opportunistically.
+   If it returns `error: ambiguous_session`, do NOT pick a candidate
+   yourself: `cwd_match` is true for every session in this project and
+   newest-mtime is exactly the recency guess this tool refuses to make
+   (Claude Code flushes transcript writes late, so the live session is often
+   not the newest file). Ask the user which session to debrief, listing the
+   candidates' ids and mtimes.
 2. Call `struggle_areas(3)`.
 3. Only if a top finding needs a concrete quote: `evidence(idxs)` for ONE
    finding. Do not bulk-fetch.

@@ -61,7 +61,12 @@ pub fn session_overview(s: &Session, ranked: &[FileScore], meta: &SessionMeta) -
         "patch_first_segment_share":
             crate::signals::dynamics::patch_first_segment_share(s).map(round2),
         "flags": {
-            "unknown_event_types": s.type_counts,
+            // `type_counts` is the FULL histogram; a flag named "unknown"
+            // must not list the types ingest models (Checkpoint D finding —
+            // "assistant: 132" under "unknown" reads as a parser bug).
+            "unknown_event_types": s.type_counts.iter()
+                .filter(|(t, _)| !matches!(t.as_str(), "assistant" | "user"))
+                .collect::<std::collections::BTreeMap<_, _>>(),
             "parse_errors": o.parse_errors,
             "untimestamped_lines": o.untimestamped_lines,
             // Honest scope disclosure (T4.2): spawns whose subagent work we
@@ -300,6 +305,29 @@ mod tests {
             ));
         }
         ingest_str(&lines.join("\n"), Lane::Main)
+    }
+
+    #[test]
+    fn unknown_event_types_excludes_modeled_types() {
+        // "assistant" and "user" are the two line types ingest actually
+        // models — a flag named "unknown_event_types" listing them is lying
+        // (Checkpoint D live finding, 2026-07-20). Truly unmodeled types
+        // ("queue-operation" here) must still appear.
+        let raw = concat!(
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"/a"}}]}}"#,
+            "\n",
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:01Z","message":{"content":[{"type":"tool_result","tool_use_id":"t1","is_error":false}]}}"#,
+            "\n",
+            r#"{"type":"queue-operation","timestamp":"2026-01-01T00:00:02Z"}"#,
+        );
+        let s = ingest_str(raw, Lane::Main);
+        let p = session_overview(&s, &[], &meta());
+        let unknown = p["flags"]["unknown_event_types"].as_object().unwrap();
+        assert!(
+            !unknown.contains_key("assistant") && !unknown.contains_key("user"),
+            "modeled types must not be reported as unknown: {unknown:?}"
+        );
+        assert_eq!(unknown["queue-operation"], 1);
     }
 
     #[test]

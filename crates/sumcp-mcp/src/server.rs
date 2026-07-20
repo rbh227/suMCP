@@ -24,12 +24,15 @@ use crate::store::SessionStore;
 /// The server key this binary is registered under in `.mcp.json`.
 pub const SERVER_KEY: &str = "sumcp";
 
-/// Bounded retry for transcript flush delay (ADR A4): the calling session
-/// appends its tool_use just before we're invoked, but the write may still be
-/// buffered. 4 attempts × 150 ms keeps worst-case added latency under half a
-/// second — and we only wait when we found *nothing* (more matches never
-/// disappear by waiting).
-const SCAN_ATTEMPTS: u32 = 4;
+/// Bounded retry for transcript flush delay (ADR A4). Measured live
+/// 2026-07-20 (Checkpoint D + /debug log): Claude Code usually flushes the
+/// triggering tool_use line only AFTER our result returns — a write we
+/// cannot outwait — so the scan is *opportunistic verification*, not
+/// reliable discovery (1 hit in 4 live tries; the transcript mtime sat 8 s
+/// stale through one full retry window). Two quick attempts catch the
+/// lucky-flush case cheaply; the dependable path is an explicit
+/// `session_id`, which the Stop-hook debrief flow always passes.
+const SCAN_ATTEMPTS: u32 = 2;
 const SCAN_RETRY_DELAY: Duration = Duration::from_millis(150);
 
 /// The server: project directory to scan, parsed-session cache, weights.
@@ -473,8 +476,9 @@ mod tests {
             .identify_caller(Some("toolu_NEVER"))
             .await
             .unwrap_err();
-        // Proves the retry loop actually waited (3 sleeps × 150 ms)…
-        assert!(started.elapsed() >= Duration::from_millis(400));
+        // Proves the retry loop actually waited (attempts − 1 sleeps),
+        // derived from the constants so tuning them doesn't break the test.
+        assert!(started.elapsed() >= SCAN_RETRY_DELAY * (SCAN_ATTEMPTS - 1));
         // …and still refused to guess, listing the one session it saw.
         match err {
             IdentifyError::Ambiguous(c) => assert_eq!(c.len(), 1),
