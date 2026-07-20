@@ -46,8 +46,12 @@ surface known to omit a whole class of work.
    could not be resolved, read, or parsed to any actions.
 4. No false-merges: a subagent transcript belonging to a *different* session is
    never merged into this one, under either on-disk layout.
-5. Findings that need strict before/after semantics (flip, failure-attribution
-   windows) never fire across an order-uncertain cross-lane boundary.
+5. Position- and line-number-based findings (`true_revert`, `flip`, failure-
+   attribution proximity) compare **only within a single lane** — the merge
+   never causes a subagent edit to read as a main-agent revert, nor a main
+   failure to be attributed to a subagent edit. (Revised 2026-07-20 during
+   planning: supersedes an earlier `order_uncertain` field, which lane-scoping
+   makes redundant — see §5.)
 6. Any subagent-side failure (missing dir, unreadable/oversized/corrupt file,
    too many files) degrades gracefully: the main-lane analysis still returns,
    and the failure is counted in `subagent_files_missing`.
@@ -88,7 +92,8 @@ missing half.
 |---|---|---|
 | Subagent discovery | `crates/sumcp-core/src/locate.rs` | Given the main transcript path + session id, return safety-checked candidate subagent file paths (per layout). Pure path/`read_dir`/canonicalize logic — no content parsing. |
 | Session assembly | `crates/sumcp-core/src/locate.rs` (or a sibling `assemble.rs`) | Orchestrate: read + `ingest_str` each discovered file, validate the sessionId back-pointer where the layout provides one, and call `merge_sessions`. Shared by both binaries so the CLI and MCP paths never duplicate it. |
-| Merge | `crates/sumcp-core/src/merge.rs` (new) | Pure function: N parsed `Session`s + a `files_missing` count → one merged `Session`. Sort, reassign `Idx`, mark `order_uncertain`, aggregate counters, keep only main-lane `user_texts`. No I/O. |
+| Merge | `crates/sumcp-core/src/merge.rs` (new) | Pure function: main `Session` + N subagent `Session`s + a `files_missing` count → one merged `Session`. Sort, reassign `Idx`, aggregate counters, keep only main-lane `user_texts`. No I/O. |
+| Signal lane-scoping | `crates/sumcp-core/src/signals/dynamics.rs`, `crates/sumcp-core/src/signals/failures.rs` | Add same-lane guards so `true_revert`/`flip` and attribution proximity compare only within one lane (see §5a). |
 | Orchestration call site | `crates/sumcp-mcp/src/store.rs`, `crates/sumcp-cli/src/main.rs` | Replace the bare `ingest_str(&raw, Lane::Main)` with the shared assembly entry point. |
 
 **Boundary note (correction to an earlier assumption):** `sumcp-core` is *not*
@@ -97,10 +102,12 @@ strictly filesystem-free — `locate.rs` already calls `canonicalize` for its
 assembly therefore belong in `locate.rs` (fs-aware) while `merge.rs` stays pure
 and fs-free, matching the existing split rather than inventing a new one.
 
-Everything downstream — `signals/`, `score.rs`, the six payload builders in
-`payloads.rs`, `report.rs` — is unchanged. They consume a generic
-`Session` / `Vec<Action>`, and `Lane` / `Idx` already exist for exactly this
-merge.
+Downstream is *almost* unchanged: `score.rs`, the six payload builders in
+`payloads.rs`, and `report.rs` consume a generic `Session` / `Vec<Action>` and
+need no edits. The **exception** is three signals in `signals/` that compare
+actions by position or line number and were written single-lane; the merge
+requires them to become lane-aware (§5a). `Lane` / `Idx` already exist for
+exactly this merge.
 
 ---
 
@@ -116,10 +123,10 @@ merge.
 
 ### `Action` (in `model.rs`)
 
-- **Add** `order_uncertain: bool` (default `false`). Set during merge on any
-  action whose `effective_ts` ties an adjacent action from a *different* lane.
-  Within one lane, source line order is always authoritative, so same-lane ties
-  are never uncertain.
+No field changes. (An earlier draft added `order_uncertain: bool`; planning
+found it redundant once findings are lane-scoped — §5a — since determinism
+already comes from the total sort key and no strict-order finding ever compares
+cross-lane pairs. Dropped.)
 
 ### `merge_sessions(main: Session, subs: Vec<Session>, files_missing: u64) -> Session`
 
@@ -139,8 +146,6 @@ without an explicit `main` parameter the merge could not identify it.
   `actions[i].idx == Idx(i)` holds across the merged whole. This is the critical
   guarantee: every payload and `evidence()` dereferences `Idx` against the
   merged model, so indices are only meaningful after the merge.
-- **`order_uncertain`:** in one linear pass over the sorted actions, flag any
-  action tying `effective_ts` with a neighbor from a different lane.
 - **`user_texts`:** keep **only** `main.user_texts`; drop every subagent's. A
   subagent transcript's "user" turn is the orchestrator's prompt, not the
   human's — feeding it to pushback/flip detection would misread an agent's own
@@ -159,6 +164,34 @@ without an explicit `main` parameter the merge could not identify it.
   `subagent_files_missing` is the passed-in `files_missing` (computed during
   assembly, which knows what did and didn't resolve — keeps `merge_sessions`
   fs-free).
+
+### 5a. Signal lane-scoping (required by the merge)
+
+Three findings were written when only one lane existed and compare actions by
+position or by line number. Interleaving subagent actions into the flat list
+breaks their assumptions, so each gains a same-lane guard. Without this the
+merge would manufacture false findings — this is not optional polish.
+
+- **`true_revert` / `flip` (`dynamics.rs`):** a revert matches an `earlier` and
+  `later` edit on the same `file_path` with `later.edit_new == earlier.edit_old`.
+  Add `earlier.lane == later.lane` to the match: a revert is one actor undoing
+  its *own* earlier change, not a cross-process coincidence on a shared path.
+  This also fixes a latent line-number bug — `flip` compares an edit's `line_no`
+  against main-lane `user_texts` line numbers, but a subagent edit's `line_no`
+  indexes the *subagent's* file, so a cross-lane `flip` would compare
+  incomparable line spaces. Same-lane scoping means `flip` only ever considers
+  main-lane edits against main-lane pushback (subagent lanes have no human
+  pushback anyway, per the `user_texts` rule).
+- **Failure attribution proximity (`failures.rs`):** Step 3 walks
+  `s.actions[start..pos]` (up to `PROXIMITY_WINDOW` positions back) for the most
+  recent Edit/Write. Filter that slice to `p.lane == a.lane` so a failure is
+  only ever attributed to a prior edit *in the same lane*. Trade-off (documented
+  in code): under heavy interleaving the effective same-lane window narrows
+  slightly; correctness (no cross-lane misattribution) wins over window width.
+
+Steps 1–2 of attribution (path-in-command / path-in-error) are already correct
+across lanes — a literal path match is a real link regardless of who made the
+edit — so they are left unchanged.
 
 ---
 
@@ -281,10 +314,16 @@ where the logic is non-trivial.)
   follows `(effective_ts, lane, line_no)`; main `user_texts` kept, sub dropped;
   additive counters summed; `auto_accept` follows `main` only (a sub in
   auto-accept does **not** flip the merged flag).
-- `order_uncertain`: identical cross-lane `effective_ts` → both flagged, and a
-  strict-order finding (flip) skips the pair; distinct timestamps → not flagged.
 - Empty subagent `Session` merged → zero actions contributed, no panic.
-- Determinism: shuffle input `Vec<Session>` order → byte-identical merged output.
+- Determinism: shuffle input `subs` order → byte-identical merged output.
+
+**Lane-scoping (`signals/`):**
+- `true_revert`: a main edit and a subagent edit on the same `file_path` with
+  matching revert content → **no** finding (different lanes); the same pair
+  within one lane → finding fires. (Red-first: the guard is the fix.)
+- Attribution proximity: a main-lane failing Bash with the nearest prior
+  Edit/Write in a **subagent** lane → not attributed to it (falls through to a
+  same-lane prior edit or unattributed); a same-lane prior edit → attributed.
 
 **Fixture (new synthetic fixtures under `fixtures/`):**
 - **2.1.x:** a mini `<uuid>/` tree with a main transcript + two
