@@ -69,9 +69,10 @@ pub fn session_overview(s: &Session, ranked: &[FileScore], meta: &SessionMeta) -
                 .collect::<std::collections::BTreeMap<_, _>>(),
             "parse_errors": o.parse_errors,
             "untimestamped_lines": o.untimestamped_lines,
-            // Honest scope disclosure (T4.2): spawns whose subagent work we
-            // did not analyze. Goes away when the flat-merge lands.
-            "subagents_excluded": s.subagent_spawns
+            // Honest scope disclosure: subagent spawns we could not turn into
+            // analyzed actions (missing/unreadable/empty child transcript, or
+            // over the file-count cap). `0` once every spawn's work merged in.
+            "subagent_files_missing": s.subagent_files_missing
         },
         "truncated": false
     })

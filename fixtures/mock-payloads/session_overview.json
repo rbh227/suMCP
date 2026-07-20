@@ -8,5 +8,5 @@
  {"file":"src/App.tsx","score":38.0,"breakdown":{"churn":17,"rework":6,"failure_loops":1,"re_read":5,"fumbles":0}},
  {"file":"src/ui/DetailPanel.tsx","score":22.5,"breakdown":{"churn":10,"rework":4,"failure_loops":1,"re_read":0,"fumbles":1}}],
 "failures":{"bash_failed":10,"bash_total":80,"attributed":6,"longest_same_cmd_chain":3},
-"flags":{"unknown_event_types":{},"parse_errors":0,"untimestamped_lines":0,"subagents_excluded":2},
+"flags":{"unknown_event_types":{},"parse_errors":0,"untimestamped_lines":0,"subagent_files_missing":0},
 "truncated":false}

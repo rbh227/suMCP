@@ -34,6 +34,17 @@ pub enum Lane {
     Sub(String),
 }
 
+/// One subagent spawn recorded in the MAIN transcript (an `Agent`/`Task`
+/// tool call). We keep the spawn's `agentId` because the legacy on-disk
+/// layout names the child transcript `agent-<agentId>.jsonl` — that id is
+/// the only link from a spawn to its file. `None` when the spawn's result
+/// had not come back yet (subagent still running) or carried no agentId.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Spawn {
+    /// The child agent's id, from the spawn's `toolUseResult.agentId`.
+    pub agent_id: Option<String>,
+}
+
 /// The kind of thing an action is — kept coarse for v0.1's overview.
 ///
 /// `Other` keeps the original tool name so nothing is silently dropped when a
@@ -273,12 +284,16 @@ pub struct Session {
     /// Whether an auto-accept permission mode was ever seen. When true,
     /// approval-latency signals are suppressed (the delta means nothing).
     pub auto_accept: bool,
-    /// Subagent spawns seen in this transcript (`Agent`/`Task` tool calls).
-    /// v0.1 analyzes only the main transcript, so each spawn is work we did
-    /// NOT look at — surfaced as `subagents_excluded` in `session_overview`
-    /// until the flat-merge lands (T4.2 honesty counter, locked decision:
-    /// disclose exclusions rather than silently narrowing scope).
-    pub subagent_spawns: u64,
+    /// This session's direct subagent spawns (`Agent`/`Task` calls in the
+    /// MAIN transcript), post-dedup. Used by assembly to find and merge the
+    /// child transcripts; carried through the merge as provenance.
+    pub spawns: Vec<Spawn>,
+    /// Subagent spawns whose transcript could not be turned into analyzed
+    /// actions (file not found / unreadable / oversized / parsed to zero
+    /// actions / over the file-count cap). Honest scope disclosure, surfaced
+    /// as `subagent_files_missing` in `session_overview`. `0` from a bare
+    /// `ingest_str`; set by `merge_sessions` from the assembly's count.
+    pub subagent_files_missing: u64,
 }
 
 #[cfg(test)]
