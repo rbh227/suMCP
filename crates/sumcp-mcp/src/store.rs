@@ -24,6 +24,12 @@ use sumcp_core::model::{Lane, Session};
 /// attack (e.g. a device-file symlink), and refusing beats dying of OOM.
 const MAX_TRANSCRIPT_BYTES: u64 = 256 * 1024 * 1024;
 
+/// Cap on cached parsed sessions (T4.2). A long-lived server that outlives
+/// many sessions would otherwise hold every model it ever parsed; parsed
+/// models run to tens of MB each. Four covers the realistic concurrent case
+/// (a couple of open sessions plus one or two recently closed).
+const MAX_CACHE_ENTRIES: usize = 4;
+
 /// What we remember about one transcript between calls.
 struct CacheEntry {
     /// File modification time at parse.
@@ -32,21 +38,38 @@ struct CacheEntry {
     size: u64,
     /// The parsed model, shared out via `Arc::clone` (cheap: bumps a counter).
     session: Arc<Session>,
+    /// Logical clock value of the last hit — the LRU eviction key. A counter,
+    /// not wall time: it can't go backwards and never collides under the lock.
+    last_used: u64,
 }
 
-/// Cache of parsed sessions keyed by transcript path.
+/// The state behind the lock: the map plus the logical clock that orders
+/// entries by recency. Bundled in one struct so a single `Mutex` guards both
+/// (two locks would allow the clock and map to drift apart).
+struct Inner {
+    /// Monotonic tick, bumped on every `load`.
+    tick: u64,
+    /// Cache keyed by transcript path.
+    map: HashMap<PathBuf, CacheEntry>,
+}
+
+/// Cache of parsed sessions keyed by transcript path, LRU-capped at
+/// [`MAX_CACHE_ENTRIES`].
 pub struct SessionStore {
     /// `Mutex` because rmcp may serve calls concurrently. The lock is held
     /// across the parse — simpler, and a duplicate parse of the same file
     /// would be wasted work, not a bug.
-    cache: Mutex<HashMap<PathBuf, CacheEntry>>,
+    cache: Mutex<Inner>,
 }
 
 impl SessionStore {
     /// An empty store.
     pub fn new() -> Self {
         SessionStore {
-            cache: Mutex::new(HashMap::new()),
+            cache: Mutex::new(Inner {
+                tick: 0,
+                map: HashMap::new(),
+            }),
         }
     }
 
@@ -74,12 +97,16 @@ impl SessionStore {
         // `.unwrap()` on a Mutex only fails if another thread panicked while
         // holding the lock ("poisoning") — at that point crashing is honest.
         let mut cache = self.cache.lock().unwrap();
+        cache.tick += 1;
+        let now = cache.tick;
 
-        if let Some(entry) = cache.get(path)
+        if let Some(entry) = cache.map.get_mut(path)
             && entry.mtime == mtime
             && entry.size == size
         {
-            // Fresh enough: same mtime and size as when we parsed.
+            // Fresh enough: same mtime and size as when we parsed. Touch the
+            // recency clock so a hot entry never looks evictable.
+            entry.last_used = now;
             return Ok(Arc::clone(&entry.session));
         }
 
@@ -93,14 +120,30 @@ impl SessionStore {
             return Err(std::io::Error::other("transcript exceeds size ceiling"));
         }
         let session = Arc::new(ingest_str(&raw, Lane::Main));
-        cache.insert(
+
+        cache.map.insert(
             path.to_path_buf(),
             CacheEntry {
                 mtime,
                 size,
                 session: Arc::clone(&session),
+                last_used: now,
             },
         );
+        // LRU eviction (T4.2): insert first, then trim. A stale re-parse of a
+        // cached path replaces in place (no growth, no eviction), and the
+        // fresh entry can never be the victim — its `last_used` is the
+        // current tick, strictly newest. With a cap of 4, a linear min-scan
+        // beats carrying a linked-list LRU crate.
+        if cache.map.len() > MAX_CACHE_ENTRIES
+            && let Some(coldest) = cache
+                .map
+                .iter()
+                .min_by_key(|(_, e)| e.last_used)
+                .map(|(p, _)| p.clone())
+        {
+            cache.map.remove(&coldest);
+        }
         Ok(session)
     }
 }
@@ -156,6 +199,73 @@ mod tests {
         // read the new content.
         assert!(!Arc::ptr_eq(&before, &after), "grown file must re-parse");
         assert_eq!(after.actions.len(), 2, "new content must be visible");
+    }
+
+    #[test]
+    fn cache_evicts_least_recently_used_beyond_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new();
+
+        // Fill the cache to the cap, oldest first.
+        let paths: Vec<PathBuf> = (0..MAX_CACHE_ENTRIES)
+            .map(|i| {
+                let p = dir.path().join(format!("s{i}.jsonl"));
+                std::fs::write(&p, line(&format!("t{i}"))).unwrap();
+                store.load(&p).unwrap();
+                p
+            })
+            .collect();
+
+        // Touch the oldest so it becomes the most recent — the eviction
+        // victim must now be paths[1], not paths[0].
+        let kept = store.load(&paths[0]).unwrap();
+
+        // One past the cap forces an eviction.
+        let extra = dir.path().join("extra.jsonl");
+        std::fs::write(&extra, line("tx")).unwrap();
+        store.load(&extra).unwrap();
+
+        // The touched entry survived: same allocation proves a cache hit.
+        let again = store.load(&paths[0]).unwrap();
+        assert!(Arc::ptr_eq(&kept, &again), "recently-used entry evicted");
+
+        // Direct proof the map obeys the cap (not just indirect Arc checks).
+        assert!(store.cache.lock().unwrap().map.len() <= MAX_CACHE_ENTRIES);
+        assert!(
+            !store.cache.lock().unwrap().map.contains_key(&paths[1]),
+            "the least-recently-used entry must be the one evicted"
+        );
+    }
+
+    #[test]
+    fn stale_reparse_replaces_in_place_without_eviction() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new();
+        let paths: Vec<PathBuf> = (0..MAX_CACHE_ENTRIES)
+            .map(|i| {
+                let p = dir.path().join(format!("s{i}.jsonl"));
+                std::fs::write(&p, line(&format!("t{i}"))).unwrap();
+                store.load(&p).unwrap();
+                p
+            })
+            .collect();
+
+        // Grow an already-cached file: a stale re-parse, not a new path —
+        // nothing may be evicted for it.
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&paths[0])
+            .unwrap();
+        writeln!(f).unwrap();
+        f.write_all(line("t0b").as_bytes()).unwrap();
+        drop(f);
+        store.load(&paths[0]).unwrap();
+
+        let inner = store.cache.lock().unwrap();
+        assert_eq!(inner.map.len(), MAX_CACHE_ENTRIES);
+        for p in &paths {
+            assert!(inner.map.contains_key(p), "no entry may be evicted");
+        }
     }
 
     #[test]

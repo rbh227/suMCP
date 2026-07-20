@@ -38,6 +38,7 @@ pub fn ingest_str(raw: &str, default_lane: Lane) -> Session {
     let mut user_texts: Vec<UserText> = Vec::new();
     let mut interrupts = 0u64;
     let mut auto_accept = false;
+    let mut subagent_spawns = 0u64;
     // tool_use id -> the result that came back for it (error text, patch hunks).
     let mut results: HashMap<String, ResultInfo> = HashMap::new();
 
@@ -122,6 +123,14 @@ pub fn ingest_str(raw: &str, default_lane: Lane) -> Session {
                             continue; // replay/streaming duplicate
                         }
                         let name = block.get("name").and_then(Value::as_str).unwrap_or("");
+                        // Subagent spawns: "Agent" in current Claude Code
+                        // versions, "Task" in older ones (exact names — the
+                        // task-list tools TaskCreate/TaskUpdate/… are NOT
+                        // spawns). Counted post-dedup so resumed-session
+                        // replays don't inflate the exclusion count.
+                        if name == "Agent" || name == "Task" {
+                            subagent_spawns += 1;
+                        }
                         let input = block.get("input");
                         let file_path = input
                             .and_then(|i| i.get("file_path"))
@@ -284,6 +293,7 @@ pub fn ingest_str(raw: &str, default_lane: Lane) -> Session {
         untimestamped_lines: untimestamped,
         interrupts,
         auto_accept,
+        subagent_spawns,
     }
 }
 
@@ -521,6 +531,27 @@ mod tests {
             Some(413),
             "totalLines is the real file size even for a partial read"
         );
+    }
+
+    #[test]
+    fn subagent_spawns_counted_task_list_tools_ignored() {
+        // "Agent" (current) and "Task" (older versions) are spawns; the
+        // task-list tools that merely share the prefix are not.
+        let call = |id: &str, name: &str| {
+            format!(
+                r#"{{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{{"content":[{{"type":"tool_use","id":"{id}","name":"{name}","input":{{}}}}]}}}}"#
+            )
+        };
+        let raw = [
+            call("a1", "Agent"),
+            call("a2", "Task"),
+            call("a3", "TaskCreate"),
+            call("a4", "TaskUpdate"),
+            call("a1", "Agent"), // replay duplicate — must not inflate
+        ]
+        .join("\n");
+        let s = ingest_str(&raw, Lane::Main);
+        assert_eq!(s.subagent_spawns, 2);
     }
 
     #[test]

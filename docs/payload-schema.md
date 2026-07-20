@@ -81,6 +81,12 @@ suppression object says so explicitly.
 | `context_health` | `read_edit_file_ratio` | distinct files read ÷ distinct files edited, informational (#28); `null` for read-only sessions |
 | `struggle_areas.weights` | `re_read`, `action_loop` | `thrash` key renamed; advisory loop weight added |
 
+## 2026-07-20 additive field (T4.2, non-breaking, `v` stays 0)
+
+| payload | field | contents |
+|---|---|---|
+| `session_overview.flags` | `subagents_excluded` | count of subagent spawns (`Agent`/`Task` tool calls) whose transcripts v0.1 does **not** analyze — honest scope disclosure until the flat-merge lands; `0` when no subagents ran. Replaces the aspirational `totals.subagent_runs` from the Checkpoint A mock, which implied subagents were analyzed. Same cleanup: the mock's `flags.order_uncertain_pairs` (never emitted by any builder) replaced with `untimestamped_lines` (always emitted) |
+
 ## Versioning
 
 `v` bumps on any breaking shape change; the checker and mock payloads update

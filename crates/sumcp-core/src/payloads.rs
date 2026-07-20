@@ -63,7 +63,10 @@ pub fn session_overview(s: &Session, ranked: &[FileScore], meta: &SessionMeta) -
         "flags": {
             "unknown_event_types": s.type_counts,
             "parse_errors": o.parse_errors,
-            "untimestamped_lines": o.untimestamped_lines
+            "untimestamped_lines": o.untimestamped_lines,
+            // Honest scope disclosure (T4.2): spawns whose subagent work we
+            // did not analyze. Goes away when the flat-merge lands.
+            "subagents_excluded": s.subagent_spawns
         },
         "truncated": false
     })

@@ -273,6 +273,12 @@ pub struct Session {
     /// Whether an auto-accept permission mode was ever seen. When true,
     /// approval-latency signals are suppressed (the delta means nothing).
     pub auto_accept: bool,
+    /// Subagent spawns seen in this transcript (`Agent`/`Task` tool calls).
+    /// v0.1 analyzes only the main transcript, so each spawn is work we did
+    /// NOT look at — surfaced as `subagents_excluded` in `session_overview`
+    /// until the flat-merge lands (T4.2 honesty counter, locked decision:
+    /// disclose exclusions rather than silently narrowing scope).
+    pub subagent_spawns: u64,
 }
 
 #[cfg(test)]
