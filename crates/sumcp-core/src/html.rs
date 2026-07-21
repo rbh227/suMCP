@@ -34,7 +34,7 @@ pub fn render_html(
     weights: &Weights,
     meta: &SessionMeta,
 ) -> String {
-    let _ = (ranked, weights); // wired in later tasks
+    let _ = weights; // wired in later tasks
     let mut h = String::new();
     // Shell. CSS is filled out in Task 2; kept minimal-but-inline here so the
     // zero-network invariant holds from the first task.
@@ -57,7 +57,9 @@ pub fn render_html(
             let _ = write!(h, "<div>{}</div>", esc(path));
         }
     }
-    // Sections appended by later tasks go here.
+    let o = crate::report::Overview::from_session(s);
+    h.push_str(&overview_section(&o));
+    h.push_str(&struggles_section(ranked));
     let _ = write!(h, "</div></body></html>");
     h
 }
@@ -67,7 +69,73 @@ fn base_css() -> &'static str {
     "body{margin:0;font:13px/1.4 'MS Sans Serif',Tahoma,sans-serif;\
      background:#008080;color:#000}\
      .titlebar{background:navy;color:#fff;font-weight:bold;padding:3px 6px}\
-     .desktop{padding:8px}"
+     .desktop{padding:8px}\
+     .gb{border:2px groove #fff;background:#c0c0c0;margin:8px 0;padding:8px}\
+     .gb>legend{padding:0 4px;font-weight:bold}\
+     table{border-collapse:collapse}\
+     .kv th{text-align:left;padding:2px 8px 2px 0;color:navy}\
+     .kv td{padding:2px 16px 2px 0}\
+     .rank-tbl{width:100%;background:#fff;border:2px inset #fff}\
+     .rank-tbl th{background:#c0c0c0;text-align:left;padding:2px 6px}\
+     .rank-tbl td{padding:2px 6px;border-top:1px solid #dfdfdf}\
+     .rank-tbl .file{font-family:'Courier New',monospace}"
+}
+
+/// A Win9x sunken group box with a title tab.
+fn group_box(title: &str, body: &str) -> String {
+    format!(
+        "<fieldset class=\"gb\"><legend>{}</legend>{}</fieldset>",
+        esc(title),
+        body
+    )
+}
+
+/// Overview: the deterministic totals.
+fn overview_section(o: &crate::report::Overview) -> String {
+    let ratio = o
+        .cache_hit_ratio
+        .map(|r| format!("{:.0}%", r * 100.0))
+        .unwrap_or_else(|| "n/a".into());
+    let body = format!(
+        "<table class=\"kv\">\
+         <tr><th>actions</th><td>{}</td><th>files</th><td>{}</td></tr>\
+         <tr><th>edits</th><td>{}</td><th>writes</th><td>{}</td></tr>\
+         <tr><th>reads</th><td>{}</td><th>bash</th><td>{}</td></tr>\
+         <tr><th>cache hit</th><td>{}</td><th>output tok</th><td>{}</td></tr>\
+         </table>",
+        o.actions, o.files_touched, o.edits, o.writes, o.reads, o.bash, ratio, o.output_tokens,
+    );
+    group_box("Overview", &body)
+}
+
+/// Struggle areas: ranked files with their category breakdown.
+fn struggles_section(ranked: &[FileScore]) -> String {
+    if ranked.is_empty() {
+        return group_box("Struggle areas", "<p>No struggle signals fired.</p>");
+    }
+    let mut rows = String::new();
+    for (i, f) in ranked.iter().enumerate() {
+        let cats: Vec<String> = f
+            .breakdown
+            .iter()
+            .map(|(k, v)| format!("{} {}", esc(k), v))
+            .collect();
+        let _ = write!(
+            rows,
+            "<tr><td class=\"rank\">{}</td><td class=\"file\">{}</td>\
+             <td class=\"score\">{:.1}</td><td>{}</td></tr>",
+            i + 1,
+            esc(&f.file),
+            f.score,
+            esc(&cats.join(", ")),
+        );
+    }
+    let body = format!(
+        "<table class=\"rank-tbl\"><thead><tr><th>#</th><th>file</th>\
+         <th>score</th><th>breakdown</th></tr></thead><tbody>{}</tbody></table>",
+        rows
+    );
+    group_box("Struggle areas", &body)
 }
 
 #[cfg(test)]
@@ -120,5 +188,40 @@ mod tests {
             !html.contains("<script src") && !html.contains("<link") && !html.contains("<img"),
             "external-loading element present"
         );
+    }
+
+    #[test]
+    fn overview_section_shows_totals() {
+        let raw = concat!(
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"tool_use","id":"1","name":"Read","input":{"file_path":"/a.ts"}}]}}"#,
+            "\n",
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:01Z","message":{"content":[{"type":"tool_use","id":"2","name":"Edit","input":{"file_path":"/a.ts","new_string":"x"}}]}}"#,
+        );
+        let html = render(raw);
+        assert!(html.contains("Overview"), "no overview heading");
+        assert!(html.contains("actions"), "no action total label");
+        // 2 actions in this session.
+        assert!(
+            html.contains(">2<")
+                || html.contains("actions</th><td>2")
+                || html.contains("actions 2"),
+            "action count 2 not rendered: {}",
+            &html[..html.len().min(4000)]
+        );
+    }
+
+    #[test]
+    fn struggles_section_lists_ranked_files_with_breakdown() {
+        // Six edits to one file ⇒ churn ⇒ it ranks.
+        let mut lines = Vec::new();
+        for i in 0..6 {
+            lines.push(format!(
+                r#"{{"type":"assistant","timestamp":"2026-01-01T00:00:0{i}Z","message":{{"content":[{{"type":"tool_use","id":"e{i}","name":"Edit","input":{{"file_path":"/a.ts","new_string":"x"}}}}]}}}}"#
+            ));
+        }
+        let html = render(&lines.join("\n"));
+        assert!(html.contains("Struggle"), "no struggle heading");
+        assert!(html.contains("/a.ts"), "ranked file not shown");
+        assert!(html.contains("churn"), "breakdown category not shown");
     }
 }
