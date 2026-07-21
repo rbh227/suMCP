@@ -591,6 +591,48 @@ mod tests {
     }
 
     #[test]
+    fn timeline_single_action_no_divide_by_zero() {
+        // n == 1 makes the `x(idx)` ordinal-to-percent map divide by
+        // `n - 1 == 0`; the guard short-circuits to 0.0 instead. Render a
+        // session with exactly one action and confirm no NaN/inf leaked
+        // into the output, and that the lone action still produces a tick
+        // in its lane (Read here).
+        let raw = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"tool_use","id":"1","name":"Read","input":{"file_path":"/a.ts"}}]}}"#;
+        let html = render(raw);
+        assert!(
+            !html.contains("NaN") && !html.contains("inf"),
+            "divide-by-zero leaked into rendered output"
+        );
+        let read_lane_start = html.find("lane-read").expect("read lane missing");
+        let read_lane_end = html[read_lane_start..]
+            .find("lane-edit")
+            .map(|i| read_lane_start + i)
+            .unwrap_or(html.len());
+        assert!(
+            html[read_lane_start..read_lane_end].contains("tick"),
+            "no tick rendered in the read lane for the single action"
+        );
+    }
+
+    #[test]
+    fn render_is_deterministic() {
+        // Same session in, byte-identical HTML out — no hidden nondeterminism
+        // (unordered iteration, timestamps, addresses) should ever leak into
+        // a report that's meant to be a stable, diffable artifact.
+        let raw = concat!(
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"tool_use","id":"1","name":"Read","input":{"file_path":"/a.ts"}}]}}"#,
+            "\n",
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:01Z","message":{"content":[{"type":"tool_use","id":"2","name":"Edit","input":{"file_path":"/a.ts","new_string":"x"}}]}}"#,
+        );
+        let a = render(raw);
+        let b = render(raw);
+        assert_eq!(
+            a, b,
+            "render_html is not deterministic across repeated calls"
+        );
+    }
+
+    #[test]
     fn inline_js_is_present_and_local_only() {
         let raw = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"tool_use","id":"1","name":"Read","input":{"file_path":"/a.ts"}}]}}"#;
         let html = render(raw);

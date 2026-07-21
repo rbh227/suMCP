@@ -28,7 +28,7 @@ fn main() -> ExitCode {
     let args = Args::parse();
 
     let Some(path) = args.file else {
-        eprintln!("usage: sumcp --file <transcript.jsonl> [--json]");
+        eprintln!("usage: sumcp --file <transcript.jsonl> [--json|--html]");
         return ExitCode::FAILURE;
     };
 
