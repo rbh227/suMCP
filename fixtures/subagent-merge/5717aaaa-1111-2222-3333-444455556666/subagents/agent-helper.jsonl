@@ -1,0 +1,2 @@
+{"type":"assistant","timestamp":"2026-07-20T10:00:05Z","sessionId":"5717aaaa-1111-2222-3333-444455556666","message":{"content":[{"type":"tool_use","id":"s1","name":"Edit","input":{"file_path":"/work/proj/sub_helper.rs","old_string":"aaa","new_string":"bbb"}}]}}
+{"type":"assistant","timestamp":"2026-07-20T10:00:10Z","sessionId":"5717aaaa-1111-2222-3333-444455556666","message":{"content":[{"type":"tool_use","id":"s2","name":"Edit","input":{"file_path":"/work/proj/sub_helper.rs","old_string":"ccc","new_string":"ddd"}}]}}
