@@ -55,6 +55,9 @@ pub fn render_html(
     h.push_str(&overview_section(&o));
     h.push_str(&timeline_section(s, ranked));
     h.push_str(&struggles_section(ranked));
+    h.push_str(&blind_spots_section(s, meta));
+    h.push_str(&file_stories_section(s, ranked, meta));
+    h.push_str(&context_health_footer(s, meta));
     let _ = write!(h, "</div></body></html>");
     h
 }
@@ -85,7 +88,9 @@ fn base_css() -> &'static str {
        margin-left:38px}\
      .tick-err{background:red}\
      .urule{position:absolute;top:14px;bottom:0;width:1px;background:#888}\
-     .cap{color:#444;font-size:11px;margin:4px 0 0}"
+     .cap{color:#444;font-size:11px;margin:4px 0 0}\
+     .exc{font-family:'Courier New',monospace;white-space:pre-wrap;word-break:break-all}\
+     details.ev{margin:4px 0}"
 }
 
 /// A Win9x sunken group box with a title tab.
@@ -267,6 +272,140 @@ fn struggles_section(ranked: &[FileScore]) -> String {
     group_box("Struggle areas", &body)
 }
 
+/// Blind spots: counts of blind-write attempts, review-burden findings, and
+/// approval outliers, plus whether the approval-latency signal is active or
+/// suppressed (auto-accept mode). Reads `payloads::blind_spots` — never
+/// recomputes — so the HTML can't drift from the MCP contract.
+fn blind_spots_section(s: &Session, meta: &SessionMeta) -> String {
+    let p = crate::payloads::blind_spots(s, meta);
+    let count = |key: &str| p[key].as_array().map(|a| a.len()).unwrap_or(0);
+    let latency = p["suppression"]["approval_latency"].as_str().unwrap_or("");
+    let body = format!(
+        "<table class=\"kv\">\
+         <tr><th>blind-write attempts</th><td>{}</td></tr>\
+         <tr><th>review-burden findings</th><td>{}</td></tr>\
+         <tr><th>approval outliers</th><td>{}</td></tr>\
+         <tr><th>approval latency</th><td>{}</td></tr>\
+         </table>",
+        count("blind_write_attempts"),
+        count("review_burden"),
+        count("approval_outliers"),
+        esc(latency),
+    );
+    group_box("Blind spots", &body)
+}
+
+/// One file's chronological story: head events, an "elided" gap marker if the
+/// middle was dropped, then tail events — mirrors `payloads::file_story`
+/// exactly (middle-out elision, same field names).
+fn file_story_section(s: &Session, path: &str, meta: &SessionMeta) -> String {
+    let p = crate::payloads::file_story(s, path, meta);
+    let render_events = |events: &[serde_json::Value]| -> String {
+        let mut items = String::new();
+        for v in events {
+            let _ = write!(
+                items,
+                "<li>#{} · {} · {}</li>",
+                v["idx"].as_u64().unwrap_or(0),
+                esc(v["action"].as_str().unwrap_or("")),
+                esc(v["outcome"].as_str().unwrap_or("n/a")),
+            );
+        }
+        items
+    };
+    let mut body = String::from("<ol class=\"story\">");
+    body.push_str(&render_events(
+        p["events"].as_array().map(|v| v.as_slice()).unwrap_or(&[]),
+    ));
+    if let Some(elided) = p.get("elided").filter(|v| !v.is_null()) {
+        let _ = write!(
+            body,
+            "<li class=\"cap\">… {} events elided — {} …</li>",
+            elided["count"].as_u64().unwrap_or(0),
+            esc(elided["note"].as_str().unwrap_or("")),
+        );
+    }
+    body.push_str(&render_events(
+        p["tail"].as_array().map(|v| v.as_slice()).unwrap_or(&[]),
+    ));
+    body.push_str("</ol>");
+    group_box(&format!("File story: {}", path), &body)
+}
+
+/// The top-3 ranked files, each with its story and the evidence behind its
+/// findings nested inside.
+fn file_stories_section(s: &Session, ranked: &[FileScore], meta: &SessionMeta) -> String {
+    if ranked.is_empty() {
+        return group_box("File stories", "<p>No files ranked.</p>");
+    }
+    let mut out = String::new();
+    for fs in ranked.iter().take(3) {
+        let mut section = file_story_section(s, &fs.file, meta);
+        // Nest the evidence for this file's findings inside its story box —
+        // dropped just before the closing </fieldset>.
+        let idxs: Vec<crate::model::Idx> = fs
+            .findings
+            .iter()
+            .flat_map(|f| f.idxs.iter().copied())
+            .collect();
+        let ev = evidence_details(s, &idxs, meta);
+        if let Some(pos) = section.rfind("</fieldset>") {
+            section.insert_str(pos, &ev);
+        } else {
+            section.push_str(&ev);
+        }
+        out.push_str(&section);
+    }
+    out
+}
+
+/// Context-health footer: cache economics, informational only (v0.1 makes no
+/// waste judgment — see `payloads::context_health`'s note).
+fn context_health_footer(s: &Session, meta: &SessionMeta) -> String {
+    let p = crate::payloads::context_health(s, meta);
+    let ratio = p["cache_hit_ratio"]
+        .as_f64()
+        .map(|r| format!("{:.0}%", r * 100.0))
+        .unwrap_or_else(|| "n/a".into());
+    let body = format!(
+        "<p>cache hit {} · output {} · cache-read {} tok. \
+         <em>Informational only — v0.1 makes no waste judgment.</em></p>",
+        ratio,
+        p["tokens"]["output"].as_u64().unwrap_or(0),
+        p["tokens"]["cache_read"].as_u64().unwrap_or(0),
+    );
+    group_box("Context health", &body)
+}
+
+/// A native `<details>` collapsible dereferencing action `idxs` into raw
+/// evidence via `payloads::evidence` — the same excerpts, caps, and
+/// redaction the MCP tool returns. `data-idxs` is stamped for Task 5's
+/// click-to-expand wiring from the timeline bands.
+fn evidence_details(s: &Session, idxs: &[crate::model::Idx], meta: &SessionMeta) -> String {
+    let p = crate::payloads::evidence(s, idxs, meta);
+    let mut rows = String::new();
+    for a in p["actions"].as_array().map(|v| v.as_slice()).unwrap_or(&[]) {
+        let _ = write!(
+            rows,
+            "<tr><td>#{}</td><td>{}</td><td class=\"exc\">{}</td></tr>",
+            a["idx"].as_u64().unwrap_or(0),
+            esc(a["tool"].as_str().unwrap_or("")),
+            esc(a["excerpt"].as_str().unwrap_or("")),
+        );
+    }
+    let idxs_attr = idxs
+        .iter()
+        .map(|i| i.0.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "<details class=\"ev\" data-idxs=\"{}\"><summary>evidence</summary>\
+         <table class=\"ev-tbl\"><tbody>{}</tbody></table></details>",
+        esc(&idxs_attr),
+        rows
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -399,6 +538,26 @@ mod tests {
         );
         let html = render(raw);
         assert!(html.contains("tick-err"), "error tick not marked");
+    }
+
+    #[test]
+    fn renders_blindspots_filestories_health_and_evidence() {
+        let mut lines = Vec::new();
+        for i in 0..6 {
+            lines.push(format!(
+                r#"{{"type":"assistant","timestamp":"2026-01-01T00:00:0{i}Z","message":{{"content":[{{"type":"tool_use","id":"e{i}","name":"Edit","input":{{"file_path":"/a.ts","new_string":"xxxxxxxx"}}}}]}}}}"#
+            ));
+        }
+        let html = render(&lines.join("\n"));
+        assert!(html.contains("Blind spots"), "no blind-spots section");
+        assert!(html.contains("Context health"), "no context-health footer");
+        // Top file gets a story section.
+        assert!(
+            html.contains("File story") && html.contains("/a.ts"),
+            "no file story"
+        );
+        // Evidence lives in a native collapsible.
+        assert!(html.contains("<details"), "evidence not in <details>");
     }
 
     #[test]
