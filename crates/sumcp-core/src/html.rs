@@ -27,6 +27,21 @@ fn esc(raw: &str) -> String {
     out
 }
 
+/// ~50 lines of dependency-free enhancement. Clicking a finding band opens the
+/// evidence collapsible whose idxs it overlaps and scrolls to it.
+fn inline_js() -> &'static str {
+    "document.addEventListener('DOMContentLoaded',function(){\
+       document.querySelectorAll('.band').forEach(function(b){\
+         b.addEventListener('click',function(){\
+           var want=(b.getAttribute('data-idxs')||'').split(',')[0];\
+           var hit=[].find.call(document.querySelectorAll('details.ev'),function(d){\
+             return (d.getAttribute('data-idxs')||'').split(',').indexOf(want)>=0;});\
+           if(hit){hit.open=true;hit.scrollIntoView({behavior:'smooth',block:'center'});}\
+         });\
+       });\
+     });"
+}
+
 /// Render the full self-contained report document.
 pub fn render_html(
     s: &Session,
@@ -58,7 +73,7 @@ pub fn render_html(
     h.push_str(&blind_spots_section(s, meta));
     h.push_str(&file_stories_section(s, ranked, meta));
     h.push_str(&context_health_footer(s, meta));
-    let _ = write!(h, "</div></body></html>");
+    let _ = write!(h, "</div><script>{}</script></body></html>", inline_js());
     h
 }
 
@@ -573,5 +588,15 @@ mod tests {
         assert!(html.contains("Struggle"), "no struggle heading");
         assert!(html.contains("/a.ts"), "ranked file not shown");
         assert!(html.contains("churn"), "breakdown category not shown");
+    }
+
+    #[test]
+    fn inline_js_is_present_and_local_only() {
+        let raw = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"tool_use","id":"1","name":"Read","input":{"file_path":"/a.ts"}}]}}"#;
+        let html = render(raw);
+        assert!(html.contains("<script>"), "no inline script");
+        assert!(html.contains("addEventListener"), "no interaction wiring");
+        // Still zero-network after adding JS (robust escaped-attribute form).
+        assert!(!html.contains("=\"http"), "external URL reference present");
     }
 }
