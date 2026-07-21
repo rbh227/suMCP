@@ -158,19 +158,41 @@ mod tests {
 
     #[test]
     fn counters_sum_and_files_missing_passthrough() {
+        use crate::model::Tokens;
         let mut main = one(Lane::Main, "2026-01-01T00:00:02Z", 5, "/a");
         main.parse_errors = 1;
         main.untimestamped_lines = 2;
         main.interrupts = 1;
+        // WHY these two extra counters: every other sub in the suite uses zero
+        // tokens and empty type_counts, so a dropped `+=` (or an overwrite) on
+        // either would still pass every test. Give BOTH main and sub nonzero
+        // values on overlapping and non-overlapping keys so the assertions
+        // below can only pass if the merge is genuinely additive.
+        main.tokens = Tokens { input: 10, output: 20, cache_read: 30, cache_creation: 40 };
+        main.type_counts.insert("assistant".into(), 6); // overlaps with sub
+        main.type_counts.insert("user".into(), 2); // main-only key
+
         let mut sub = one(Lane::Sub("x".into()), "2026-01-01T00:00:01Z", 3, "/b");
         sub.parse_errors = 3;
         sub.untimestamped_lines = 4;
+        sub.tokens = Tokens { input: 5, output: 7, cache_read: 3, cache_creation: 2 };
+        sub.type_counts.insert("assistant".into(), 4); // adds to main's 6
+        sub.type_counts.insert("tool_result".into(), 9); // sub-only key
 
         let merged = merge_sessions(main, vec![sub], 7);
         assert_eq!(merged.parse_errors, 4);
         assert_eq!(merged.untimestamped_lines, 6);
         assert_eq!(merged.interrupts, 1);
         assert_eq!(merged.subagent_files_missing, 7);
+        // Token fields must be element-wise SUMS of main + sub.
+        assert_eq!(merged.tokens.input, 15);
+        assert_eq!(merged.tokens.output, 27);
+        assert_eq!(merged.tokens.cache_read, 33);
+        assert_eq!(merged.tokens.cache_creation, 42);
+        // type_counts must merge additively: shared key sums, distinct keys kept.
+        assert_eq!(merged.type_counts["assistant"], 10); // 6 + 4
+        assert_eq!(merged.type_counts["user"], 2); // main-only, untouched
+        assert_eq!(merged.type_counts["tool_result"], 9); // sub-only, carried in
     }
 
     #[test]

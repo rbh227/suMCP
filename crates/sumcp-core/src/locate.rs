@@ -117,6 +117,14 @@ pub fn discover_subagent_paths(main_path: &Path, spawns: &[Spawn]) -> Vec<PathBu
             .filter(|p| p.is_file() && is_within(root, p))
             .collect()
     };
+    // Dedup: two spawns can name the same agentId, which would map to the same
+    // sibling path twice — assembly would then read and merge that child
+    // transcript twice, doubling its actions. Sort first so `dedup` (which only
+    // removes CONSECUTIVE duplicates) is complete, and so the order stays
+    // deterministic. The 2.1.x branch is already sorted and duplicate-free, so
+    // this is a harmless no-op there.
+    out.sort();
+    out.dedup();
     out.truncate(MAX_SUBAGENT_FILES);
     out
 }
@@ -186,6 +194,26 @@ mod tests {
         let found = discover_subagent_paths(&main, &spawns);
         assert_eq!(found.len(), 1, "only the spawn-linked, existing sibling");
         assert!(found[0].ends_with("agent-present.jsonl"));
+    }
+
+    #[test]
+    fn duplicate_spawn_agent_ids_yield_one_path() {
+        // WHY: two spawns naming the SAME agentId map to the same sibling path.
+        // Without dedup, assembly would read + merge that child transcript
+        // twice, doubling its actions (inflating churn/re-read counts) while
+        // files_missing still reads 0. The returned Vec must be duplicate-free.
+        let td = tempfile::tempdir().unwrap();
+        let uuid = "5717aaaa-1111-2222-3333-444455556666";
+        let main = td.path().join(format!("{uuid}.jsonl"));
+        std::fs::write(&main, "{}").unwrap();
+        std::fs::write(td.path().join("agent-dup.jsonl"), "{}").unwrap();
+
+        let spawns = vec![
+            Spawn { agent_id: Some("dup".into()) },
+            Spawn { agent_id: Some("dup".into()) }, // same id → same path
+        ];
+        let found = discover_subagent_paths(&main, &spawns);
+        assert_eq!(found.len(), 1, "the shared sibling path is merged exactly once");
     }
 
     #[test]
