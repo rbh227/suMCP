@@ -51,12 +51,6 @@ pub fn render_html(
         id = esc(&meta.id),
     );
     let _ = write!(h, "<div class=\"desktop\">");
-    // Render file paths from actions.
-    for action in &s.actions {
-        if let Some(path) = &action.file_path {
-            let _ = write!(h, "<div>{}</div>", esc(path));
-        }
-    }
     let o = crate::report::Overview::from_session(s);
     h.push_str(&overview_section(&o));
     h.push_str(&struggles_section(ranked));
@@ -162,13 +156,42 @@ mod tests {
 
     #[test]
     fn escapes_html_metacharacters_in_paths() {
-        // A file path containing HTML must never render as live markup.
-        let raw = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"tool_use","id":"1","name":"Read","input":{"file_path":"/<script>x</script>.ts"}}]}}"#;
-        let html = render(raw);
+        // A file path containing HTML must never render as live markup. Six
+        // edits to one file ⇒ churn ⇒ it ranks ⇒ it shows up in the
+        // struggle-areas table, which is the real (non-scaffold) path that
+        // renders `esc(&f.file)`.
+        let mut lines = Vec::new();
+        for i in 0..6 {
+            lines.push(format!(
+                r#"{{"type":"assistant","timestamp":"2026-01-01T00:00:0{i}Z","message":{{"content":[{{"type":"tool_use","id":"e{i}","name":"Edit","input":{{"file_path":"/<script>x</script>.ts","new_string":"x"}}}}]}}}}"#
+            ));
+        }
+        let html = render(&lines.join("\n"));
         assert!(!html.contains("<script>x</script>.ts"), "raw markup leaked");
         assert!(
             html.contains("&lt;script&gt;x&lt;/script&gt;.ts"),
             "path not escaped"
+        );
+    }
+
+    #[test]
+    fn overview_precedes_struggles() {
+        let raw = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"tool_use","id":"1","name":"Read","input":{"file_path":"/a.ts"}}]}}"#;
+        let html = render(raw);
+        assert!(
+            html.find("Overview").unwrap() < html.find("Struggle").unwrap(),
+            "overview must precede struggles"
+        );
+    }
+
+    #[test]
+    fn struggles_section_empty_when_nothing_ranked() {
+        // A single Read, no edits ⇒ no ranking findings ⇒ empty branch.
+        let raw = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"tool_use","id":"1","name":"Read","input":{"file_path":"/a.ts"}}]}}"#;
+        let html = render(raw);
+        assert!(
+            html.contains("No struggle signals fired."),
+            "empty-ranked branch not shown"
         );
     }
 
