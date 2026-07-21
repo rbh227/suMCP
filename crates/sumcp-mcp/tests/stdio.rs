@@ -176,7 +176,9 @@ fn fixture_home_subagents(root: &Path) -> (PathBuf, PathBuf) {
     let subs_dir = project_dir.join(SESSION_ID).join("subagents");
     std::fs::create_dir_all(&subs_dir).unwrap();
     std::fs::copy(
-        repo_fixtures.join(SESSION_ID).join("subagents/agent-helper.jsonl"),
+        repo_fixtures
+            .join(SESSION_ID)
+            .join("subagents/agent-helper.jsonl"),
         subs_dir.join("agent-helper.jsonl"),
     )
     .unwrap();
@@ -309,7 +311,9 @@ fn subagent_actions_merge_and_dereference_over_stdio() {
     // The dereferenced action is the subagent's Edit, identified by its
     // sub-lane file path (`/work/proj/sub_helper.rs`) — evidence from the sub
     // lane, proving the merge is queryable end-to-end.
-    let file = actions[0]["file"].as_str().expect("evidence carries a file");
+    let file = actions[0]["file"]
+        .as_str()
+        .expect("evidence carries a file");
     assert!(
         file.contains("sub_helper"),
         "evidence should reflect the sub-lane file, got {file:?}"

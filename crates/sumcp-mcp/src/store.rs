@@ -15,7 +15,7 @@ use std::sync::Mutex;
 // the model is dropped when the last holder lets go.
 use std::sync::Arc;
 use std::time::SystemTime;
-use sumcp_core::assemble::{load_session, MAX_TRANSCRIPT_BYTES as CORE_MAX_BYTES};
+use sumcp_core::assemble::{MAX_TRANSCRIPT_BYTES as CORE_MAX_BYTES, load_session};
 use sumcp_core::model::Session;
 
 /// Cap on cached parsed sessions (T4.2). A long-lived server that outlives
@@ -128,8 +128,7 @@ impl SessionStore {
             // `tool_result` line to the main file, so main's mtime/size already
             // catches it; this `subs` check is specifically for an *existing*
             // sub file that grew.)
-            let cached_paths: Vec<PathBuf> =
-                entry.subs.iter().map(|(p, _, _)| p.clone()).collect();
+            let cached_paths: Vec<PathBuf> = entry.subs.iter().map(|(p, _, _)| p.clone()).collect();
             let subs_fresh = entry.subs == fingerprint_subs(&cached_paths);
             if subs_fresh {
                 // Fresh enough: main and every merged sub unchanged. Touch the
@@ -212,8 +211,11 @@ mod tests {
 
         let store = SessionStore::new();
         let a = store.load(&main).unwrap();
-        let sub_actions =
-            a.actions.iter().filter(|x| matches!(x.lane, sumcp_core::model::Lane::Sub(_))).count();
+        let sub_actions = a
+            .actions
+            .iter()
+            .filter(|x| matches!(x.lane, sumcp_core::model::Lane::Sub(_)))
+            .count();
         assert_eq!(sub_actions, 1, "subagent edit merged via the store");
 
         // Grow the subagent file; the merged session must re-parse.
@@ -227,9 +229,15 @@ mod tests {
         drop(f);
 
         let b = store.load(&main).unwrap();
-        let sub_actions_b =
-            b.actions.iter().filter(|x| matches!(x.lane, sumcp_core::model::Lane::Sub(_))).count();
-        assert_eq!(sub_actions_b, 2, "appended subagent action picked up (freshness over sub files)");
+        let sub_actions_b = b
+            .actions
+            .iter()
+            .filter(|x| matches!(x.lane, sumcp_core::model::Lane::Sub(_)))
+            .count();
+        assert_eq!(
+            sub_actions_b, 2,
+            "appended subagent action picked up (freshness over sub files)"
+        );
     }
 
     #[test]

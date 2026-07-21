@@ -187,9 +187,13 @@ mod tests {
         std::fs::write(td.path().join("agent-decoy.jsonl"), "{}").unwrap();
 
         let spawns = vec![
-            Spawn { agent_id: Some("present".into()) },
-            Spawn { agent_id: Some("absent".into()) }, // file does not exist
-            Spawn { agent_id: None },                  // unresolved, skipped
+            Spawn {
+                agent_id: Some("present".into()),
+            },
+            Spawn {
+                agent_id: Some("absent".into()),
+            }, // file does not exist
+            Spawn { agent_id: None }, // unresolved, skipped
         ];
         let found = discover_subagent_paths(&main, &spawns);
         assert_eq!(found.len(), 1, "only the spawn-linked, existing sibling");
@@ -209,11 +213,19 @@ mod tests {
         std::fs::write(td.path().join("agent-dup.jsonl"), "{}").unwrap();
 
         let spawns = vec![
-            Spawn { agent_id: Some("dup".into()) },
-            Spawn { agent_id: Some("dup".into()) }, // same id → same path
+            Spawn {
+                agent_id: Some("dup".into()),
+            },
+            Spawn {
+                agent_id: Some("dup".into()),
+            }, // same id → same path
         ];
         let found = discover_subagent_paths(&main, &spawns);
-        assert_eq!(found.len(), 1, "the shared sibling path is merged exactly once");
+        assert_eq!(
+            found.len(),
+            1,
+            "the shared sibling path is merged exactly once"
+        );
     }
 
     #[test]

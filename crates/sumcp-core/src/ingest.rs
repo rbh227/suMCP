@@ -580,7 +580,11 @@ mod tests {
         ]
         .join("\n");
         let s = ingest_str(&raw, Lane::Main);
-        assert_eq!(s.spawns.len(), 2, "two Agent/Task spawns, task-list tools ignored");
+        assert_eq!(
+            s.spawns.len(),
+            2,
+            "two Agent/Task spawns, task-list tools ignored"
+        );
         // The paired tool_result carried an agentId for the first spawn only.
         assert_eq!(s.spawns[0].agent_id.as_deref(), Some("agent-abc"));
     }

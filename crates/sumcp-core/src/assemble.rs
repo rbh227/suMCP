@@ -95,7 +95,9 @@ pub fn load_session(main_path: &Path, max_bytes: u64) -> std::io::Result<Assembl
         }
         // `let ... else` binds on Some, and on None runs the `else` block —
         // here we skip this candidate (an unreadable/oversized file is missing).
-        let Some(sub_raw) = read_bounded(&path, max_bytes) else { continue };
+        let Some(sub_raw) = read_bounded(&path, max_bytes) else {
+            continue;
+        };
         // 2.1.x ownership check: reject a file whose sessionId is present AND
         // mismatched. Absent sessionId is accepted (the namespaced directory is
         // the primary ownership guarantee; the field's exact shape is not yet
@@ -129,7 +131,10 @@ pub fn load_session(main_path: &Path, max_bytes: u64) -> std::io::Result<Assembl
     let files_missing = attempted.saturating_sub(merged_ok) as u64;
 
     let session = merge_sessions(main, subs, files_missing);
-    Ok(Assembled { session, subagent_paths: read_paths })
+    Ok(Assembled {
+        session,
+        subagent_paths: read_paths,
+    })
 }
 
 #[cfg(test)]
@@ -140,14 +145,20 @@ mod tests {
         // A main-transcript Agent spawn whose result carries an agentId.
         format!(
             "{}\n{}",
-            format!(r#"{{"type":"assistant","timestamp":"2026-01-01T00:00:01Z","message":{{"content":[{{"type":"tool_use","id":"{id}","name":"Agent","input":{{"subagent_type":"x"}}}}]}}}}"#),
-            format!(r#"{{"type":"user","timestamp":"2026-01-01T00:00:02Z","message":{{"content":[{{"type":"tool_result","tool_use_id":"{id}","is_error":false}}]}},"toolUseResult":{{"agentId":"{agent_id}"}}}}"#),
+            format!(
+                r#"{{"type":"assistant","timestamp":"2026-01-01T00:00:01Z","message":{{"content":[{{"type":"tool_use","id":"{id}","name":"Agent","input":{{"subagent_type":"x"}}}}]}}}}"#
+            ),
+            format!(
+                r#"{{"type":"user","timestamp":"2026-01-01T00:00:02Z","message":{{"content":[{{"type":"tool_result","tool_use_id":"{id}","is_error":false}}]}},"toolUseResult":{{"agentId":"{agent_id}"}}}}"#
+            ),
         )
     }
 
     /// A subagent transcript line: one Edit, carrying a parent sessionId.
     fn sub_edit_line(parent: &str) -> String {
-        format!(r#"{{"type":"assistant","timestamp":"2026-01-01T00:00:03Z","sessionId":"{parent}","message":{{"content":[{{"type":"tool_use","id":"e1","name":"Edit","input":{{"file_path":"/sub.rs","old_string":"a","new_string":"b"}}}}]}}}}"#)
+        format!(
+            r#"{{"type":"assistant","timestamp":"2026-01-01T00:00:03Z","sessionId":"{parent}","message":{{"content":[{{"type":"tool_use","id":"e1","name":"Edit","input":{{"file_path":"/sub.rs","old_string":"a","new_string":"b"}}}}]}}}}"#
+        )
     }
 
     #[test]
@@ -158,7 +169,11 @@ mod tests {
         // two spawns: "present" has a sibling file, "absent" does not.
         std::fs::write(
             &main,
-            format!("{}\n{}", agent_spawn_lines("a1", "present"), agent_spawn_lines("a2", "absent")),
+            format!(
+                "{}\n{}",
+                agent_spawn_lines("a1", "present"),
+                agent_spawn_lines("a2", "absent")
+            ),
         )
         .unwrap();
         std::fs::write(td.path().join("agent-present.jsonl"), sub_edit_line(uuid)).unwrap();
@@ -167,11 +182,20 @@ mod tests {
 
         let a = load_session(&main, MAX_TRANSCRIPT_BYTES).unwrap();
         // The present subagent's Edit merged in (a sub-lane action exists).
-        assert!(a.session.actions.iter().any(|x| matches!(x.lane, Lane::Sub(_))));
+        assert!(
+            a.session
+                .actions
+                .iter()
+                .any(|x| matches!(x.lane, Lane::Sub(_)))
+        );
         // One spawn ("absent") could not be resolved.
         assert_eq!(a.session.subagent_files_missing, 1);
         // The decoy was never read.
-        assert!(a.subagent_paths.iter().all(|p| !p.ends_with("agent-decoy.jsonl")));
+        assert!(
+            a.subagent_paths
+                .iter()
+                .all(|p| !p.ends_with("agent-decoy.jsonl"))
+        );
     }
 
     #[test]
@@ -184,12 +208,24 @@ mod tests {
         std::fs::create_dir_all(&subs).unwrap();
         // one file belongs to this session, one carries a wrong sessionId.
         std::fs::write(subs.join("agent-ok.jsonl"), sub_edit_line(uuid)).unwrap();
-        std::fs::write(subs.join("agent-wrong.jsonl"), sub_edit_line("SOMEONE-ELSE")).unwrap();
+        std::fs::write(
+            subs.join("agent-wrong.jsonl"),
+            sub_edit_line("SOMEONE-ELSE"),
+        )
+        .unwrap();
 
         let a = load_session(&main, MAX_TRANSCRIPT_BYTES).unwrap();
-        let sub_actions = a.session.actions.iter().filter(|x| matches!(x.lane, Lane::Sub(_))).count();
+        let sub_actions = a
+            .session
+            .actions
+            .iter()
+            .filter(|x| matches!(x.lane, Lane::Sub(_)))
+            .count();
         assert_eq!(sub_actions, 1, "only the matching-sessionId file merges");
-        assert_eq!(a.session.subagent_files_missing, 1, "wrong-sessionId file counts missing");
+        assert_eq!(
+            a.session.subagent_files_missing, 1,
+            "wrong-sessionId file counts missing"
+        );
     }
 
     #[test]

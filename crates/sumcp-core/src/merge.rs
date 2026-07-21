@@ -113,7 +113,9 @@ mod tests {
     fn merged_idx_is_contiguous_and_ordered() {
         // main action at 00:02, sub action at 00:01 → sub sorts first.
         let mut main = one(Lane::Main, "2026-01-01T00:00:02Z", 5, "/a");
-        main.spawns = vec![Spawn { agent_id: Some("x".into()) }];
+        main.spawns = vec![Spawn {
+            agent_id: Some("x".into()),
+        }];
         let sub = one(Lane::Sub("x".into()), "2026-01-01T00:00:01Z", 3, "/b");
 
         let merged = merge_sessions(main, vec![sub], 0);
@@ -144,16 +146,27 @@ mod tests {
     fn keeps_only_main_user_texts_and_ors_nothing_for_auto_accept() {
         use crate::model::UserText;
         let mut main = one(Lane::Main, "2026-01-01T00:00:02Z", 5, "/a");
-        main.user_texts = vec![UserText { line_no: 1, text: "human says".into(), effective_ts: "2026-01-01T00:00:00Z".into() }];
+        main.user_texts = vec![UserText {
+            line_no: 1,
+            text: "human says".into(),
+            effective_ts: "2026-01-01T00:00:00Z".into(),
+        }];
         main.auto_accept = false;
         let mut sub = one(Lane::Sub("x".into()), "2026-01-01T00:00:01Z", 3, "/b");
-        sub.user_texts = vec![UserText { line_no: 1, text: "orchestrator prompt".into(), effective_ts: "2026-01-01T00:00:00Z".into() }];
+        sub.user_texts = vec![UserText {
+            line_no: 1,
+            text: "orchestrator prompt".into(),
+            effective_ts: "2026-01-01T00:00:00Z".into(),
+        }];
         sub.auto_accept = true; // a sub in auto-accept must NOT flip the merged flag
 
         let merged = merge_sessions(main, vec![sub], 0);
         assert_eq!(merged.user_texts.len(), 1);
         assert_eq!(merged.user_texts[0].text, "human says");
-        assert!(!merged.auto_accept, "sub auto-accept must not suppress main latency");
+        assert!(
+            !merged.auto_accept,
+            "sub auto-accept must not suppress main latency"
+        );
     }
 
     #[test]
@@ -168,14 +181,24 @@ mod tests {
         // either would still pass every test. Give BOTH main and sub nonzero
         // values on overlapping and non-overlapping keys so the assertions
         // below can only pass if the merge is genuinely additive.
-        main.tokens = Tokens { input: 10, output: 20, cache_read: 30, cache_creation: 40 };
+        main.tokens = Tokens {
+            input: 10,
+            output: 20,
+            cache_read: 30,
+            cache_creation: 40,
+        };
         main.type_counts.insert("assistant".into(), 6); // overlaps with sub
         main.type_counts.insert("user".into(), 2); // main-only key
 
         let mut sub = one(Lane::Sub("x".into()), "2026-01-01T00:00:01Z", 3, "/b");
         sub.parse_errors = 3;
         sub.untimestamped_lines = 4;
-        sub.tokens = Tokens { input: 5, output: 7, cache_read: 3, cache_creation: 2 };
+        sub.tokens = Tokens {
+            input: 5,
+            output: 7,
+            cache_read: 3,
+            cache_creation: 2,
+        };
         sub.type_counts.insert("assistant".into(), 4); // adds to main's 6
         sub.type_counts.insert("tool_result".into(), 9); // sub-only key
 
@@ -212,9 +235,16 @@ mod tests {
     fn empty_sub_contributes_nothing() {
         let main = one(Lane::Main, "2026-01-01T00:00:02Z", 5, "/a");
         let empty = Session {
-            actions: vec![], user_texts: vec![], tokens: Default::default(),
-            type_counts: Default::default(), parse_errors: 0, untimestamped_lines: 0,
-            interrupts: 0, auto_accept: false, spawns: vec![], subagent_files_missing: 0,
+            actions: vec![],
+            user_texts: vec![],
+            tokens: Default::default(),
+            type_counts: Default::default(),
+            parse_errors: 0,
+            untimestamped_lines: 0,
+            interrupts: 0,
+            auto_accept: false,
+            spawns: vec![],
+            subagent_files_missing: 0,
         };
         let merged = merge_sessions(main, vec![empty], 1);
         assert_eq!(merged.actions.len(), 1);

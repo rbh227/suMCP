@@ -109,15 +109,11 @@ fn attribute(
     // an edit in that same lane; cross-lane adjacency in the merged order is
     // coincidental. Trade-off: heavy interleaving narrows the effective window.
     let start = pos.saturating_sub(PROXIMITY_WINDOW);
-    if let Some(prev) = s.actions[start..pos]
-        .iter()
-        .rev()
-        .find(|p| {
-            p.lane == a.lane
-                && matches!(p.kind, ActionKind::Edit | ActionKind::Write)
-                && p.file_path.is_some()
-        })
-    {
+    if let Some(prev) = s.actions[start..pos].iter().rev().find(|p| {
+        p.lane == a.lane
+            && matches!(p.kind, ActionKind::Edit | ActionKind::Write)
+            && p.file_path.is_some()
+    }) {
         return Some((prev.file_path.clone().unwrap(), Attribution::Proximity));
     }
 
@@ -278,11 +274,25 @@ mod tests {
         // must not be attributed to it; a same-lane prior edit is required.
         use crate::model::{Action, ActionKind, Idx, Lane, Session};
         let edit = |idx, lane, file: &str| Action {
-            idx: Idx(idx), effective_ts: "2026-01-01T00:00:01Z".into(), ts_inherited: false,
-            lane, line_no: idx as usize, kind: ActionKind::Edit, file_path: Some(file.into()),
-            is_error: None, write_len: None, write_lines: None, read_total_lines: None,
-            input_hash: None, error: None, hunks: vec![], command: None, user_modified: false,
-            edit_old: None, edit_new: None, approval_latency_s: None,
+            idx: Idx(idx),
+            effective_ts: "2026-01-01T00:00:01Z".into(),
+            ts_inherited: false,
+            lane,
+            line_no: idx as usize,
+            kind: ActionKind::Edit,
+            file_path: Some(file.into()),
+            is_error: None,
+            write_len: None,
+            write_lines: None,
+            read_total_lines: None,
+            input_hash: None,
+            error: None,
+            hunks: vec![],
+            command: None,
+            user_modified: false,
+            edit_old: None,
+            edit_new: None,
+            approval_latency_s: None,
         };
         let mut bash = edit(1, Lane::Main, "/x");
         bash.kind = ActionKind::Bash;
@@ -300,14 +310,23 @@ mod tests {
         // Only prior edit is in a sub lane → must fall through to unattributed.
         let s = Session {
             actions: vec![edit(0, Lane::Sub("z".into()), "/sub-file"), bash, bash2],
-            user_texts: vec![], tokens: Default::default(), type_counts: Default::default(),
-            parse_errors: 0, untimestamped_lines: 0, interrupts: 0, auto_accept: false,
-            spawns: vec![], subagent_files_missing: 0,
+            user_texts: vec![],
+            tokens: Default::default(),
+            type_counts: Default::default(),
+            parse_errors: 0,
+            untimestamped_lines: 0,
+            interrupts: 0,
+            auto_accept: false,
+            spawns: vec![],
+            subagent_files_missing: 0,
         };
         let f = failures(&s);
         // No path match, no same-lane prior edit → the failure is unattributed,
         // i.e. carries no file.
-        assert!(f.iter().all(|x| x.file.is_none()), "must not attribute to sub-lane edit");
+        assert!(
+            f.iter().all(|x| x.file.is_none()),
+            "must not attribute to sub-lane edit"
+        );
     }
 
     #[test]

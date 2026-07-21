@@ -163,7 +163,11 @@ mod tests {
         // Flip the very same action to the main lane: now it must fire.
         s.actions[0].lane = Lane::Main;
         let f = comprehension(&s);
-        assert_eq!(f.len(), 1, "same write on the main lane IS comprehension debt");
+        assert_eq!(
+            f.len(),
+            1,
+            "same write on the main lane IS comprehension debt"
+        );
         assert_eq!(f[0].kind, FindingKind::LargeWriteInstantAccept);
     }
 

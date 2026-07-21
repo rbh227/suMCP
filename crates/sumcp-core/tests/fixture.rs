@@ -106,7 +106,10 @@ fn synthetic_2_1_x_merges_subagent_actions() {
         .filter(|x| matches!(x.lane, Lane::Sub(_)))
         .count();
     assert_eq!(sub, 2, "both subagent edits merged");
-    assert_eq!(a.session.subagent_files_missing, 0, "the one spawn resolved");
+    assert_eq!(
+        a.session.subagent_files_missing, 0,
+        "the one spawn resolved"
+    );
 }
 
 #[test]

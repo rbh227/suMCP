@@ -556,23 +556,52 @@ mod tests {
         // revert. Same content within one lane WOULD fire (asserted below).
         use crate::model::{Action, ActionKind, Idx, Lane};
         let mk = |idx, lane, ts: &str, line, old: &str, new: &str| Action {
-            idx: Idx(idx), effective_ts: ts.into(), ts_inherited: false, lane,
-            line_no: line, kind: ActionKind::Edit, file_path: Some("/a".into()),
-            is_error: None, write_len: None, write_lines: None, read_total_lines: None,
-            input_hash: None, error: None, hunks: vec![], command: None,
-            user_modified: false, edit_old: Some(old.into()), edit_new: Some(new.into()),
+            idx: Idx(idx),
+            effective_ts: ts.into(),
+            ts_inherited: false,
+            lane,
+            line_no: line,
+            kind: ActionKind::Edit,
+            file_path: Some("/a".into()),
+            is_error: None,
+            write_len: None,
+            write_lines: None,
+            read_total_lines: None,
+            input_hash: None,
+            error: None,
+            hunks: vec![],
+            command: None,
+            user_modified: false,
+            edit_old: Some(old.into()),
+            edit_new: Some(new.into()),
             approval_latency_s: None,
         };
         let mut s = crate::model::Session {
             actions: vec![
                 mk(0, Lane::Main, "2026-01-01T00:00:01Z", 1, "foo", "bar"),
-                mk(1, Lane::Sub("x".into()), "2026-01-01T00:00:02Z", 1, "bar", "foo"),
+                mk(
+                    1,
+                    Lane::Sub("x".into()),
+                    "2026-01-01T00:00:02Z",
+                    1,
+                    "bar",
+                    "foo",
+                ),
             ],
-            user_texts: vec![], tokens: Default::default(), type_counts: Default::default(),
-            parse_errors: 0, untimestamped_lines: 0, interrupts: 0, auto_accept: false,
-            spawns: vec![], subagent_files_missing: 0,
+            user_texts: vec![],
+            tokens: Default::default(),
+            type_counts: Default::default(),
+            parse_errors: 0,
+            untimestamped_lines: 0,
+            interrupts: 0,
+            auto_accept: false,
+            spawns: vec![],
+            subagent_files_missing: 0,
         };
-        assert!(reverts_and_flips(&s).is_empty(), "cross-lane pair must not be a revert");
+        assert!(
+            reverts_and_flips(&s).is_empty(),
+            "cross-lane pair must not be a revert"
+        );
 
         // Same pair, both main lane → a true_revert fires.
         s.actions[1].lane = Lane::Main;
@@ -592,12 +621,25 @@ mod tests {
         // only the Flip label is suppressed for sub lanes.
         use crate::model::{Action, ActionKind, Idx, UserText};
         let sub_edit = |idx, line, old: &str, new: &str, ts: &str| Action {
-            idx: Idx(idx), effective_ts: ts.into(), ts_inherited: false,
-            lane: Lane::Sub("x".into()), line_no: line, kind: ActionKind::Edit,
-            file_path: Some("/a".into()), is_error: None, write_len: None,
-            write_lines: None, read_total_lines: None, input_hash: None, error: None,
-            hunks: vec![], command: None, user_modified: false,
-            edit_old: Some(old.into()), edit_new: Some(new.into()), approval_latency_s: None,
+            idx: Idx(idx),
+            effective_ts: ts.into(),
+            ts_inherited: false,
+            lane: Lane::Sub("x".into()),
+            line_no: line,
+            kind: ActionKind::Edit,
+            file_path: Some("/a".into()),
+            is_error: None,
+            write_len: None,
+            write_lines: None,
+            read_total_lines: None,
+            input_hash: None,
+            error: None,
+            hunks: vec![],
+            command: None,
+            user_modified: false,
+            edit_old: Some(old.into()),
+            edit_new: Some(new.into()),
+            approval_latency_s: None,
         };
         let s = crate::model::Session {
             actions: vec![
@@ -615,9 +657,14 @@ mod tests {
                 text: "no revert that please".into(),
                 effective_ts: "2026-01-01T00:00:02Z".into(),
             }],
-            tokens: Default::default(), type_counts: Default::default(),
-            parse_errors: 0, untimestamped_lines: 0, interrupts: 0, auto_accept: false,
-            spawns: vec![], subagent_files_missing: 0,
+            tokens: Default::default(),
+            type_counts: Default::default(),
+            parse_errors: 0,
+            untimestamped_lines: 0,
+            interrupts: 0,
+            auto_accept: false,
+            spawns: vec![],
+            subagent_files_missing: 0,
         };
         let f = reverts_and_flips(&s);
         assert_eq!(f.len(), 1, "the self-revert is real and must be reported");
