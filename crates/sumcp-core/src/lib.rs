@@ -7,6 +7,7 @@
 //! and every finding carries the action indices proving it.
 
 pub mod assemble;
+pub mod html;
 pub mod ingest;
 pub mod locate;
 pub mod merge;
