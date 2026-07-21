@@ -1,6 +1,6 @@
 //! Transparent weighted ranking (T3.5, SPEC decision 6).
 //!
-//! Rank = Σ (weight[category] × magnitude × confidence-factor). Nothing is an
+//! Rank = Σ (`weight[category]` × magnitude × confidence-factor). Nothing is an
 //! opaque score: every ranked file exposes its per-category breakdown and the
 //! weights used. Low-confidence findings count ×`low_confidence_factor`.
 //!
