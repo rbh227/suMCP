@@ -125,7 +125,8 @@ into one totally-ordered timeline, then runs pure functions that look for
 edit-shape churn, rework, re-reads, failure loops, reverts, and comprehension
 signals. Every finding carries a **tier**, an **exact-vs-heuristic** flag, a
 **confidence**, and the action indices that prove it. See
-[docs/metrics-spec.md](docs/metrics-spec.md).
+[docs/metrics.md](docs/metrics.md) for the reader-facing catalog, or
+[docs/metrics-spec.md](docs/metrics-spec.md) for the authoritative spec.
 
 ---
 
