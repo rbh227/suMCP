@@ -19,6 +19,9 @@ struct Args {
     /// Emit the session_overview JSON payload instead of the text view.
     #[arg(long)]
     json: bool,
+    /// Render the self-contained HTML report to stdout.
+    #[arg(long)]
+    html: bool,
 }
 
 fn main() -> ExitCode {
@@ -36,16 +39,15 @@ fn main() -> ExitCode {
     // silently dropping. It returns an `Assembled { session, subagent_paths }`
     // (or an io::Error if the main file can't be read / is too large), so we
     // pull `.session` out and proceed exactly as before.
-    let assembled = match sumcp_core::assemble::load_session(
-        &path,
-        sumcp_core::assemble::MAX_TRANSCRIPT_BYTES,
-    ) {
-        Ok(a) => a,
-        Err(e) => {
-            eprintln!("could not load {}: {e}", path.display());
-            return ExitCode::FAILURE;
-        }
-    };
+    let assembled =
+        match sumcp_core::assemble::load_session(&path, sumcp_core::assemble::MAX_TRANSCRIPT_BYTES)
+        {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("could not load {}: {e}", path.display());
+                return ExitCode::FAILURE;
+            }
+        };
     let session = assembled.session;
     let ranked = rank(&session, &Weights::default());
     // CLI resolves the session by path, so provenance is "explicit".
@@ -56,6 +58,14 @@ fn main() -> ExitCode {
             .unwrap_or_default(),
         identified_by: "explicit".into(),
     };
+
+    if args.html {
+        print!(
+            "{}",
+            sumcp_core::html::render_html(&session, &ranked, &Weights::default(), &meta)
+        );
+        return ExitCode::SUCCESS;
+    }
 
     if args.json {
         let payload = session_overview(&session, &ranked, &meta);
