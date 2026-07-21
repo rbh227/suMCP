@@ -6,8 +6,6 @@
 use clap::Parser;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use sumcp_core::ingest::ingest_str;
-use sumcp_core::model::Lane;
 use sumcp_core::payloads::{SessionMeta, session_overview};
 use sumcp_core::score::{Weights, rank};
 
@@ -31,15 +29,24 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     };
 
-    let raw = match std::fs::read_to_string(&path) {
-        Ok(r) => r,
+    // `load_session` does more than read one file: it ingests the main
+    // transcript AND looks for sibling subagent transcripts next to it,
+    // flat-merging any it finds into a single `Session`. What it can't find
+    // it records honestly (see `flags.subagent_files_missing`) rather than
+    // silently dropping. It returns an `Assembled { session, subagent_paths }`
+    // (or an io::Error if the main file can't be read / is too large), so we
+    // pull `.session` out and proceed exactly as before.
+    let assembled = match sumcp_core::assemble::load_session(
+        &path,
+        sumcp_core::assemble::MAX_TRANSCRIPT_BYTES,
+    ) {
+        Ok(a) => a,
         Err(e) => {
-            eprintln!("could not read {}: {e}", path.display());
+            eprintln!("could not load {}: {e}", path.display());
             return ExitCode::FAILURE;
         }
     };
-
-    let session = ingest_str(&raw, Lane::Main);
+    let session = assembled.session;
     let ranked = rank(&session, &Weights::default());
     // CLI resolves the session by path, so provenance is "explicit".
     let meta = SessionMeta {
