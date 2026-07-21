@@ -3,7 +3,9 @@
 //! `sumcp --file <path>` prints the overview + ranked struggle areas.
 //! `--json` emits the `session_overview` payload (the frozen v0 contract).
 
-use clap::Parser;
+mod install;
+
+use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use sumcp_core::payloads::{SessionMeta, session_overview};
@@ -13,6 +15,9 @@ use sumcp_core::score::{Weights, rank};
 #[derive(Parser)]
 #[command(name = "sumcp", version, about)]
 struct Args {
+    /// Optional subcommand. When omitted, the legacy `--file` analysis path runs.
+    #[command(subcommand)]
+    command: Option<Command>,
     /// Path to a transcript `.jsonl` to analyze.
     #[arg(long)]
     file: Option<PathBuf>,
@@ -24,11 +29,53 @@ struct Args {
     html: bool,
 }
 
+#[derive(Subcommand)]
+enum Command {
+    /// Register the MCP server, debrief skill, and Stop hook in `~/.claude`.
+    /// Dry-run by default; pass `--apply` to write.
+    Install {
+        /// Actually perform the writes (default is a dry-run preview).
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Remove everything a previous `install` created (manifest-tracked).
+    /// Dry-run by default; pass `--apply` to write.
+    Uninstall {
+        /// Actually perform the removals (default is a dry-run preview).
+        #[arg(long)]
+        apply: bool,
+    },
+}
+
 fn main() -> ExitCode {
     let args = Args::parse();
 
+    // Subcommands (the write path) short-circuit the analysis flow.
+    match args.command {
+        Some(Command::Install { apply }) => {
+            return match install::cmd_install(apply) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("install failed: {e}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
+        Some(Command::Uninstall { apply }) => {
+            return match install::cmd_uninstall(apply) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("uninstall failed: {e}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
+        None => {}
+    }
+
     let Some(path) = args.file else {
         eprintln!("usage: sumcp --file <transcript.jsonl> [--json|--html]");
+        eprintln!("       sumcp install [--apply]   |   sumcp uninstall [--apply]");
         return ExitCode::FAILURE;
     };
 

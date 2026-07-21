@@ -30,8 +30,13 @@ Parser rules (non-negotiable):
 - Review burden: human defect detection collapses past ~200–400 LOC per review (~87% under 100 lines → ~28% over 1,000; SmartBear/Cisco, 3.2M LOC), and AI-assisted developers are overconfident about their code's security (Perry et al., CCS 2023). LOC-per-human-turn against this band is the best-grounded comprehension-debt operationalization — and unlike approval latency, it works under auto-accept.
 - Stuck-in-loop is standard in the SWE-bench literature (≥3 consecutive identical tool+args; SEAlign arXiv:2503.18455), but SWE-agent's authors abandoned automated loop detectors over false positives — flags are advisory-only, require byte-identical calls.
 - Localization dispersion: agents read ~22× more functions than needed (TRAJEVAL), but the baseline needs gold patches — without one, report the read:edit ratio informationally and defer outlier flagging to a cross-session personal baseline.
-- Context rot: accuracy degrades well before the window fills (~50k tokens in), mid-context info is the blind spot. Track window fill.
+- Context rot: accuracy degrades well before the window fills — a 200K-token window can show serious accuracy loss by ~50k tokens of input (Chroma, *Context Rot*, Hong/Troynikov/Huber 2025) — and mid-context info is the blind spot ("lost in the middle", Liu et al., TACL 2024, arXiv:2307.03172). Track window fill.
 - Capitulation flips ("You're absolutely right") are string-detectable and meaningful after user pushback — but only reversal WITHOUT new evidence is sycophancy (FlipFlop arXiv:2311.08596); reversal after a failing test or new read is healthy revision.
+
+_Citation provenance for the findings above was verified 2026-07-21 (full-text,
+not abstract) — see `docs/research-provenance-audit.md`. All load-bearing arXiv
+IDs and the Nagappan & Ball / Perry et al. references resolve and match; two
+earlier abstract-level flags were false alarms and are cleared._
 
 ## Metric catalog (grouped, priority-marked)
 
