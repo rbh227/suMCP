@@ -13,7 +13,7 @@
 //! that is the more robust choice: a surprising shape in one field costs us
 //! that field, not the whole line's type/uuid/timestamp.
 
-use crate::model::{Action, ActionKind, Idx, Lane, Session, Tokens, UserText};
+use crate::model::{Action, ActionKind, Idx, Lane, Session, Spawn, Tokens, UserText};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -38,7 +38,9 @@ pub fn ingest_str(raw: &str, default_lane: Lane) -> Session {
     let mut user_texts: Vec<UserText> = Vec::new();
     let mut interrupts = 0u64;
     let mut auto_accept = false;
-    let mut subagent_spawns = 0u64;
+    // Tool-use ids of Agent/Task spawns, in first-seen order (post-dedup).
+    // Resolved to agentIds after the results map is built.
+    let mut spawn_ids: Vec<String> = Vec::new();
     // tool_use id -> the result that came back for it (error text, patch hunks).
     let mut results: HashMap<String, ResultInfo> = HashMap::new();
 
@@ -129,7 +131,11 @@ pub fn ingest_str(raw: &str, default_lane: Lane) -> Session {
                         // spawns). Counted post-dedup so resumed-session
                         // replays don't inflate the exclusion count.
                         if name == "Agent" || name == "Task" {
-                            subagent_spawns += 1;
+                            // Record the spawn's own tool_use id; we resolve
+                            // its agentId from the paired result below.
+                            if let Some(id) = tool_id {
+                                spawn_ids.push(id.to_string());
+                            }
                         }
                         let input = block.get("input");
                         let file_path = input
@@ -215,6 +221,13 @@ pub fn ingest_str(raw: &str, default_lane: Lane) -> Session {
                                 .and_then(|f| f.get("totalLines"))
                                 .and_then(Value::as_u64)
                                 .map(|n| n as usize);
+                            // Subagent spawns' results carry the child agent's
+                            // id here; it's the only link to the child's file.
+                            let agent_id = v
+                                .get("toolUseResult")
+                                .and_then(|r| r.get("agentId"))
+                                .and_then(Value::as_str)
+                                .map(str::to_string);
                             results.insert(
                                 id.to_string(),
                                 ResultInfo {
@@ -224,6 +237,7 @@ pub fn ingest_str(raw: &str, default_lane: Lane) -> Session {
                                     user_modified,
                                     result_ts: effective_ts.clone(),
                                     read_total_lines,
+                                    agent_id,
                                 },
                             );
                         }
@@ -276,6 +290,15 @@ pub fn ingest_str(raw: &str, default_lane: Lane) -> Session {
         })
         .collect();
 
+    // Resolve each spawn's agentId from its paired result (if the result had
+    // come back and carried one). Order preserved from first-seen.
+    let spawns: Vec<Spawn> = spawn_ids
+        .iter()
+        .map(|id| Spawn {
+            agent_id: results.get(id).and_then(|r| r.agent_id.clone()),
+        })
+        .collect();
+
     let mut tokens = Tokens::default();
     for u in usage_by_msg.values() {
         tokens.input += u.input;
@@ -293,7 +316,8 @@ pub fn ingest_str(raw: &str, default_lane: Lane) -> Session {
         untimestamped_lines: untimestamped,
         interrupts,
         auto_accept,
-        subagent_spawns,
+        spawns,
+        subagent_files_missing: 0,
     }
 }
 
@@ -373,6 +397,8 @@ struct ResultInfo {
     user_modified: bool,
     result_ts: String,
     read_total_lines: Option<usize>,
+    /// The child agent's id from a subagent spawn's `toolUseResult.agentId`.
+    agent_id: Option<String>,
 }
 
 /// Hash (tool name + raw input JSON) for the loop detector: byte-identical
@@ -548,10 +574,15 @@ mod tests {
             call("a3", "TaskCreate"),
             call("a4", "TaskUpdate"),
             call("a1", "Agent"), // replay duplicate — must not inflate
+            // A tool_result for the first Agent spawn, carrying the agentId the
+            // legacy-layout discovery links on.
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:02Z","message":{"content":[{"type":"tool_result","tool_use_id":"a1","is_error":false}]},"toolUseResult":{"agentId":"agent-abc"}}"#.to_string(),
         ]
         .join("\n");
         let s = ingest_str(&raw, Lane::Main);
-        assert_eq!(s.subagent_spawns, 2);
+        assert_eq!(s.spawns.len(), 2, "two Agent/Task spawns, task-list tools ignored");
+        // The paired tool_result carried an agentId for the first spawn only.
+        assert_eq!(s.spawns[0].agent_id.as_deref(), Some("agent-abc"));
     }
 
     #[test]

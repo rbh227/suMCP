@@ -220,10 +220,21 @@ directory-driven path; otherwise fall back to legacy spawn-driven lookup.
   already guarantees ownership, but the file asserts it, so we check.
 - `is_within` canonicalization check on each path (ADR A9 symlink-escape guard,
   same as the main transcript gets).
-- **`files_missing` here** = `max(0, spawn_count − files_that_validated_and_-
-  yielded_actions)`. Spawn count is already deduped (`seen_tool_ids`), so
-  replays don't inflate it. Floored at zero because a version/streaming artifact
-  could surface more files than spawns; flooring keeps it an honest lower bound.
+- **`files_missing` here** (as implemented) =
+  `max(main.spawns.len(), candidates.len()).saturating_sub(merged_ok)`, where
+  `candidates` is the **full discovered file list before ownership/parse
+  filtering** and `merged_ok` is the number of child files that read, validated,
+  AND parsed to ≥1 action. **Why the `max`, not a spawns-only count:** in the
+  2.1.x directory layout the namespaced `subagents/` dir can hold *more* files
+  than the main transcript recorded spawns (e.g. a foreign or wrong-`sessionId`
+  file we later reject). A spawns-only count would leave such a
+  rejected/foreign file **invisible** — subtracted from a base too small to
+  account for it — so a dropped file would not register as missing. Taking the
+  max of "spawns recorded" and "files actually on disk" makes every file we
+  looked at but could not merge count as missing. Spawn count is already deduped
+  (`seen_tool_ids`), so replays don't inflate it. `saturating_sub` floors at
+  zero because a version/streaming artifact could surface more merges than
+  attempted; flooring keeps it an honest lower bound.
 
 ### Legacy layout — sibling `agent-<agentId>.jsonl` in the shared project dir
 
@@ -234,9 +245,15 @@ directory-driven path; otherwise fall back to legacy spawn-driven lookup.
   transcript, pair it with its `tool_result`, read `toolUseResult.agentId`,
   construct exactly `agent-<agentId>.jsonl`, and resolve that one filename.
 - `is_within` check, then existence check.
-- **`files_missing` here** = count of deduped spawns whose file failed to
-  resolve, failed `is_within`, didn't exist, errored on read, or parsed to zero
-  actions. Direct per-spawn accounting.
+- **`files_missing` here** = the same unified formula
+  `max(main.spawns.len(), candidates.len()).saturating_sub(merged_ok)`. In the
+  legacy layout `candidates` is spawn-driven — only siblings our own spawns name
+  and that exist — so `candidates.len() ≤ spawns.len()` and the `max` collapses
+  to `spawns.len()`: effectively direct per-spawn accounting (deduped spawns
+  whose file failed to resolve, failed `is_within`, didn't exist, errored on
+  read, or parsed to zero actions). The one formula is correct for both layouts;
+  only the 2.1.x directory case exercises the `candidates.len() > spawns.len()`
+  branch.
 
 ### Empty/corrupt parse (both layouts)
 

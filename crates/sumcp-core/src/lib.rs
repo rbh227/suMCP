@@ -6,8 +6,10 @@
 //! runtime (ADR A2). Signals are pure functions `&Session -> Vec<Finding>`,
 //! and every finding carries the action indices proving it.
 
+pub mod assemble;
 pub mod ingest;
 pub mod locate;
+pub mod merge;
 pub mod model;
 pub mod payloads;
 pub mod redact;

@@ -85,7 +85,7 @@ suppression object says so explicitly.
 
 | payload | field | contents |
 |---|---|---|
-| `session_overview.flags` | `subagents_excluded` | count of subagent spawns (`Agent`/`Task` tool calls) whose transcripts v0.1 does **not** analyze — honest scope disclosure until the flat-merge lands; `0` when no subagents ran. Replaces the aspirational `totals.subagent_runs` from the Checkpoint A mock, which implied subagents were analyzed. Same cleanup: the mock's `flags.order_uncertain_pairs` (never emitted by any builder) replaced with `untimestamped_lines` (always emitted) |
+| `session_overview.flags` | `subagent_files_missing` | count of subagent spawns whose child transcript could not be analyzed — not found, unreadable, oversized, parsed to zero actions, or beyond the 64-file cap. `0` when every spawn's work was merged in (the common case) and when no subagents ran. Replaces the pre-merge `subagents_excluded` counter. |
 
 ## Versioning
 

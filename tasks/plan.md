@@ -166,6 +166,14 @@ no transcript re-reading.
 
 ## Phase 5 — Packaging & external validation (~2–3 days)
 
+**T5.0 Subagent transcript flat-merge (DONE, feat/subagent-flat-merge).** Spawn
+records, pure `merge_sessions` (total order + Idx re-numbering), lane-scoped
+findings, two-layout discovery (2.1.x namespaced dir + legacy sibling), bounded
+`assemble::load_session`, store+CLI wiring, and the honesty counter
+`flags.subagent_files_missing` (replaces `subagents_excluded`; 12 on the donor,
+0 on the synthetic fixture). Proven end-to-end through the stdio binary. Unblocks
+T5.3 (removes the Checkpoint D subagent blind spot volunteers would have hit).
+
 **T5.1 Static HTML report.** `sumcp report --html`: one self-contained file
 (inline CSS/JS, no framework) rendering the same Report — struggle table,
 churn timeline, evidence appendix.

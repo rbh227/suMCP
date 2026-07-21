@@ -246,12 +246,25 @@ fn reverts_and_flips(s: &Session) -> Vec<Finding> {
     let mut out = Vec::new();
     for (i, later) in edits.iter().enumerate() {
         for earlier in &edits[..i] {
-            // same file, and the later edit puts back what the earlier removed
-            if earlier.file_path == later.file_path && later.edit_new == earlier.edit_old {
+            // same LANE, same file, and the later edit puts back what the
+            // earlier removed. Lane guard (spec §5a): a revert is one actor
+            // undoing its own change — a cross-lane content coincidence on a
+            // shared path is not a revert, and a subagent edit's line_no
+            // indexes a different file than the main-lane pushback stream.
+            if earlier.lane == later.lane
+                && earlier.file_path == later.file_path
+                && later.edit_new == earlier.edit_old
+            {
                 // A flip needs BOTH: pushback in between, and no evidence
                 // gathered between that pushback and the reverting edit.
-                let is_flip = pushback_between(s, earlier.line_no, later.line_no)
-                    .is_some_and(|push| !evidence_between(s, push, later));
+                // Main lane ONLY: a Flip means capitulation to HUMAN pushback,
+                // and pushback_between compares main-transcript line numbers.
+                // A sub-lane edit's line_no indexes a different file, so those
+                // numbers are incomparable — a sub self-revert stays a
+                // TrueRevert (correct) and is never upgraded to a Flip (§5a).
+                let is_flip = later.lane == crate::model::Lane::Main
+                    && pushback_between(s, earlier.line_no, later.line_no)
+                        .is_some_and(|push| !evidence_between(s, push, later));
                 out.push(Finding {
                     kind: if is_flip {
                         FindingKind::Flip
@@ -534,6 +547,85 @@ mod tests {
             edit("2", "2026-01-01T00:00:02Z", "/a.ts", "baz", "qux"),
         );
         assert!(reverts_and_flips(&ingest_str(&raw, Lane::Main)).is_empty());
+    }
+
+    #[test]
+    fn cross_lane_revert_is_not_flagged() {
+        // A main edit and a subagent edit on the same path, where the sub's
+        // new_string restores the main's old_string. Different actors → not a
+        // revert. Same content within one lane WOULD fire (asserted below).
+        use crate::model::{Action, ActionKind, Idx, Lane};
+        let mk = |idx, lane, ts: &str, line, old: &str, new: &str| Action {
+            idx: Idx(idx), effective_ts: ts.into(), ts_inherited: false, lane,
+            line_no: line, kind: ActionKind::Edit, file_path: Some("/a".into()),
+            is_error: None, write_len: None, write_lines: None, read_total_lines: None,
+            input_hash: None, error: None, hunks: vec![], command: None,
+            user_modified: false, edit_old: Some(old.into()), edit_new: Some(new.into()),
+            approval_latency_s: None,
+        };
+        let mut s = crate::model::Session {
+            actions: vec![
+                mk(0, Lane::Main, "2026-01-01T00:00:01Z", 1, "foo", "bar"),
+                mk(1, Lane::Sub("x".into()), "2026-01-01T00:00:02Z", 1, "bar", "foo"),
+            ],
+            user_texts: vec![], tokens: Default::default(), type_counts: Default::default(),
+            parse_errors: 0, untimestamped_lines: 0, interrupts: 0, auto_accept: false,
+            spawns: vec![], subagent_files_missing: 0,
+        };
+        assert!(reverts_and_flips(&s).is_empty(), "cross-lane pair must not be a revert");
+
+        // Same pair, both main lane → a true_revert fires.
+        s.actions[1].lane = Lane::Main;
+        assert_eq!(reverts_and_flips(&s).len(), 1, "same-lane revert must fire");
+    }
+
+    #[test]
+    fn sub_lane_self_revert_stays_a_true_revert_never_a_flip() {
+        // WHY: a Flip means "the agent capitulated to HUMAN pushback." That
+        // upgrade compares the human pushback message's main-transcript line_no
+        // against the edits' line_no. For a SUBAGENT self-revert those line
+        // numbers index a different file entirely, so a human pushback whose
+        // main-transcript line happens to fall between the two sub-edit line
+        // numbers would falsely upgrade a legitimate subagent self-revert into a
+        // "capitulation flip." The Flip upgrade must be gated to the main lane.
+        // The self-revert itself is real, so it must STILL emit as TrueRevert —
+        // only the Flip label is suppressed for sub lanes.
+        use crate::model::{Action, ActionKind, Idx, UserText};
+        let sub_edit = |idx, line, old: &str, new: &str, ts: &str| Action {
+            idx: Idx(idx), effective_ts: ts.into(), ts_inherited: false,
+            lane: Lane::Sub("x".into()), line_no: line, kind: ActionKind::Edit,
+            file_path: Some("/a".into()), is_error: None, write_len: None,
+            write_lines: None, read_total_lines: None, input_hash: None, error: None,
+            hunks: vec![], command: None, user_modified: false,
+            edit_old: Some(old.into()), edit_new: Some(new.into()), approval_latency_s: None,
+        };
+        let s = crate::model::Session {
+            actions: vec![
+                // Sub edits on the SAME sub file: line 1 then line 5 (these are
+                // line numbers WITHIN the subagent's own transcript file).
+                sub_edit(0, 1, "foo", "bar", "2026-01-01T00:00:01Z"),
+                sub_edit(1, 5, "bar", "foo", "2026-01-01T00:00:03Z"), // restores "foo"
+            ],
+            // A human pushback in the MAIN transcript at line 3 — which lands
+            // between the sub edits' 1 and 5 purely by coincidence. The word
+            // "revert" is in the PUSHBACK list, so WITHOUT the lane gate this
+            // would upgrade to a Flip.
+            user_texts: vec![UserText {
+                line_no: 3,
+                text: "no revert that please".into(),
+                effective_ts: "2026-01-01T00:00:02Z".into(),
+            }],
+            tokens: Default::default(), type_counts: Default::default(),
+            parse_errors: 0, untimestamped_lines: 0, interrupts: 0, auto_accept: false,
+            spawns: vec![], subagent_files_missing: 0,
+        };
+        let f = reverts_and_flips(&s);
+        assert_eq!(f.len(), 1, "the self-revert is real and must be reported");
+        assert_eq!(
+            f[0].kind,
+            FindingKind::TrueRevert,
+            "a subagent self-revert is never a capitulation to human pushback"
+        );
     }
 
     fn grep(id: &str, ts: &str, pattern: &str) -> String {

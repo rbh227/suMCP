@@ -10,3 +10,8 @@ repository.workspace = true
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+
+[dev-dependencies]
+# Test-only: real on-disk temp dirs for discovery tests (already in the lockfile
+# via the mcp crate).
+tempfile = "3"

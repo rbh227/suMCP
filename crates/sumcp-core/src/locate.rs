@@ -7,6 +7,12 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::model::Spawn;
+
+/// Cap on subagent files merged for one session (ADR A9(3)). ~5× the largest
+/// real spawn count observed (12 on the donor); the rest count as missing.
+pub const MAX_SUBAGENT_FILES: usize = 64;
+
 /// A validated session id (36-char lowercase-hex-and-dashes UUID form).
 ///
 /// The only way to construct one is [`SessionId::parse`], so if you hold a
@@ -54,6 +60,83 @@ pub fn is_within(root: &Path, candidate: &Path) -> bool {
     }
 }
 
+/// True if `candidate` is inside `main_path`'s parent directory tree — the
+/// guard assembly applies before reading any discovered subagent file.
+pub fn is_within_or_root(main_path: &Path, candidate: &Path) -> bool {
+    let root = main_path.parent().unwrap_or_else(|| Path::new("."));
+    is_within(root, candidate)
+}
+
+/// The 2.1.x subagents directory for a main transcript: `<dir>/<stem>/subagents`,
+/// where `<stem>` is the main file's name without `.jsonl` (the session uuid).
+pub fn subagents_dir(main_path: &Path) -> PathBuf {
+    let stem = main_path.file_stem().unwrap_or_default();
+    let parent = main_path.parent().unwrap_or_else(|| Path::new("."));
+    parent.join(stem).join("subagents")
+}
+
+/// The legacy sibling transcript path for a given agent id:
+/// `<dir>/agent-<agentId>.jsonl` next to the main transcript.
+fn legacy_sibling(main_path: &Path, agent_id: &str) -> PathBuf {
+    let parent = main_path.parent().unwrap_or_else(|| Path::new("."));
+    parent.join(format!("agent-{agent_id}.jsonl"))
+}
+
+/// Discover this session's subagent transcript files, safety-checked and
+/// count-capped. Layout is auto-detected: if the 2.1.x `subagents/` directory
+/// exists we list it; otherwise we resolve legacy siblings from the spawns'
+/// agent ids. Returns only existing regular-file paths that resolve INSIDE the
+/// session's own directory tree (ADR A9 symlink/`..` guard).
+pub fn discover_subagent_paths(main_path: &Path, spawns: &[Spawn]) -> Vec<PathBuf> {
+    let dir = subagents_dir(main_path);
+    let mut out: Vec<PathBuf> = if dir.is_dir() {
+        // 2.1.x: list agent-*.jsonl in the session-namespaced directory. The
+        // directory itself guarantees these belong to this session, so no
+        // spawn-linking is needed here (content validation happens at read).
+        let root = main_path.parent().unwrap_or_else(|| Path::new("."));
+        let mut v: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .map(|rd| {
+                rd.flatten()
+                    .map(|e| e.path())
+                    .filter(|p| is_agent_jsonl(p))
+                    .filter(|p| is_within(root, p))
+                    .collect()
+            })
+            .unwrap_or_default();
+        // Deterministic order regardless of filesystem enumeration.
+        v.sort();
+        v
+    } else {
+        // Legacy: resolve exactly the siblings our own spawns name. Never list
+        // the shared project dir — that would false-merge other sessions.
+        let root = main_path.parent().unwrap_or_else(|| Path::new("."));
+        spawns
+            .iter()
+            .filter_map(|s| s.agent_id.as_deref())
+            .map(|id| legacy_sibling(main_path, id))
+            .filter(|p| p.is_file() && is_within(root, p))
+            .collect()
+    };
+    // Dedup: two spawns can name the same agentId, which would map to the same
+    // sibling path twice — assembly would then read and merge that child
+    // transcript twice, doubling its actions. Sort first so `dedup` (which only
+    // removes CONSECUTIVE duplicates) is complete, and so the order stays
+    // deterministic. The 2.1.x branch is already sorted and duplicate-free, so
+    // this is a harmless no-op there.
+    out.sort();
+    out.dedup();
+    out.truncate(MAX_SUBAGENT_FILES);
+    out
+}
+
+/// True for a regular file named `agent-*.jsonl`.
+fn is_agent_jsonl(p: &Path) -> bool {
+    p.is_file()
+        && p.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("agent-") && n.ends_with(".jsonl"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -70,5 +153,81 @@ mod tests {
     fn project_dir_name_dashifies_the_path() {
         let name = project_dir_name(Path::new("/Users/dev/Desktop/example-app"));
         assert_eq!(name, "-Users-dev-Desktop-example-app");
+    }
+
+    use crate::model::Spawn;
+
+    #[test]
+    fn discovers_2_1_x_subagents_dir() {
+        // Layout: <dir>/<uuid>.jsonl (main) + <dir>/<uuid>/subagents/agent-*.jsonl
+        let td = tempfile::tempdir().unwrap();
+        let uuid = "5717aaaa-1111-2222-3333-444455556666";
+        let main = td.path().join(format!("{uuid}.jsonl"));
+        std::fs::write(&main, "{}").unwrap();
+        let subs = td.path().join(uuid).join("subagents");
+        std::fs::create_dir_all(&subs).unwrap();
+        std::fs::write(subs.join("agent-aaa.jsonl"), "{}").unwrap();
+        std::fs::write(subs.join("agent-bbb.jsonl"), "{}").unwrap();
+        std::fs::write(subs.join("notes.txt"), "ignore me").unwrap();
+
+        let found = discover_subagent_paths(&main, &[]);
+        assert_eq!(found.len(), 2, "two agent-*.jsonl, notes.txt ignored");
+    }
+
+    #[test]
+    fn discovers_legacy_siblings_by_spawn_agent_id() {
+        // Layout: <dir>/<uuid>.jsonl (main) + <dir>/agent-<id>.jsonl (siblings),
+        // no <uuid>/subagents dir → legacy path.
+        let td = tempfile::tempdir().unwrap();
+        let uuid = "5717aaaa-1111-2222-3333-444455556666";
+        let main = td.path().join(format!("{uuid}.jsonl"));
+        std::fs::write(&main, "{}").unwrap();
+        std::fs::write(td.path().join("agent-present.jsonl"), "{}").unwrap();
+        // A decoy sibling for a DIFFERENT session's agent — must not be found.
+        std::fs::write(td.path().join("agent-decoy.jsonl"), "{}").unwrap();
+
+        let spawns = vec![
+            Spawn { agent_id: Some("present".into()) },
+            Spawn { agent_id: Some("absent".into()) }, // file does not exist
+            Spawn { agent_id: None },                  // unresolved, skipped
+        ];
+        let found = discover_subagent_paths(&main, &spawns);
+        assert_eq!(found.len(), 1, "only the spawn-linked, existing sibling");
+        assert!(found[0].ends_with("agent-present.jsonl"));
+    }
+
+    #[test]
+    fn duplicate_spawn_agent_ids_yield_one_path() {
+        // WHY: two spawns naming the SAME agentId map to the same sibling path.
+        // Without dedup, assembly would read + merge that child transcript
+        // twice, doubling its actions (inflating churn/re-read counts) while
+        // files_missing still reads 0. The returned Vec must be duplicate-free.
+        let td = tempfile::tempdir().unwrap();
+        let uuid = "5717aaaa-1111-2222-3333-444455556666";
+        let main = td.path().join(format!("{uuid}.jsonl"));
+        std::fs::write(&main, "{}").unwrap();
+        std::fs::write(td.path().join("agent-dup.jsonl"), "{}").unwrap();
+
+        let spawns = vec![
+            Spawn { agent_id: Some("dup".into()) },
+            Spawn { agent_id: Some("dup".into()) }, // same id → same path
+        ];
+        let found = discover_subagent_paths(&main, &spawns);
+        assert_eq!(found.len(), 1, "the shared sibling path is merged exactly once");
+    }
+
+    #[test]
+    fn file_count_is_capped() {
+        let td = tempfile::tempdir().unwrap();
+        let uuid = "5717aaaa-1111-2222-3333-444455556666";
+        let main = td.path().join(format!("{uuid}.jsonl"));
+        std::fs::write(&main, "{}").unwrap();
+        let subs = td.path().join(uuid).join("subagents");
+        std::fs::create_dir_all(&subs).unwrap();
+        for i in 0..(MAX_SUBAGENT_FILES + 10) {
+            std::fs::write(subs.join(format!("agent-{i:03}.jsonl")), "{}").unwrap();
+        }
+        let found = discover_subagent_paths(&main, &[]);
+        assert_eq!(found.len(), MAX_SUBAGENT_FILES, "capped");
     }
 }

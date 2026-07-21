@@ -147,6 +147,42 @@ fn fixture_home(root: &Path) -> (PathBuf, PathBuf) {
     (claude_home, project_cwd)
 }
 
+/// Build a fake `~/.claude` containing the SYNTHETIC 2.1.x subagent-merge
+/// fixture tree as one session of a fake project. Unlike `fixture_home` (which
+/// copies only a flat main transcript), this also reproduces the 2.1.x on-disk
+/// layout the server discovers subagents from:
+///
+///   <project_dir>/<SESSION_ID>.jsonl                        (main)
+///   <project_dir>/<SESSION_ID>/subagents/agent-helper.jsonl (child)
+///
+/// so `load_session` can find, validate, and merge the child transcript.
+fn fixture_home_subagents(root: &Path) -> (PathBuf, PathBuf) {
+    let project_cwd = root.join("proj");
+    std::fs::create_dir_all(&project_cwd).unwrap();
+    let project_cwd = project_cwd.canonicalize().unwrap();
+    let claude_home = root.join("claude-home");
+    let project_dir = sumcp_core::locate::project_dir(&claude_home, &project_cwd);
+    std::fs::create_dir_all(&project_dir).unwrap();
+
+    // Repo root is two levels up from this crate (crates/sumcp-mcp).
+    let repo_fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/subagent-merge");
+    // Main transcript → <project_dir>/<SESSION_ID>.jsonl
+    std::fs::copy(
+        repo_fixtures.join(format!("{SESSION_ID}.jsonl")),
+        project_dir.join(format!("{SESSION_ID}.jsonl")),
+    )
+    .unwrap();
+    // Child transcript → <project_dir>/<SESSION_ID>/subagents/agent-helper.jsonl
+    let subs_dir = project_dir.join(SESSION_ID).join("subagents");
+    std::fs::create_dir_all(&subs_dir).unwrap();
+    std::fs::copy(
+        repo_fixtures.join(SESSION_ID).join("subagents/agent-helper.jsonl"),
+        subs_dir.join("agent-helper.jsonl"),
+    )
+    .unwrap();
+    (claude_home, project_cwd)
+}
+
 fn cap_ok(name: &str, payload: &serde_json::Value, cap: usize) {
     let tokens = (payload.to_string().len() as f64 / CHARS_PER_TOKEN).ceil() as usize;
     assert!(tokens <= cap, "{name} over cap: ~{tokens} > {cap}");
@@ -221,6 +257,63 @@ fn six_tools_answer_the_frozen_contract_over_stdio() {
     let actions = evidence["actions"].as_array().unwrap();
     assert!(!actions.is_empty(), "finding idxs must dereference");
     assert!(actions[0]["idx"].is_number());
+    cap_ok("evidence", &evidence, 1500);
+}
+
+#[test]
+fn subagent_actions_merge_and_dereference_over_stdio() {
+    // End-to-end proof that the flat-merge survives the whole pipeline through
+    // the REAL binary: point the server at the synthetic 2.1.x tree, and check
+    // that (a) the child transcript was found + merged (nothing missing), and
+    // (b) `evidence` can dereference an Idx that lands on a *subagent* action,
+    // returning that action's sub-lane file path.
+    let tmp = tempfile::tempdir().unwrap();
+    let (home, cwd) = fixture_home_subagents(tmp.path());
+    let mut rpc = Rpc::spawn(&home, &cwd);
+    rpc.handshake();
+
+    let sid = serde_json::json!({"session_id": SESSION_ID});
+
+    // --- session_overview: merge succeeded, no missing subagent files ---
+    let (overview, err) = rpc.tool("session_overview", sid.clone());
+    assert!(!err, "overview must not error: {overview}");
+    assert_eq!(overview["v"], 0);
+    // The one Agent spawn's child transcript was discovered, validated, and
+    // merged — so the honesty counter reads zero.
+    assert_eq!(
+        overview["flags"]["subagent_files_missing"], 0,
+        "the one spawn's child file was merged"
+    );
+    // Four actions total: main Agent spawn + main Edit + two subagent Edits.
+    // This is what pins that the 2 sub actions are actually in the timeline
+    // (evidence surfaces the file path, not the lane, so the merged action
+    // count is where the sub work becomes visible in the overview).
+    assert_eq!(overview["totals"]["actions"], 4, "2 main + 2 sub actions");
+    cap_ok("session_overview", &overview, 1000);
+
+    // --- evidence at a known subagent Idx ---
+    // Merged total order is by (timestamp, lane, line_no):
+    //   idx 0  main  Agent spawn   @10:00:01
+    //   idx 1  sub   Edit sub_helper @10:00:05  ← subagent action
+    //   idx 2  sub   Edit sub_helper @10:00:10  ← subagent action
+    //   idx 3  main  Edit main_app   @10:00:20
+    // So Idx 1 dereferences a subagent Edit; its `file` is the sub-lane path.
+    let (evidence, err) = rpc.tool(
+        "evidence",
+        serde_json::json!({"idxs": [1], "session_id": SESSION_ID}),
+    );
+    assert!(!err, "evidence must not error: {evidence}");
+    let actions = evidence["actions"].as_array().unwrap();
+    assert_eq!(actions.len(), 1, "the one requested idx dereferences");
+    assert_eq!(actions[0]["idx"], 1);
+    // The dereferenced action is the subagent's Edit, identified by its
+    // sub-lane file path (`/work/proj/sub_helper.rs`) — evidence from the sub
+    // lane, proving the merge is queryable end-to-end.
+    let file = actions[0]["file"].as_str().expect("evidence carries a file");
+    assert!(
+        file.contains("sub_helper"),
+        "evidence should reflect the sub-lane file, got {file:?}"
+    );
     cap_ok("evidence", &evidence, 1500);
 }
 

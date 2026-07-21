@@ -10,7 +10,7 @@
 //!   cannot tell "read carefully" from "auto-accept" from "got coffee", so it
 //!   is suppressed when the session ran under an auto-accept permission mode.
 
-use crate::model::{Action, ActionKind, Confidence, Finding, FindingKind, Session, Tier};
+use crate::model::{Action, ActionKind, Confidence, Finding, FindingKind, Lane, Session, Tier};
 use crate::signals::dynamics::segments;
 
 /// A write this many chars or larger is "large".
@@ -81,7 +81,9 @@ fn review_burden(s: &Session) -> Vec<Finding> {
 fn large_write_instant_accept(s: &Session) -> Vec<Finding> {
     s.actions
         .iter()
-        .filter(|a| is_large_write(a) && accepted_instantly(a))
+        // Main lane only: comprehension debt is a claim about the human, and a
+        // subagent lane has no human gating its writes (design §5 corollary).
+        .filter(|a| a.lane == Lane::Main && is_large_write(a) && accepted_instantly(a))
         .map(|a| {
             let latency = a.approval_latency_s.unwrap_or(0.0);
             let chars = a.write_len.unwrap_or(0);
@@ -120,7 +122,7 @@ pub fn approval_latency_active(s: &Session) -> bool {
 mod tests {
     use super::*;
     use crate::ingest::ingest_str;
-    use crate::model::Lane;
+    // `Lane` comes in via `super::*` (now imported by the parent module).
 
     // A Write of `content`, then its result `dt` seconds later.
     fn write_then_accept(id: &str, content_len: usize, t0: &str, t1: &str) -> String {
@@ -141,6 +143,28 @@ mod tests {
         assert_eq!(f.len(), 1);
         assert_eq!(f[0].kind, FindingKind::LargeWriteInstantAccept);
         assert!(!f[0].exact, "always heuristic");
+    }
+
+    #[test]
+    fn subagent_large_write_does_not_fire_but_main_does() {
+        // WHY: comprehension debt is a claim about the HUMAN — "you shipped code
+        // you didn't read." A subagent has no human gating its writes, so a big
+        // fast subagent write is NOT comprehension debt (design §5 corollary:
+        // comprehension signals consider main-lane actions only). This test
+        // proves the lane filter is load-bearing: the SAME action fires on Main
+        // and stays silent on a Sub lane.
+        let raw = write_then_accept("w1", 5000, "2026-01-01T00:00:00Z", "2026-01-01T00:00:02Z");
+        // Ingested as a subagent lane: the qualifying write exists, but no human.
+        let mut s = ingest_str(&raw, Lane::Sub("x".into()));
+        assert!(
+            comprehension(&s).is_empty(),
+            "a subagent lane has no human to owe comprehension — no finding"
+        );
+        // Flip the very same action to the main lane: now it must fire.
+        s.actions[0].lane = Lane::Main;
+        let f = comprehension(&s);
+        assert_eq!(f.len(), 1, "same write on the main lane IS comprehension debt");
+        assert_eq!(f[0].kind, FindingKind::LargeWriteInstantAccept);
     }
 
     #[test]

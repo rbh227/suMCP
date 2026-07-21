@@ -47,6 +47,69 @@ fn edge_cases_bad_line_is_counted_not_fatal() {
 }
 
 #[test]
+fn donor_reports_all_subagents_missing() {
+    // The real 2.1.210 donor spawns subagents whose child transcript files
+    // never made it into the sanitized fixture (T1.2: they were unrecoverable).
+    // An *honest* assembly must therefore report every spawn as a missing
+    // subagent file rather than silently pretending the work didn't happen.
+    //
+    // `load_session` is the filesystem-facing entry point: it reads the main
+    // transcript, tries to discover+read subagent files, and records how many
+    // it could not turn into analyzed actions. Here that count should equal the
+    // number of spawns (12) — cross-checked by `grep -c '"agentId"'` on the
+    // fixture, which finds 12 spawn results.
+    let path: std::path::PathBuf = [
+        env!("CARGO_MANIFEST_DIR"),
+        "..",
+        "..",
+        "fixtures",
+        "session-2_1_210-subagents.jsonl",
+    ]
+    .iter()
+    .collect();
+    let a = sumcp_core::assemble::load_session(&path, sumcp_core::assemble::MAX_TRANSCRIPT_BYTES)
+        .unwrap();
+    assert_eq!(
+        a.session.subagent_files_missing, 12,
+        "12 spawns, no child files on disk"
+    );
+}
+
+#[test]
+fn synthetic_2_1_x_merges_subagent_actions() {
+    // The synthetic 2.1.x fixture tree DOES ship the child transcript, so the
+    // merge should succeed end-to-end: two subagent `Edit` actions get folded
+    // into the main session's timeline (interleaved by timestamp), and nothing
+    // is left missing.
+    //
+    // Layout under fixtures/subagent-merge/:
+    //   <uuid>.jsonl                       (main: one Agent spawn + one Edit)
+    //   <uuid>/subagents/agent-helper.jsonl (two Edits, sessionId == parent)
+    let path: std::path::PathBuf = [
+        env!("CARGO_MANIFEST_DIR"),
+        "..",
+        "..",
+        "fixtures",
+        "subagent-merge",
+        "5717aaaa-1111-2222-3333-444455556666.jsonl",
+    ]
+    .iter()
+    .collect();
+    let a = sumcp_core::assemble::load_session(&path, sumcp_core::assemble::MAX_TRANSCRIPT_BYTES)
+        .unwrap();
+    // Count actions whose lane is `Sub(_)` — i.e. came from a subagent file.
+    // `matches!` is a compact "does this value fit that pattern?" test.
+    let sub = a
+        .session
+        .actions
+        .iter()
+        .filter(|x| matches!(x.lane, Lane::Sub(_)))
+        .count();
+    assert_eq!(sub, 2, "both subagent edits merged");
+    assert_eq!(a.session.subagent_files_missing, 0, "the one spawn resolved");
+}
+
+#[test]
 fn edit_shape_signals_fire_on_the_real_donor() {
     use sumcp_core::signals::edit_shape;
     let s = ingest_str(&fixture("session-2_1_210-subagents.jsonl"), Lane::Main);
