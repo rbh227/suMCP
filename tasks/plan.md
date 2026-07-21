@@ -189,18 +189,32 @@ hook nudges only when session had ≥N edits.
   pre-existing `.mcp.json`/skills/hooks, repeated install, simulated partial
   failure with rollback, and uninstall-after-manual-edits.
 
-**T5.3 External validation + README (dealbreaker + gate 2).**
-Run signals on 2–3 volunteers' transcripts (sanitizer offered for privacy);
-interview: do the top-3 struggle files feel true? Measure the token ratio
-(structured debrief tokens vs transcript-re-read tokens) on real fixtures.
-README leads with the measured number + HTML-report screenshot; document
-metrics with tier/heuristic labels.
-- Accept (release gate, no escape hatch): ≥2 external "feels true"
-  confirmations required to tag. If weights/signals are adjusted in response
-  to feedback, the gate re-runs on held-out transcripts (OS/version/project
-  diversity) — tuning never substitutes for passing. Measured token ratio in
-  README; `v0.1.0` tag only after the gate passes. Publishing to
-  GitHub/crates.io is an ask-first boundary per SPEC §7.
+**T5.3 Internal multi-project validation + README skeleton (v0.1 gate).**
+REFRAMED 2026-07-21: no external volunteers for v0.1. Validate by running
+suMCP across several of the author's OWN projects of different types (e.g.
+CSE262, CSE216, suMCP, …) — a real generalization + robustness check on
+transcripts the signals were not built on. Honesty is preserved by discipline,
+not by outside eyes:
+  1. **Freeze weights** before starting the run.
+  2. **Predict-then-check** — for each sampled session, write one line of what
+     you remember struggling with BEFORE running suMCP, then compare. This is
+     the guardrail against confirmation bias and is non-negotiable.
+  3. **Log true / partly / false AND misses** per top-3 finding, verbatim.
+  4. **Robustness sweep** across projects: crashes, nonsense findings, zero-fire
+     on an obviously painful session, over-fire on a calm one.
+Measure the token ratio (structured debrief tokens vs transcript-re-read tokens)
+on these real sessions. README leads with the measured number + HTML-report
+screenshot, labels validation HONESTLY as single-user / multi-project (never
+"external"), and lists external validation as the #1 post-v0.1 item. Metrics
+carry tier/heuristic labels.
+- Accept (v0.1 gate): suMCP runs clean (no crash/nonsense) across ≥3 distinct
+  project types; top-3 struggles match the predict-then-check ground truth on a
+  majority of sampled sessions, with misses/false-positives documented; token
+  ratio measured and in the README; weights frozen (or, if tuned after seeing
+  results, re-checked on sessions not used to tune). `v0.1.0` is an honest
+  "validated on my own N projects" claim. Publishing to GitHub/crates.io is an
+  ask-first boundary per SPEC §7. NOTE: SPEC §6's "≥2 external feels-true"
+  gate language must be amended to match this reframe.
 
 **T5.4 OSS readiness.**
 LICENSE (MIT or Apache-2.0/MIT dual — decide at task time), README as the
