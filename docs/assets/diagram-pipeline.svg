@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 240" font-family="'Comic Sans MS','Chalkboard SE','Segoe Print',cursive">
+  <style>
+    .box{fill:#fffdf5;stroke:#222;stroke-width:2.5;}
+    .lbl{font-size:15px;fill:#111;text-anchor:middle;}
+    .arr{stroke:#222;stroke-width:2.5;fill:none;}
+    .sub{font-size:12px;fill:#555;text-anchor:middle;}
+    .foot{font-size:14px;fill:#800000;text-anchor:middle;}
+  </style>
+  <!-- nodes -->
+  <path class="box" d="M14 60 q4 -8 150 -6 q8 40 -2 74 q-70 8 -150 2 q-6 -40 2 -70 z"/>
+  <text class="lbl" x="90" y="92">session.jsonl</text>
+  <text class="sub" x="90" y="112">the transcript</text>
+
+  <path class="box" d="M232 60 q4 -8 150 -6 q8 40 -2 74 q-70 8 -150 2 q-6 -40 2 -70 z"/>
+  <text class="lbl" x="308" y="92">Rust parser</text>
+  <text class="sub" x="308" y="112">deterministic</text>
+
+  <path class="box" d="M450 60 q4 -8 150 -6 q8 40 -2 74 q-70 8 -150 2 q-6 -40 2 -70 z"/>
+  <text class="lbl" x="526" y="92">session graph</text>
+  <text class="sub" x="526" y="112">actions + findings</text>
+
+  <path class="box" d="M668 60 q4 -8 150 -6 q8 40 -2 74 q-70 8 -150 2 q-6 -40 2 -70 z"/>
+  <text class="lbl" x="744" y="88">6 MCP tools</text>
+  <text class="sub" x="744" y="108">then your agent,</text>
+  <text class="sub" x="744" y="124">cited</text>
+
+  <!-- arrows -->
+  <path class="arr" d="M170 98 q20 -3 56 0"/>
+  <path class="arr" d="M226 98 l-10 -5 m10 5 l-10 6"/>
+  <path class="arr" d="M388 98 q20 -3 56 0"/>
+  <path class="arr" d="M444 98 l-10 -5 m10 5 l-10 6"/>
+  <path class="arr" d="M606 98 q20 -3 56 0"/>
+  <path class="arr" d="M662 98 l-10 -5 m10 5 l-10 6"/>
+
+  <text class="foot" x="460" y="196">no LLM  .  no network  .  read-only</text>
+</svg>

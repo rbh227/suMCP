@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 620 340" font-family="'Comic Sans MS','Chalkboard SE','Segoe Print',cursive">
+  <style>
+    .big{fill:#c9d9e8;stroke:#222;stroke-width:2.5;}
+    .small{fill:#800000;stroke:#222;stroke-width:2.5;}
+    .cap{font-size:14px;fill:#111;text-anchor:middle;}
+    .num{font-size:13px;fill:#555;text-anchor:middle;}
+    .win{font-size:18px;fill:#800000;text-anchor:middle;}
+  </style>
+  <path class="big" d="M70 30 q60 -4 120 0 q4 130 0 232 q-60 5 -122 0 q-4 -130 2 -232 z"/>
+  <text class="cap" x="130" y="284">full transcript</text>
+  <text class="num" x="130" y="304">tens of thousands</text>
+  <text class="num" x="130" y="320">to ~1,000,000 tok</text>
+
+  <rect class="small" x="430" y="258" width="120" height="6" rx="2"/>
+  <text class="cap" x="490" y="284">suMCP payload</text>
+  <text class="num" x="490" y="304">~150 to 290 tok</text>
+
+  <text class="win" x="310" y="26">median ~800x smaller</text>
+</svg>

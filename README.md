@@ -1,35 +1,62 @@
-# suMCP
+<p align="center">
+  <img src="docs/assets/wordmark.svg" alt="suMCP" width="420">
+</p>
 
-**Post-session forensics for Claude Code.** suMCP reads your Claude Code
-session transcripts and tells a connected agent *what actually happened* —
-which files you fought with, where work was silently reverted, where an edit
-went in unverified — from **evidence**, not the agent's self-report. It's a
-deterministic Rust MCP server: **no LLM, no network, read-only.**
+<p align="center"><b>The agent tells you what it built. suMCP tells you what it actually did.</b></p>
 
-> **Status: v0.1 pre-release.** Robust across many real projects; the *accuracy*
-> of the struggle ranking is not yet systematically validated (see
+<p align="center">
+  <img alt="license: MIT OR Apache-2.0" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue">
+  <img alt="Rust" src="https://img.shields.io/badge/Rust-edition%202024-orange">
+  <img alt="deterministic, no LLM, no network" src="https://img.shields.io/badge/deterministic-no%20LLM%20%C2%B7%20no%20network-2ea44f">
+  <img alt="status: v0.1 pre-release" src="https://img.shields.io/badge/status-v0.1%20pre--release-lightgrey">
+</p>
+
+<p align="center">
+  <img src="docs/assets/report-screenshot.png" alt="suMCP HTML report: session timeline, ranked struggle areas, blind spots, and per-file evidence" width="820">
+</p>
+
+> **v0.1 pre-release.** Validated on the author's own projects across many
+> session types. The ranking is proven to run and generalize; its top-3
+> accuracy has been spot-checked, not yet systematically measured (see
 > [Limitations](#limitations)). Not yet published to crates.io.
 
 ---
 
-## Why
+## Why I built this
 
-When you ask an agent "what did we struggle with this session?", it answers from
-a lossy memory of its own context — or by re-reading the entire transcript,
-which is enormous. suMCP extracts the same answer as a few hundred tokens of
-structured, cited evidence.
+I ship code an agent wrote faster than I can fully understand it. That gap,
+the comprehension debt, is the thing I actually wanted a tool for.
 
-On **15 real sessions across 6 project types** (Rust, Python/ML, TS/React,
-prose, and more), the core debrief payload was **~150–290 tokens** against raw
-transcripts of tens of thousands to ~1,000,000 tokens — a **median ~800×
-reduction**.¹ Same answer, a fraction of the context.
+When you ask an agent "what did we struggle with this session?", it answers
+from a lossy, self-flattering memory of its own context, or it re-reads the
+entire transcript, which is enormous. Neither is trustworthy: the first is
+narrative, the second is expensive, and both drift from what actually
+happened.
 
-<!-- TODO(T5.3): drop the HTML-report screenshot here. -->
+The transcript is the evidence. Every edit, every failed command, every time
+I pushed back, ordered and timestamped. That record survives compaction and it
+survives the agent's self-report. suMCP reads it deterministically, in Rust,
+with no LLM and no network, and hands a connected agent a few hundred tokens of
+cited, structured evidence instead of a vibe. The tool does not judge; it shows
+its work, and the agent is the only intelligence in the loop.
 
-¹ Measured as `session_overview` payload vs full transcript, `chars/3.5`. A
-complete debrief that also reads `struggle_areas` + a few `evidence` calls is a
-small multiple of that — still one to three orders of magnitude smaller than
-re-reading the transcript.
+---
+
+## The numbers
+
+<p align="center">
+  <img src="docs/assets/diagram-tokens.svg" alt="A full transcript of tens of thousands to about one million tokens versus a suMCP payload of about 150 to 290 tokens: a median 800x reduction." width="520">
+</p>
+
+On 15 real sessions across 6 project types (Rust, Python/ML, TS/React, prose,
+and more), the core debrief payload was about 150 to 290 tokens against raw
+transcripts of tens of thousands to about 1,000,000 tokens: a median ~800x
+reduction.[^tok] Same answer, a fraction of the context.
+
+[^tok]: Measured as the `session_overview` payload vs the full transcript at
+`chars/3.5`. A full debrief that also reads `struggle_areas` plus a few
+`evidence` calls is a small multiple of that, still one to three orders of
+magnitude smaller than re-reading the transcript.
 
 ---
 
@@ -80,7 +107,7 @@ All read-only; all return compact JSON evidence, never narration.
 | `session_overview` | Totals, token economics, and top-3 struggle files. **Start here.** |
 | `struggle_areas` | Ranked struggle files with a per-category score breakdown, the weights used, and evidence-backed findings. |
 | `file_story` | Chronological event story for one file (head + tail kept, middle elided). |
-| `blind_spots` | Blind-write attempts and large-write-instant-accept outliers, with suppression status for heuristic metrics. |
+| `blind_spots` | Blind-write attempts, review-burden findings, and large-write-instant-accept outliers, with suppression status for heuristic metrics. |
 | `context_health` | Cache hit ratio and token economics (informational). |
 | `evidence` | Dereference a finding's `idxs` into the raw actions that prove them (≤10 actions, excerpts ≤600 chars). |
 
@@ -88,13 +115,18 @@ All read-only; all return compact JSON evidence, never narration.
 
 ## How it works
 
+<p align="center">
+  <img src="docs/assets/diagram-pipeline.svg" alt="session.jsonl to a deterministic Rust parser to a session graph to 6 MCP tools to your agent, cited. No LLM, no network, read-only." width="760">
+</p>
+
 `locate → ingest → model → signals → score → Report`. suMCP parses transcripts
 permissively (a bad line never fails a file), merges any subagent transcripts
 into one totally-ordered timeline, then runs pure functions that look for
 edit-shape churn, rework, re-reads, failure loops, reverts, and comprehension
 signals. Every finding carries a **tier**, an **exact-vs-heuristic** flag, a
 **confidence**, and the action indices that prove it. See
-[docs/metrics-spec.md](docs/metrics-spec.md).
+[docs/metrics.md](docs/metrics.md) for the reader-facing catalog, or
+[docs/metrics-spec.md](docs/metrics-spec.md) for the authoritative spec.
 
 ---
 
@@ -118,4 +150,9 @@ Read these before trusting a ranking:
 
 ## License
 
-MIT (see [LICENSE](LICENSE) — added in the OSS-readiness pass).
+Dual-licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](LICENSE-MIT))
+
+at your option.
