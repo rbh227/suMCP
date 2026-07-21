@@ -199,20 +199,53 @@ fn refuse_symlink(path: &Path) -> io::Result<()> {
     }
 }
 
-/// Assert `path` is under `home` once its lexical `..`/`.` segments are removed.
-/// We normalize lexically (not via `canonicalize`) because the target may not
-/// exist yet. This blocks a crafted `home` like `/Users/x/../../etc`.
+/// Assert `path` is under `home`, in two layers:
+///
+/// 1. **Lexical.** Collapse `..`/`.` and require the result to start with a
+///    lexically-normalized `home`. Works even when the target doesn't exist yet,
+///    and blocks a crafted path like `~/.claude/../../etc`.
+/// 2. **Symlink-aware.** If `home` really exists on disk, `canonicalize` the
+///    deepest *existing* ancestor of the target and require it to still resolve
+///    under the real `home`. This catches the case a lexical check can't: an
+///    intermediate directory (e.g. `~/.claude/skills`) that is itself a symlink
+///    pointing outside `$HOME`, which `create_dir_all` would otherwise follow.
+///    Skipped when `home` doesn't exist (synthetic paths in some unit tests).
 fn assert_under_home(path: &Path, home: &Path) -> io::Result<()> {
     let norm = lexical_normalize(path);
     let home_norm = lexical_normalize(home);
-    if norm.starts_with(&home_norm) {
-        Ok(())
-    } else {
-        Err(io::Error::new(
+    if !norm.starts_with(&home_norm) {
+        return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("target escapes home: {}", path.display()),
-        ))
+        ));
     }
+    if let Ok(home_real) = home.canonicalize() {
+        // Walk up from the (lexical) target to the first ancestor that exists,
+        // staying within the lexical home. Canonicalizing it resolves any
+        // symlinks in the chain; if the real path leaves home, refuse.
+        let mut anc: &Path = &norm;
+        loop {
+            match anc.canonicalize() {
+                Ok(real) => {
+                    if !real.starts_with(&home_real) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!(
+                                "target resolves outside home via symlink: {}",
+                                path.display()
+                            ),
+                        ));
+                    }
+                    break;
+                }
+                Err(_) => match anc.parent() {
+                    Some(p) if p.starts_with(&home_norm) => anc = p,
+                    _ => break,
+                },
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Collapse `.` and `..` segments lexically without hitting the filesystem.
@@ -297,6 +330,10 @@ impl<'a> Journal<'a> {
     /// so uninstall removes the whole subtree.
     fn ensure_dir(&mut self, dir: &Path) -> io::Result<()> {
         assert_under_home(dir, self.home)?;
+        // Refuse a symlinked directory as a target: even one pointing inside
+        // home shouldn't be written *through* (A8: no following symlinks at
+        // write targets). Outside-home symlinks are already caught above.
+        refuse_symlink(dir)?;
         if dir.exists() {
             return Ok(());
         }
@@ -1078,9 +1115,10 @@ mod tests {
         let installed = fs::read_to_string(skill.join("SKILL.md")).unwrap();
         assert_ne!(installed, "MY CUSTOM SKILL", "skill not replaced");
         assert!(
-            fs::read_dir(&skill).unwrap().filter_map(|e| e.ok()).any(|e| {
-                e.file_name().to_string_lossy().contains(".sumcp-bak.")
-            }),
+            fs::read_dir(&skill)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .any(|e| { e.file_name().to_string_lossy().contains(".sumcp-bak.") }),
             "no backup of the pre-existing skill"
         );
 
@@ -1091,6 +1129,49 @@ mod tests {
             "MY CUSTOM SKILL",
             "uninstall did not restore the backed-up skill"
         );
+    }
+
+    #[test]
+    fn symlinked_skill_dir_target_is_refused() {
+        let home = temp_home();
+        let outside = tempdir().unwrap();
+        fs::create_dir_all(home.path().join(".claude/skills")).unwrap();
+        // The skill destination itself is a symlink pointing outside home.
+        std::os::unix::fs::symlink(outside.path(), home.path().join(".claude/skills/debrief"))
+            .unwrap();
+
+        let (_g, exe) = fake_exe_dir();
+        let paths = Paths::new(home.path().to_path_buf());
+        assert!(
+            run_install(&paths, &exe, true).is_err(),
+            "symlinked skill dir must be refused"
+        );
+        assert!(
+            !outside.path().join("SKILL.md").exists(),
+            "wrote through the symlinked target dir"
+        );
+        assert!(!paths.sumcp().exists(), "not rolled back");
+    }
+
+    #[test]
+    fn symlinked_skills_parent_is_refused() {
+        let home = temp_home();
+        let outside = tempdir().unwrap();
+        // `~/.claude/skills` is a symlink outside home; `debrief` doesn't exist yet,
+        // so only the canonicalized-ancestor check can catch this.
+        std::os::unix::fs::symlink(outside.path(), home.path().join(".claude/skills")).unwrap();
+
+        let (_g, exe) = fake_exe_dir();
+        let paths = Paths::new(home.path().to_path_buf());
+        assert!(
+            run_install(&paths, &exe, true).is_err(),
+            "symlinked skills parent must be refused"
+        );
+        assert!(
+            !outside.path().join("debrief").exists(),
+            "created a dir through the symlinked parent"
+        );
+        assert!(!paths.sumcp().exists(), "not rolled back");
     }
 
     #[test]
