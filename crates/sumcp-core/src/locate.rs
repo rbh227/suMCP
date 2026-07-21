@@ -60,6 +60,13 @@ pub fn is_within(root: &Path, candidate: &Path) -> bool {
     }
 }
 
+/// True if `candidate` is inside `main_path`'s parent directory tree — the
+/// guard assembly applies before reading any discovered subagent file.
+pub fn is_within_or_root(main_path: &Path, candidate: &Path) -> bool {
+    let root = main_path.parent().unwrap_or_else(|| Path::new("."));
+    is_within(root, candidate)
+}
+
 /// The 2.1.x subagents directory for a main transcript: `<dir>/<stem>/subagents`,
 /// where `<stem>` is the main file's name without `.jsonl` (the session uuid).
 pub fn subagents_dir(main_path: &Path) -> PathBuf {
