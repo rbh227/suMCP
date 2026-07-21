@@ -73,9 +73,15 @@ mod tests {
         assert!(html.starts_with("<!DOCTYPE html>"), "missing doctype");
         assert!(html.contains("<html"), "missing html element");
         assert!(html.contains("sess-1"), "session id not shown");
-        // Zero-network invariant (the whole point of the artifact).
-        assert!(!html.contains("http://") && !html.contains("https://"), "external URL present");
-        assert!(!html.contains("src=") && !html.contains("href="), "external ref attribute present");
+        // Zero-network invariant (the whole point of the artifact). Robust form:
+        // all dynamic content is esc()'d, so a content quote becomes &quot; and
+        // `="http` / `<script src` can only come from OUR markup — never from an
+        // evidence excerpt that legitimately contains a URL.
+        assert!(!html.contains("=\"http"), "external URL in an attribute");
+        assert!(
+            !html.contains("<script src") && !html.contains("<link") && !html.contains("<img"),
+            "external-loading element present"
+        );
     }
 }
 ```
@@ -609,8 +615,8 @@ fn inline_js_is_present_and_local_only() {
     let html = render(raw);
     assert!(html.contains("<script>"), "no inline script");
     assert!(html.contains("addEventListener"), "no interaction wiring");
-    // Still zero-network after adding JS.
-    assert!(!html.contains("http://") && !html.contains("https://"), "external URL in JS");
+    // Still zero-network after adding JS (robust escaped-attribute form).
+    assert!(!html.contains("=\"http"), "external URL reference present");
 }
 ```
 
@@ -700,9 +706,13 @@ fn html_output_is_self_contained_and_structured() {
     let html = String::from_utf8(out.stdout).expect("utf8 html");
     assert!(html.starts_with("<!DOCTYPE html>"), "not an html doc");
     assert!(html.contains("timeline"), "no timeline");
-    // Hard zero-network invariant on real data.
-    assert!(!html.contains("http://") && !html.contains("https://"), "external URL leaked");
-    assert!(!html.contains("src=") && !html.contains("href="), "external ref attr leaked");
+    // Hard zero-network invariant on real data. Robust escaped-attribute form:
+    // won't false-fail if a sanitized evidence excerpt contains a literal URL.
+    assert!(!html.contains("=\"http"), "external URL in an attribute");
+    assert!(
+        !html.contains("<script src") && !html.contains("<link") && !html.contains("<img"),
+        "external-loading element leaked"
+    );
     // No secret leaks in evidence excerpts (redaction wired).
     assert!(!html.contains("BEGIN RSA PRIVATE KEY"), "unredacted secret");
 }

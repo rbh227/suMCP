@@ -19,13 +19,16 @@ struct Args {
     /// Emit the session_overview JSON payload instead of the text view.
     #[arg(long)]
     json: bool,
+    /// Render the self-contained HTML report to stdout.
+    #[arg(long)]
+    html: bool,
 }
 
 fn main() -> ExitCode {
     let args = Args::parse();
 
     let Some(path) = args.file else {
-        eprintln!("usage: sumcp --file <transcript.jsonl> [--json]");
+        eprintln!("usage: sumcp --file <transcript.jsonl> [--json|--html]");
         return ExitCode::FAILURE;
     };
 
@@ -56,6 +59,14 @@ fn main() -> ExitCode {
             .unwrap_or_default(),
         identified_by: "explicit".into(),
     };
+
+    if args.html {
+        print!(
+            "{}",
+            sumcp_core::html::render_html(&session, &ranked, &Weights::default(), &meta)
+        );
+        return ExitCode::SUCCESS;
+    }
 
     if args.json {
         let payload = session_overview(&session, &ranked, &meta);
