@@ -107,7 +107,7 @@ All read-only; all return compact JSON evidence, never narration.
 | `session_overview` | Totals, token economics, and top-3 struggle files. **Start here.** |
 | `struggle_areas` | Ranked struggle files with a per-category score breakdown, the weights used, and evidence-backed findings. |
 | `file_story` | Chronological event story for one file (head + tail kept, middle elided). |
-| `blind_spots` | Blind-write attempts and large-write-instant-accept outliers, with suppression status for heuristic metrics. |
+| `blind_spots` | Blind-write attempts, review-burden findings, and large-write-instant-accept outliers, with suppression status for heuristic metrics. |
 | `context_health` | Cache hit ratio and token economics (informational). |
 | `evidence` | Dereference a finding's `idxs` into the raw actions that prove them (≤10 actions, excerpts ≤600 chars). |
 
