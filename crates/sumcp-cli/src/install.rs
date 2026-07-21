@@ -1,0 +1,1138 @@
+//! The install / uninstall write path — the ONLY place suMCP writes anything
+//! outside its own read-only analysis. Everything here honors ADR A8:
+//!
+//! - **Dry-run by default.** `install` and `uninstall` just *print* what they
+//!   would do; nothing touches disk unless you pass `--apply`.
+//! - **Atomic writes.** Every file is written to a temp file in the same
+//!   directory and then `rename`d over the target, so a crash mid-write can
+//!   never leave a half-written config.
+//! - **Timestamped backups.** Any pre-existing file we replace wholesale is
+//!   copied to `<file>.sumcp-bak.<unix-seconds>` first.
+//! - **Rollback.** If `--apply` fails partway, every step already done is
+//!   undone (best-effort) before we return the error.
+//! - **Manifest-tracked uninstall.** We record every action in
+//!   `~/.claude/sumcp/manifest.json`; `uninstall` reads it and removes only
+//!   what we created (and restores backups of files we replaced).
+//! - **Safety rails.** We refuse to write through a symlink, and every target
+//!   must resolve to a path under `$HOME`. Files are `0700`, dirs `0700`.
+//!
+//! ## What gets installed (all under `$HOME`)
+//!
+//! | Target                                   | What                                   |
+//! |------------------------------------------|----------------------------------------|
+//! | `~/.claude/sumcp/bin/sumcp{,-mcp}`       | copies of the two binaries             |
+//! | `~/.claude/sumcp/hooks/stop-nudge.sh`    | the Stop-hook nudge script             |
+//! | `~/.claude/sumcp/manifest.json`          | the uninstall ledger                   |
+//! | `~/.claude/skills/debrief/SKILL.md`      | the debrief skill                      |
+//! | `~/.claude.json` → `mcpServers.sumcp`    | registers the MCP server (user scope)  |
+//! | `~/.claude/settings.json` → `hooks.Stop` | registers the Stop hook (user scope)   |
+
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
+use std::fs;
+use std::io::{self, Write};
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Bumped if the manifest layout ever changes so an old `uninstall` can refuse
+/// a manifest it doesn't understand rather than mis-handle it.
+const MANIFEST_VERSION: u32 = 1;
+
+/// The key we register the MCP server under, in both `~/.claude.json` and the
+/// backup/removal logic. One constant so the two can never drift.
+const SERVER_KEY: &str = "sumcp";
+
+/// The debrief skill body, baked into the binary at compile time. Embedding it
+/// (rather than copying from the repo) means `install` works even if the clone
+/// is later deleted — the installed skill is self-contained.
+const SKILL_MD: &str = include_str!("../../../skills/debrief/SKILL.md");
+
+/// The Stop-hook script, also baked in. It shells out to the *installed* sumcp
+/// binary (absolute path substituted at write time) so it has no dependency on
+/// the repo or on `sumcp` being on `PATH`.
+const HOOK_TEMPLATE: &str = r#"#!/bin/sh
+# suMCP Stop-hook nudge (installed by `sumcp install`). Read-only.
+# Claude Code pipes a JSON blob on stdin including "transcript_path". We ask the
+# installed sumcp binary how many edits the session had; if it's a substantial
+# session we print a one-line reminder to run the debrief. Never blocks.
+set -eu
+SUMCP="__SUMCP_BIN__"
+THRESHOLD=3
+input="$(cat)"
+# Pull transcript_path out of the stdin JSON without needing jq.
+transcript="$(printf '%s' "$input" | sed -n 's/.*"transcript_path"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+[ -n "${transcript:-}" ] || exit 0
+[ -x "$SUMCP" ] || exit 0
+edits="$("$SUMCP" --file "$transcript" --json 2>/dev/null | sed -n 's/.*"edits"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p' | head -n1)"
+[ -n "${edits:-}" ] || exit 0
+if [ "$edits" -ge "$THRESHOLD" ]; then
+  printf '{"systemMessage":"suMCP: this session had %s edits — run the debrief skill to see what actually struggled."}\n' "$edits"
+fi
+exit 0
+"#;
+
+// ---------------------------------------------------------------------------
+// Paths: every destination derived from one home root. In tests we point this
+// at a temp dir; in production it comes from `$HOME`.
+// ---------------------------------------------------------------------------
+
+/// All install destinations, derived from a single home directory.
+pub struct Paths {
+    home: PathBuf,
+}
+
+impl Paths {
+    /// Build from `$HOME`. Errors if it's unset or empty (we never guess a home).
+    pub fn from_env() -> io::Result<Self> {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .filter(|p| !p.as_os_str().is_empty())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not set"))?;
+        Ok(Self { home })
+    }
+
+    /// Build from an explicit home (used by tests).
+    #[cfg(test)]
+    pub fn new(home: PathBuf) -> Self {
+        Self { home }
+    }
+
+    fn claude(&self) -> PathBuf {
+        self.home.join(".claude")
+    }
+    fn sumcp(&self) -> PathBuf {
+        self.claude().join("sumcp")
+    }
+    fn bin(&self) -> PathBuf {
+        self.sumcp().join("bin")
+    }
+    fn hooks(&self) -> PathBuf {
+        self.sumcp().join("hooks")
+    }
+    fn manifest(&self) -> PathBuf {
+        self.sumcp().join("manifest.json")
+    }
+    fn hook_script(&self) -> PathBuf {
+        self.hooks().join("stop-nudge.sh")
+    }
+    fn skill_dest(&self) -> PathBuf {
+        self.claude().join("skills").join("debrief")
+    }
+    fn installed_sumcp(&self) -> PathBuf {
+        self.bin().join("sumcp")
+    }
+    fn installed_mcp(&self) -> PathBuf {
+        self.bin().join("sumcp-mcp")
+    }
+    fn claude_json(&self) -> PathBuf {
+        self.home.join(".claude.json")
+    }
+    fn settings_json(&self) -> PathBuf {
+        self.claude().join("settings.json")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Manifest: the ledger `uninstall` replays in reverse.
+// ---------------------------------------------------------------------------
+
+/// One recorded install action. `#[serde(tag = "kind")]` makes each variant
+/// serialize as a JSON object with a `"kind"` field, e.g.
+/// `{"kind":"created","path":"…"}`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum Entry {
+    /// A file or directory that did not exist before — remove it on uninstall.
+    Created { path: PathBuf },
+    /// A file that existed and we replaced wholesale — restore `backup` on
+    /// uninstall.
+    Replaced { path: PathBuf, backup: PathBuf },
+    /// A nested key we spliced into a shared JSON file — delete just that key
+    /// on uninstall. `backup` (if the file pre-existed) is kept on disk as a
+    /// recovery artifact but is NOT blindly restored, since the user may have
+    /// added other servers/hooks after we installed.
+    JsonKey {
+        file: PathBuf,
+        key_path: Vec<String>,
+        backup: Option<PathBuf>,
+    },
+    /// One group we appended to a JSON array (`hooks.Stop`), identified by the
+    /// command it runs. Uninstall removes only the matching group, leaving any
+    /// hooks the user added untouched.
+    StopHook {
+        file: PathBuf,
+        command: String,
+        backup: Option<PathBuf>,
+    },
+}
+
+/// The full uninstall ledger, serialized to `manifest.json`.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct Manifest {
+    version: u32,
+    entries: Vec<Entry>,
+}
+
+// ---------------------------------------------------------------------------
+// Low-level safety-checked filesystem primitives (all honor A8).
+// ---------------------------------------------------------------------------
+
+/// Current wall-clock seconds, used to make backup filenames unique-ish.
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Refuse to touch a path whose final component is a symlink — a classic way to
+/// trick a privileged writer into clobbering a file elsewhere. `symlink_metadata`
+/// does NOT follow the link, so this sees the link itself.
+fn refuse_symlink(path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("refusing to write through a symlink: {}", path.display()),
+        )),
+        _ => Ok(()), // absent, or a real file/dir — both fine
+    }
+}
+
+/// Assert `path` is under `home` once its lexical `..`/`.` segments are removed.
+/// We normalize lexically (not via `canonicalize`) because the target may not
+/// exist yet. This blocks a crafted `home` like `/Users/x/../../etc`.
+fn assert_under_home(path: &Path, home: &Path) -> io::Result<()> {
+    let norm = lexical_normalize(path);
+    let home_norm = lexical_normalize(home);
+    if norm.starts_with(&home_norm) {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("target escapes home: {}", path.display()),
+        ))
+    }
+}
+
+/// Collapse `.` and `..` segments lexically without hitting the filesystem.
+fn lexical_normalize(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        use std::path::Component::*;
+        match comp {
+            ParentDir => {
+                out.pop();
+            }
+            CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Atomically write `bytes` to `dest` with mode `mode`: write to a sibling temp
+/// file, set perms, then `rename` over the target (rename is atomic on the same
+/// filesystem). Callers have already backed up any pre-existing file.
+fn atomic_write(dest: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
+    let parent = dest
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "target has no parent dir"))?;
+    let tmp = parent.join(format!(
+        ".{}.sumcp-tmp-{}",
+        dest.file_name().and_then(|n| n.to_str()).unwrap_or("out"),
+        now_secs()
+    ));
+    {
+        let mut f = fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.set_permissions(fs::Permissions::from_mode(mode))?;
+        f.sync_all()?;
+    }
+    // Rename over the destination. On failure, don't leave the temp behind.
+    if let Err(e) = fs::rename(&tmp, dest) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Copy a pre-existing regular file to a timestamped backup and return its path.
+fn make_backup(path: &Path) -> io::Result<PathBuf> {
+    let backup = path.with_file_name(format!(
+        "{}.sumcp-bak.{}",
+        path.file_name().and_then(|n| n.to_str()).unwrap_or("file"),
+        now_secs()
+    ));
+    fs::copy(path, &backup)?;
+    Ok(backup)
+}
+
+// ---------------------------------------------------------------------------
+// The plan/execute engine. One code path drives both dry-run and apply so the
+// printed plan can never lie about what apply will do.
+// ---------------------------------------------------------------------------
+
+/// Accumulates human-readable plan lines and, when applying, the manifest
+/// entries needed to undo the work.
+struct Journal<'a> {
+    home: &'a Path,
+    apply: bool,
+    lines: Vec<String>,
+    entries: Vec<Entry>,
+}
+
+impl<'a> Journal<'a> {
+    fn new(home: &'a Path, apply: bool) -> Self {
+        Self {
+            home,
+            apply,
+            lines: Vec::new(),
+            entries: Vec::new(),
+        }
+    }
+
+    /// Ensure a directory exists. If we create it (and any missing parents up to
+    /// an existing ancestor), record the highest newly-created dir as `Created`
+    /// so uninstall removes the whole subtree.
+    fn ensure_dir(&mut self, dir: &Path) -> io::Result<()> {
+        assert_under_home(dir, self.home)?;
+        if dir.exists() {
+            return Ok(());
+        }
+        // Find the topmost ancestor that doesn't exist — that's what we "own".
+        let mut topmost_new = dir.to_path_buf();
+        let mut cur = dir;
+        while let Some(parent) = cur.parent() {
+            if parent.exists() {
+                break;
+            }
+            topmost_new = parent.to_path_buf();
+            cur = parent;
+        }
+        self.lines.push(format!("mkdir  {}  (0700)", dir.display()));
+        if self.apply {
+            fs::create_dir_all(dir)?;
+            fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+            self.entries.push(Entry::Created { path: topmost_new });
+        }
+        Ok(())
+    }
+
+    /// Place a wholesale file (binary copy or embedded text). Backs up any
+    /// pre-existing regular file first and records Created/Replaced accordingly.
+    fn place_file(&mut self, dest: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
+        assert_under_home(dest, self.home)?;
+        refuse_symlink(dest)?;
+        let existed = dest.exists();
+        self.lines.push(format!(
+            "{} {}  ({} bytes, {:o})",
+            if existed { "replace" } else { "create " },
+            dest.display(),
+            bytes.len(),
+            mode
+        ));
+        if self.apply {
+            let entry = if existed {
+                let backup = make_backup(dest)?;
+                Entry::Replaced {
+                    path: dest.to_path_buf(),
+                    backup,
+                }
+            } else {
+                Entry::Created {
+                    path: dest.to_path_buf(),
+                }
+            };
+            atomic_write(dest, bytes, mode)?;
+            self.entries.push(entry);
+        }
+        Ok(())
+    }
+
+    /// Splice `value` into a shared JSON file at `key_path` (e.g.
+    /// `["mcpServers","sumcp"]`), preserving everything else. Missing file →
+    /// treated as `{}`. Records a `JsonKey` entry for surgical removal.
+    fn merge_json(&mut self, file: &Path, key_path: &[&str], value: Value) -> io::Result<()> {
+        assert_under_home(file, self.home)?;
+        refuse_symlink(file)?;
+        let existed = file.exists();
+        self.lines.push(format!(
+            "merge  {}  ← {}",
+            file.display(),
+            key_path.join(".")
+        ));
+        if self.apply {
+            let mut root = read_json_object(file)?;
+            insert_nested(&mut root, key_path, value);
+            let pretty = serde_json::to_vec_pretty(&Value::Object(root))
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            let backup = if existed {
+                Some(make_backup(file)?)
+            } else {
+                None
+            };
+            atomic_write(file, &pretty, 0o600)?;
+            self.entries.push(Entry::JsonKey {
+                file: file.to_path_buf(),
+                key_path: key_path.iter().map(|s| s.to_string()).collect(),
+                backup,
+            });
+        }
+        Ok(())
+    }
+
+    /// Append our Stop-hook group to `file`'s `hooks.Stop` array (idempotent:
+    /// skips the append if our command is already present). Records a `StopHook`
+    /// entry so uninstall removes only our group.
+    fn append_stop_hook(&mut self, file: &Path, script: &Path) -> io::Result<()> {
+        assert_under_home(file, self.home)?;
+        refuse_symlink(file)?;
+        let existed = file.exists();
+        let command = script.to_string_lossy().to_string();
+        self.lines.push(format!(
+            "hook   {}  ← hooks.Stop += {command}",
+            file.display()
+        ));
+        if self.apply {
+            let mut root = read_json_object(file)?;
+            if !stop_contains_command(&root, &command) {
+                append_stop_group(&mut root, script);
+            }
+            let pretty = serde_json::to_vec_pretty(&Value::Object(root))
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            let backup = if existed {
+                Some(make_backup(file)?)
+            } else {
+                None
+            };
+            atomic_write(file, &pretty, 0o600)?;
+            self.entries.push(Entry::StopHook {
+                file: file.to_path_buf(),
+                command,
+                backup,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Read a JSON file into an object map. Absent file → empty map. A file whose
+/// top level isn't an object is an error (we won't guess how to merge into it).
+fn read_json_object(file: &Path) -> io::Result<Map<String, Value>> {
+    if !file.exists() {
+        return Ok(Map::new());
+    }
+    let text = fs::read_to_string(file)?;
+    if text.trim().is_empty() {
+        return Ok(Map::new());
+    }
+    match serde_json::from_str::<Value>(&text)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
+    {
+        Value::Object(m) => Ok(m),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} is not a JSON object", file.display()),
+        )),
+    }
+}
+
+/// Insert `value` at a nested key path, creating intermediate objects as needed.
+fn insert_nested(root: &mut Map<String, Value>, key_path: &[&str], value: Value) {
+    if let Some((last, parents)) = key_path.split_last() {
+        let mut cur = root;
+        for p in parents {
+            cur = cur
+                .entry(p.to_string())
+                .or_insert_with(|| Value::Object(Map::new()))
+                .as_object_mut()
+                .expect("intermediate JSON node is an object");
+        }
+        cur.insert(last.to_string(), value);
+    }
+}
+
+/// Remove a nested key path from a JSON object if present, pruning any parent
+/// object we just left empty (so `mcpServers.sumcp` removal doesn't strand an
+/// empty `"mcpServers": {}`). Returns whether it removed anything. Recursive so
+/// the pruning unwinds naturally back up the path.
+fn remove_nested(root: &mut Map<String, Value>, key_path: &[String]) -> bool {
+    match key_path.split_first() {
+        None => false,
+        // Leaf: remove the key here.
+        Some((head, [])) => root.remove(head).is_some(),
+        // Interior: recurse, then prune this level if the child is now empty.
+        Some((head, rest)) => {
+            let removed = match root.get_mut(head).and_then(|v| v.as_object_mut()) {
+                Some(child) => remove_nested(child, rest),
+                None => false,
+            };
+            if removed
+                && let Some(obj) = root.get(head).and_then(|v| v.as_object())
+                && obj.is_empty()
+            {
+                root.remove(head);
+            }
+            removed
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The Stop-hook value we merge into settings.json.
+// ---------------------------------------------------------------------------
+
+/// Build ONE `hooks.Stop` group registering our script. Claude Code's shape for
+/// Stop hooks: an array of groups, each `{ "hooks": [ {type,command} ] }`. Stop
+/// events take no `matcher`. We append this group rather than replace the array,
+/// so a user's existing Stop hooks survive.
+fn stop_hook_group(script: &Path) -> Value {
+    serde_json::json!({
+        "hooks": [
+            { "type": "command", "command": script.to_string_lossy() }
+        ]
+    })
+}
+
+/// Does any group in `hooks.Stop` already reference `command`? (Idempotency +
+/// uninstall targeting both key off this.)
+fn stop_contains_command(root: &Map<String, Value>, command: &str) -> bool {
+    stop_array(root)
+        .map(|arr| arr.iter().any(|g| group_has_command(g, command)))
+        .unwrap_or(false)
+}
+
+/// Borrow the `hooks.Stop` array if it exists and is an array.
+fn stop_array(root: &Map<String, Value>) -> Option<&Vec<Value>> {
+    root.get("hooks")?.get("Stop")?.as_array()
+}
+
+/// Does one Stop group contain a hook whose command equals `command`?
+fn group_has_command(group: &Value, command: &str) -> bool {
+    group
+        .get("hooks")
+        .and_then(|h| h.as_array())
+        .map(|hooks| {
+            hooks
+                .iter()
+                .any(|h| h.get("command").and_then(|c| c.as_str()) == Some(command))
+        })
+        .unwrap_or(false)
+}
+
+/// Append our Stop group to `root.hooks.Stop`, creating the `hooks` object and
+/// `Stop` array as needed. Assumes the caller already checked it isn't present.
+fn append_stop_group(root: &mut Map<String, Value>, script: &Path) {
+    let hooks = root
+        .entry("hooks".to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    if !hooks.is_object() {
+        *hooks = Value::Object(Map::new());
+    }
+    let stop = hooks
+        .as_object_mut()
+        .unwrap()
+        .entry("Stop".to_string())
+        .or_insert_with(|| Value::Array(Vec::new()));
+    if !stop.is_array() {
+        *stop = Value::Array(Vec::new());
+    }
+    stop.as_array_mut().unwrap().push(stop_hook_group(script));
+}
+
+/// Remove any Stop group referencing `command`, pruning an emptied `Stop`/`hooks`.
+/// Returns whether anything was removed.
+fn remove_stop_command(root: &mut Map<String, Value>, command: &str) -> bool {
+    let Some(hooks) = root.get_mut("hooks").and_then(|h| h.as_object_mut()) else {
+        return false;
+    };
+    let Some(stop) = hooks.get_mut("Stop").and_then(|s| s.as_array_mut()) else {
+        return false;
+    };
+    let before = stop.len();
+    stop.retain(|g| !group_has_command(g, command));
+    let removed = stop.len() != before;
+    if stop.is_empty() {
+        hooks.remove("Stop");
+    }
+    if hooks.is_empty() {
+        root.remove("hooks");
+    }
+    removed
+}
+
+/// The `mcpServers.sumcp` value: run the installed MCP binary directly.
+fn server_value(mcp_bin: &Path) -> Value {
+    serde_json::json!({
+        "command": mcp_bin.to_string_lossy(),
+        "args": []
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Install / uninstall orchestration.
+// ---------------------------------------------------------------------------
+
+/// Run the full install plan through a fresh journal. On apply, writes the
+/// manifest last; if any step fails, rolls back everything already done.
+fn run_install(paths: &Paths, exe_dir: &Path, apply: bool) -> io::Result<Vec<String>> {
+    let home = paths.home.clone();
+    let mut j = Journal::new(&home, apply);
+
+    // Reinstall support: if a prior manifest exists, this is a refresh. Cleanly
+    // roll back the previous install FIRST, so the manifest we write below fully
+    // and accurately describes what's on disk. Without this, a second install
+    // wouldn't re-record dirs that already exist, and uninstall would strand
+    // them. (Net effect: `install` twice == `install` once — idempotent.)
+    if paths.manifest().exists() {
+        j.lines.push(format!(
+            "reinstall: first remove previous install recorded in {}",
+            paths.manifest().display()
+        ));
+        if apply
+            && let Ok(text) = fs::read_to_string(paths.manifest())
+            && let Ok(prev) = serde_json::from_str::<Manifest>(&text)
+        {
+            rollback(&prev.entries);
+        }
+    }
+
+    // The closure lets us use `?` for early-exit and still catch the error to
+    // roll back. (Rust has no try/finally; this is the idiomatic stand-in.)
+    let steps = |j: &mut Journal| -> io::Result<()> {
+        // 1. Our own tree.
+        j.ensure_dir(&paths.bin())?;
+        j.ensure_dir(&paths.hooks())?;
+
+        // 2. Copy the two binaries from the running exe's directory.
+        let src_sumcp = exe_dir.join("sumcp");
+        let src_mcp = exe_dir.join("sumcp-mcp");
+        let sumcp_bytes = fs::read(&src_sumcp).map_err(|e| {
+            io::Error::new(e.kind(), format!("reading {}: {e}", src_sumcp.display()))
+        })?;
+        let mcp_bytes = fs::read(&src_mcp)
+            .map_err(|e| io::Error::new(e.kind(), format!("reading {}: {e}", src_mcp.display())))?;
+        j.place_file(&paths.installed_sumcp(), &sumcp_bytes, 0o700)?;
+        j.place_file(&paths.installed_mcp(), &mcp_bytes, 0o700)?;
+
+        // 3. The Stop-hook script, with the installed sumcp path substituted in.
+        let script =
+            HOOK_TEMPLATE.replace("__SUMCP_BIN__", &paths.installed_sumcp().to_string_lossy());
+        j.place_file(&paths.hook_script(), script.as_bytes(), 0o700)?;
+
+        // 4. The debrief skill (embedded).
+        j.ensure_dir(&paths.skill_dest())?;
+        j.place_file(
+            &paths.skill_dest().join("SKILL.md"),
+            SKILL_MD.as_bytes(),
+            0o600,
+        )?;
+
+        // 5. Register the MCP server (user scope) in ~/.claude.json.
+        j.merge_json(
+            &paths.claude_json(),
+            &["mcpServers", SERVER_KEY],
+            server_value(&paths.installed_mcp()),
+        )?;
+
+        // 6. Register the Stop hook (user scope) in ~/.claude/settings.json.
+        //    Appended (not replaced) so existing Stop hooks survive.
+        j.append_stop_hook(&paths.settings_json(), &paths.hook_script())?;
+        Ok(())
+    };
+
+    match steps(&mut j) {
+        Ok(()) => {
+            if apply {
+                // Write the manifest last so it reflects everything above. It
+                // lives inside the sumcp dir we already recorded as Created, so
+                // uninstall removes it along with the tree.
+                let manifest = Manifest {
+                    version: MANIFEST_VERSION,
+                    entries: j.entries.clone(),
+                };
+                let bytes = serde_json::to_vec_pretty(&manifest)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                atomic_write(&paths.manifest(), &bytes, 0o600)?;
+            }
+            Ok(j.lines)
+        }
+        Err(e) => {
+            if apply {
+                // Best-effort rollback of whatever we managed to do.
+                rollback(&j.entries);
+            }
+            Err(e)
+        }
+    }
+}
+
+/// Undo a list of manifest entries (used both by `uninstall` and by rollback on
+/// a failed apply). Best-effort: we keep going past individual errors so one
+/// stuck file can't strand the rest.
+fn rollback(entries: &[Entry]) {
+    // Reverse order: undo last action first (e.g. remove JSON keys before the
+    // dirs, though these are independent here).
+    for entry in entries.iter().rev() {
+        match entry {
+            Entry::Created { path } => {
+                let _ = if path.is_dir() {
+                    fs::remove_dir_all(path)
+                } else {
+                    fs::remove_file(path)
+                };
+            }
+            Entry::Replaced { path, backup } => {
+                // Restore the pre-existing file we overwrote.
+                let _ = fs::rename(backup, path);
+            }
+            Entry::JsonKey {
+                file,
+                key_path,
+                backup,
+            } => {
+                if let Ok(mut root) = read_json_object(file)
+                    && remove_nested(&mut root, key_path)
+                {
+                    // `backup.is_none()` means the file didn't exist before
+                    // install — we created it. If removing our key leaves it
+                    // empty, delete the whole file rather than leave `{}`.
+                    if backup.is_none() && root.is_empty() {
+                        let _ = fs::remove_file(file);
+                    } else if let Ok(bytes) = serde_json::to_vec_pretty(&Value::Object(root)) {
+                        let _ = atomic_write(file, &bytes, 0o600);
+                    }
+                }
+            }
+            Entry::StopHook {
+                file,
+                command,
+                backup,
+            } => {
+                if let Ok(mut root) = read_json_object(file)
+                    && remove_stop_command(&mut root, command)
+                {
+                    if backup.is_none() && root.is_empty() {
+                        let _ = fs::remove_file(file);
+                    } else if let Ok(bytes) = serde_json::to_vec_pretty(&Value::Object(root)) {
+                        let _ = atomic_write(file, &bytes, 0o600);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Uninstall by replaying the manifest. Dry-run prints; apply removes.
+fn run_uninstall(paths: &Paths, apply: bool) -> io::Result<Vec<String>> {
+    let manifest_path = paths.manifest();
+    if !manifest_path.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "no manifest at {} — nothing installed (or installed by hand)",
+                manifest_path.display()
+            ),
+        ));
+    }
+    let text = fs::read_to_string(&manifest_path)?;
+    let manifest: Manifest =
+        serde_json::from_str(&text).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    if manifest.version != MANIFEST_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "manifest version {} unsupported (expected {})",
+                manifest.version, MANIFEST_VERSION
+            ),
+        ));
+    }
+
+    let mut lines = Vec::new();
+    for entry in &manifest.entries {
+        match entry {
+            Entry::Created { path } => lines.push(format!("remove  {}", path.display())),
+            Entry::Replaced { path, backup } => lines.push(format!(
+                "restore {}  ← {}",
+                path.display(),
+                backup.display()
+            )),
+            Entry::JsonKey { file, key_path, .. } => lines.push(format!(
+                "unmerge {}  ✗ {}",
+                file.display(),
+                key_path.join(".")
+            )),
+            Entry::StopHook { file, .. } => {
+                lines.push(format!("unhook  {}  ✗ hooks.Stop", file.display()))
+            }
+        }
+    }
+    if apply {
+        rollback(&manifest.entries);
+        // The manifest itself lives under the sumcp dir, which `rollback`
+        // removed via its Created entry; nothing more to do.
+    }
+    Ok(lines)
+}
+
+// ---------------------------------------------------------------------------
+// Public command entry points, called from main.rs.
+// ---------------------------------------------------------------------------
+
+/// Locate the directory holding the running `sumcp` binary (its siblings are the
+/// binaries we copy). `current_exe` can be spoofed on some platforms, but for a
+/// user installing their own build it's exactly right.
+fn exe_dir() -> io::Result<PathBuf> {
+    let exe = std::env::current_exe()?;
+    exe.parent()
+        .map(|p| p.to_path_buf())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "cannot locate binary directory"))
+}
+
+/// `sumcp install [--apply]`.
+pub fn cmd_install(apply: bool) -> io::Result<()> {
+    let paths = Paths::from_env()?;
+    let dir = exe_dir()?;
+    let lines = run_install(&paths, &dir, apply)?;
+    print_plan("install", apply, &lines);
+    Ok(())
+}
+
+/// `sumcp uninstall [--apply]`.
+pub fn cmd_uninstall(apply: bool) -> io::Result<()> {
+    let paths = Paths::from_env()?;
+    let lines = run_uninstall(&paths, apply)?;
+    print_plan("uninstall", apply, &lines);
+    Ok(())
+}
+
+/// Shared plan printer: header, each line, and a footer telling the user how to
+/// actually apply (or confirming it was applied).
+fn print_plan(verb: &str, apply: bool, lines: &[String]) {
+    if apply {
+        println!("sumcp {verb}: applied {} step(s):", lines.len());
+    } else {
+        println!("sumcp {verb} (dry-run — nothing written). Would do:");
+    }
+    for line in lines {
+        println!("  {line}");
+    }
+    if !apply {
+        println!("\nRe-run with --apply to execute.");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests for the pure logic (JSON merge/remove, path safety, manifest
+// round-trip). End-to-end install/uninstall lives in tests/install.rs.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn insert_and_remove_nested_roundtrip() {
+        let mut root = Map::new();
+        // Pre-existing unrelated content must survive.
+        root.insert("model".into(), Value::String("opus".into()));
+        insert_nested(
+            &mut root,
+            &["mcpServers", "sumcp"],
+            serde_json::json!({"command": "x"}),
+        );
+        assert!(root.contains_key("model"), "unrelated key clobbered");
+        assert_eq!(root["mcpServers"]["sumcp"]["command"], "x");
+
+        let removed = remove_nested(&mut root, &["mcpServers".into(), "sumcp".into()]);
+        assert!(removed);
+        // The now-empty `mcpServers` parent is pruned, but siblings survive.
+        assert!(!root.contains_key("mcpServers"), "empty parent not pruned");
+        assert!(root.contains_key("model"), "unrelated key lost on removal");
+    }
+
+    #[test]
+    fn remove_nested_keeps_sibling_servers() {
+        let mut root = Map::new();
+        insert_nested(
+            &mut root,
+            &["mcpServers", "other"],
+            serde_json::json!({"command": "y"}),
+        );
+        insert_nested(
+            &mut root,
+            &["mcpServers", "sumcp"],
+            serde_json::json!({"command": "x"}),
+        );
+        assert!(remove_nested(
+            &mut root,
+            &["mcpServers".into(), "sumcp".into()]
+        ));
+        // Parent stays because a sibling server remains.
+        assert_eq!(root["mcpServers"]["other"]["command"], "y");
+        assert!(
+            root["mcpServers"]
+                .as_object()
+                .unwrap()
+                .get("sumcp")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn remove_nested_absent_is_false() {
+        let mut root = Map::new();
+        assert!(!remove_nested(&mut root, &["a".into(), "b".into()]));
+    }
+
+    #[test]
+    fn assert_under_home_blocks_escape() {
+        let home = Path::new("/Users/x");
+        assert!(assert_under_home(Path::new("/Users/x/.claude/sumcp"), home).is_ok());
+        assert!(assert_under_home(Path::new("/Users/x/../y/evil"), home).is_err());
+        assert!(assert_under_home(Path::new("/etc/passwd"), home).is_err());
+    }
+
+    #[test]
+    fn manifest_serde_roundtrip() {
+        let m = Manifest {
+            version: MANIFEST_VERSION,
+            entries: vec![
+                Entry::Created {
+                    path: "/a/b".into(),
+                },
+                Entry::Replaced {
+                    path: "/c".into(),
+                    backup: "/c.bak".into(),
+                },
+                Entry::JsonKey {
+                    file: "/d.json".into(),
+                    key_path: vec!["hooks".into(), "Stop".into()],
+                    backup: None,
+                },
+            ],
+        };
+        let s = serde_json::to_string(&m).unwrap();
+        let back: Manifest = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.entries, m.entries);
+    }
+
+    #[test]
+    fn read_json_object_absent_is_empty() {
+        let missing = Path::new("/definitely/not/here/x.json");
+        assert!(read_json_object(missing).unwrap().is_empty());
+    }
+
+    // --- A8 end-to-end scenarios against a temp $HOME + fake exe dir ---------
+
+    use tempfile::{TempDir, tempdir};
+
+    /// A directory with dummy `sumcp` / `sumcp-mcp` "binaries" to copy. Returns
+    /// the guard (keep it alive to keep the dir) plus its path.
+    fn fake_exe_dir() -> (TempDir, PathBuf) {
+        let d = tempdir().unwrap();
+        fs::write(d.path().join("sumcp"), b"#!fake sumcp\n").unwrap();
+        fs::write(d.path().join("sumcp-mcp"), b"#!fake mcp\n").unwrap();
+        let p = d.path().to_path_buf();
+        (d, p)
+    }
+
+    /// A temp home with `~/.claude` already present (mirrors a real machine,
+    /// where install must NOT own/remove `~/.claude` itself).
+    fn temp_home() -> TempDir {
+        let h = tempdir().unwrap();
+        fs::create_dir_all(h.path().join(".claude")).unwrap();
+        h
+    }
+
+    fn read_json(p: &Path) -> Value {
+        serde_json::from_str(&fs::read_to_string(p).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn fresh_install_writes_all_targets() {
+        let home = temp_home();
+        let (_g, exe) = fake_exe_dir();
+        let paths = Paths::new(home.path().to_path_buf());
+        run_install(&paths, &exe, true).unwrap();
+
+        assert!(paths.installed_sumcp().exists());
+        assert!(paths.installed_mcp().exists());
+        assert!(paths.hook_script().exists());
+        assert!(paths.skill_dest().join("SKILL.md").exists());
+        assert!(paths.manifest().exists());
+
+        let cj = read_json(&paths.claude_json());
+        assert_eq!(
+            cj["mcpServers"]["sumcp"]["command"].as_str(),
+            Some(paths.installed_mcp().to_string_lossy().as_ref())
+        );
+        let sj = read_json(&paths.settings_json());
+        assert_eq!(sj["hooks"]["Stop"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn install_preserves_preexisting_config() {
+        let home = temp_home();
+        let settings = home.path().join(".claude/settings.json");
+        fs::write(
+            &settings,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "model": "opus",
+                "hooks": { "Stop": [ { "hooks": [ { "type":"command", "command":"/usr/bin/true" } ] } ] }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let cjp = home.path().join(".claude.json");
+        fs::write(
+            &cjp,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "mcpServers": { "other": { "command": "otherbin", "args": [] } }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let (_g, exe) = fake_exe_dir();
+        let paths = Paths::new(home.path().to_path_buf());
+        run_install(&paths, &exe, true).unwrap();
+
+        let sj = read_json(&settings);
+        assert_eq!(sj["model"], "opus", "unrelated setting clobbered");
+        assert_eq!(
+            sj["hooks"]["Stop"].as_array().unwrap().len(),
+            2,
+            "our hook should append, not replace the user's"
+        );
+        let cj = read_json(&cjp);
+        assert!(cj["mcpServers"]["other"].is_object(), "user server lost");
+        assert!(cj["mcpServers"]["sumcp"].is_object(), "our server missing");
+
+        // Backups of both pre-existing files exist.
+        let has_backup = |dir: &Path| {
+            fs::read_dir(dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .any(|e| e.file_name().to_string_lossy().contains(".sumcp-bak."))
+        };
+        assert!(
+            has_backup(&home.path().join(".claude")),
+            "no settings backup"
+        );
+        assert!(has_backup(home.path()), "no .claude.json backup");
+    }
+
+    #[test]
+    fn reinstall_idempotent_then_uninstall_preserves_user_edits() {
+        let home = temp_home();
+        let (_g, exe) = fake_exe_dir();
+        let paths = Paths::new(home.path().to_path_buf());
+        run_install(&paths, &exe, true).unwrap();
+        run_install(&paths, &exe, true).unwrap(); // second time: no-op-ish, still Ok
+
+        let sj = read_json(&paths.settings_json());
+        let ours = paths.hook_script().to_string_lossy().to_string();
+        let dupes = sj["hooks"]["Stop"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|g| group_has_command(g, &ours))
+            .count();
+        assert_eq!(dupes, 1, "reinstall duplicated the Stop hook");
+
+        // User adds their own MCP server AFTER install.
+        let cjp = paths.claude_json();
+        let mut cj = read_json(&cjp);
+        cj["mcpServers"]["userthing"] = serde_json::json!({ "command": "z", "args": [] });
+        fs::write(&cjp, serde_json::to_vec_pretty(&cj).unwrap()).unwrap();
+
+        run_uninstall(&paths, true).unwrap();
+
+        assert!(!paths.sumcp().exists(), "uninstall left the sumcp tree");
+        assert!(!paths.skill_dest().exists(), "uninstall left the skill");
+        let cj2 = read_json(&cjp);
+        assert!(
+            cj2["mcpServers"]["userthing"].is_object(),
+            "user server lost"
+        );
+        assert!(
+            cj2["mcpServers"].get("sumcp").is_none(),
+            "our server not removed"
+        );
+    }
+
+    #[test]
+    fn preexisting_skill_is_backed_up_and_restored() {
+        let home = temp_home();
+        // A user (or older suMCP) already has a debrief skill with custom text.
+        let skill = home.path().join(".claude/skills/debrief");
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(skill.join("SKILL.md"), b"MY CUSTOM SKILL").unwrap();
+
+        let (_g, exe) = fake_exe_dir();
+        let paths = Paths::new(home.path().to_path_buf());
+        run_install(&paths, &exe, true).unwrap();
+
+        // Install replaced it with the embedded skill (and made a backup).
+        let installed = fs::read_to_string(skill.join("SKILL.md")).unwrap();
+        assert_ne!(installed, "MY CUSTOM SKILL", "skill not replaced");
+        assert!(
+            fs::read_dir(&skill).unwrap().filter_map(|e| e.ok()).any(|e| {
+                e.file_name().to_string_lossy().contains(".sumcp-bak.")
+            }),
+            "no backup of the pre-existing skill"
+        );
+
+        // Uninstall restores the user's original content.
+        run_uninstall(&paths, true).unwrap();
+        assert_eq!(
+            fs::read_to_string(skill.join("SKILL.md")).unwrap(),
+            "MY CUSTOM SKILL",
+            "uninstall did not restore the backed-up skill"
+        );
+    }
+
+    #[test]
+    fn partial_failure_rolls_back() {
+        let home = temp_home();
+        let cjp = home.path().join(".claude.json");
+        fs::write(
+            &cjp,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "mcpServers": { "other": { "command": "o", "args": [] } }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        // Make settings.json a symlink so step 6 refuses and the install fails.
+        let decoy = home.path().join("decoy");
+        fs::write(&decoy, b"x").unwrap();
+        std::os::unix::fs::symlink(&decoy, home.path().join(".claude/settings.json")).unwrap();
+
+        let (_g, exe) = fake_exe_dir();
+        let paths = Paths::new(home.path().to_path_buf());
+        assert!(
+            run_install(&paths, &exe, true).is_err(),
+            "symlinked settings.json should abort install"
+        );
+
+        // Everything we started is rolled back; the user's config is intact.
+        assert!(!paths.sumcp().exists(), "rollback left the sumcp tree");
+        assert!(!paths.skill_dest().exists(), "rollback left the skill");
+        let cj = read_json(&cjp);
+        assert!(
+            cj["mcpServers"]["other"].is_object(),
+            "rollback lost user server"
+        );
+        assert!(
+            cj["mcpServers"].get("sumcp").is_none(),
+            "rollback left our server key"
+        );
+        assert_eq!(
+            fs::read_to_string(&decoy).unwrap(),
+            "x",
+            "symlink target written"
+        );
+    }
+}
