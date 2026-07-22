@@ -100,7 +100,9 @@ pub fn all_findings(s: &Session) -> Vec<Finding> {
 
 /// Map a finding to its ranking `(category, magnitude)`, or `None` if it is
 /// informational (opening move, reverts, comprehension) and doesn't rank.
-fn ranked_category(f: &Finding) -> Option<(&'static str, u64)> {
+/// `pub(crate)`: `review.rs`'s `severity_order_covers_every_ranked_category`
+/// test cross-checks it against `SEVERITY_ORDER` so the two lists can't drift.
+pub(crate) fn ranked_category(f: &Finding) -> Option<(&'static str, u64)> {
     match f.kind {
         FindingKind::Churn => Some(("churn", f.idxs.len() as u64)),
         FindingKind::Rework => Some(("rework", 1)),

@@ -44,7 +44,10 @@ fn has_flip_or_correction(all: &[Finding], file: &str) -> bool {
 
 /// The evidence floor (grill decision, 2026-07-22): a file needs review when
 /// it has 2+ findings, or a single high-signal one (failure loop, blind-write
-/// attempt, flip, user-correction). Cap 3. Order follows `ranked`.
+/// attempt, flip, user-correction). Cap 3. Order follows `ranked`. Known,
+/// accepted edge: a file whose ONLY findings are non-ranking kinds (flip,
+/// user-correction) never enters `ranked` in the first place, so it cannot
+/// qualify no matter what `has_flip_or_correction` would say about it.
 pub fn needs_review<'a>(ranked: &'a [FileScore], all: &[Finding]) -> Vec<&'a FileScore> {
     ranked
         .iter()
@@ -197,6 +200,38 @@ mod tests {
             reason_sentence(&f, &all),
             "rewritten 2x, flipped after pushback, user-corrected"
         );
+    }
+
+    #[test]
+    fn severity_order_covers_every_ranked_category() {
+        // Cheap hardening: if `score::ranked_category` ever grows a new
+        // ranking category, this fails loudly instead of the category
+        // silently vanishing from `reason_sentence` (it just isn't in
+        // SEVERITY_ORDER's filter_map). Magnitude is irrelevant to
+        // `ranked_category`, so 1 is fine everywhere.
+        let all_kinds = [
+            FindingKind::Churn,
+            FindingKind::Rework,
+            FindingKind::ReRead,
+            FindingKind::BlindWriteAttempt,
+            FindingKind::FailureLoop,
+            FindingKind::TrueRevert,
+            FindingKind::Flip,
+            FindingKind::UserCorrected,
+            FindingKind::OpeningMove,
+            FindingKind::LargeWriteInstantAccept,
+            FindingKind::ActionLoop,
+            FindingKind::ReviewBurden,
+        ];
+        for kind in all_kinds {
+            let f = finding(kind, "/a.rs");
+            if let Some((category, _magnitude)) = crate::score::ranked_category(&f) {
+                assert!(
+                    SEVERITY_ORDER.contains(&category),
+                    "ranked_category emits {category:?} but SEVERITY_ORDER doesn't list it"
+                );
+            }
+        }
     }
 
     #[test]

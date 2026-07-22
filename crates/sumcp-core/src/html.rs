@@ -64,7 +64,7 @@ pub fn render_html(
     );
     h.push_str(&header_band(s, meta));
     h.push_str(&facts_strip(&o, s));
-    h.push_str(&needs_review_section(&review, &all, s)); // Task 5
+    h.push_str(&needs_review_section(&review, &all, ranked, s)); // Task 5
     h.push_str(&timeline_section(s, ranked)); // Task 6
     h.push_str(&struggles_section(ranked, weights, &review)); // Task 7
     h.push_str(&file_stories_section(s, &review, &all, meta)); // Task 8
@@ -201,7 +201,8 @@ fn header_band(s: &Session, meta: &SessionMeta) -> String {
     if let Some(d) = crate::report::active_span(s, crate::report::ACTIVE_GAP_CAP_SECS) {
         parts.push(format!(
             "<span class=\"num\" title=\"active time sums the gaps between \
-             actions, each capped at 5 minutes\">active {} (span {})</span>",
+             actions, each capped at {} minutes\">active {} (span {})</span>",
+            crate::report::ACTIVE_GAP_CAP_SECS / 60,
             fmt_duration(d.active_secs),
             fmt_duration(d.span_secs),
         ));
@@ -244,7 +245,10 @@ fn facts_strip(o: &crate::report::Overview, s: &Session) -> String {
         format!("<span><b>{}</b> bash</span>", fmt_thousands(o.bash as u64)),
     ];
     if !s.spawns.is_empty() {
-        facts.push(format!("<span><b>{}</b> subagents</span>", s.spawns.len()));
+        facts.push(format!(
+            "<span><b>{}</b> subagents</span>",
+            fmt_thousands(s.spawns.len() as u64)
+        ));
     }
     format!("<div class=\"facts\">{}</div>", facts.join(""))
 }
@@ -278,6 +282,7 @@ fn status_bar(s: &Session, o: &crate::report::Overview) -> String {
 fn needs_review_section(
     review: &[&FileScore],
     all: &[crate::model::Finding],
+    ranked: &[FileScore],
     s: &Session,
 ) -> String {
     use crate::model::FindingKind;
@@ -292,6 +297,9 @@ fn needs_review_section(
         });
         let msg = if has_blind {
             "No files met the review bar. Blind spots below still apply."
+        } else if !ranked.is_empty() {
+            "No files met the review bar. Minor signals appear in struggle \
+             areas below."
         } else {
             "No struggle signals. No blind spots."
         };
@@ -412,7 +420,8 @@ fn timeline_section(s: &Session, ranked: &[FileScore]) -> String {
             let _ = write!(
                 gaps,
                 "<div class=\"gapmark\" style=\"left:{mid:.2}%\" \
-                 title=\"gap over 5 minutes\"></div>"
+                 title=\"gap over {} minutes\"></div>",
+                crate::report::ACTIVE_GAP_CAP_SECS / 60,
             );
         }
     }
@@ -427,8 +436,8 @@ fn timeline_section(s: &Session, ranked: &[FileScore]) -> String {
             .iter()
             .position(|a| a.line_no >= ut.line_no)
             .unwrap_or(n - 1);
-        let excerpt: String = ut.text.chars().take(80).collect();
-        let excerpt = crate::redact::redact(&excerpt);
+        let redacted = crate::redact::redact(&ut.text);
+        let excerpt: String = redacted.chars().take(80).collect();
         let _ = write!(
             rules,
             "<div class=\"urule\" style=\"left:{:.2}%\" title=\"{}\"></div>",
@@ -447,13 +456,16 @@ fn timeline_section(s: &Session, ranked: &[FileScore]) -> String {
              <div class=\"track\">{content}</div></div>"
         )
     };
-    let legend = "<div class=\"legend\">\
+    let legend = format!(
+        "<div class=\"legend\">\
         <span><i class=\"sw sw-tick\"></i>action</span>\
         <span><i class=\"sw sw-err\"></i>error</span>\
         <span><i class=\"sw sw-band\"></i>finding span (click for evidence)</span>\
         <span><i class=\"sw sw-turn\"></i>your turn (hover for prompt)</span>\
-        <span><i class=\"sw sw-gap\"></i>gap &gt; 5 min</span>\
-        <span>x = action sequence, not time</span></div>";
+        <span><i class=\"sw sw-gap\"></i>gap &gt; {} min</span>\
+        <span>x = action sequence, not time</span></div>",
+        crate::report::ACTIVE_GAP_CAP_SECS / 60,
+    );
     let caption = if other > 0 {
         format!("<p class=\"foot\">{other} actions in other tools not laned.</p>")
     } else {
@@ -630,13 +642,14 @@ fn story_rows_html(s: &Session, rows: &[StoryRow]) -> String {
                         .get(*idx as usize)
                         .and_then(|a| a.error.as_deref())
                         .unwrap_or("");
-                    let excerpt: String = err.chars().take(120).collect();
+                    let redacted = crate::redact::redact(err);
+                    let excerpt: String = redacted.chars().take(120).collect();
                     let _ = write!(
                         out,
                         "<li class=\"fail\">#{idx} · {} · fail \
                          <span class=\"exc\">{}</span></li>",
                         esc(action),
-                        esc(&crate::redact::redact(&excerpt)),
+                        esc(&excerpt),
                     );
                 } else {
                     let _ = write!(out, "<li>#{idx} · {} · {}</li>", esc(action), esc(outcome));
@@ -688,12 +701,13 @@ fn file_stories_section(
                 .and_then(|i| s.actions.get(i.0 as usize))
                 .and_then(|a| a.command.as_deref())
             {
-                let capped: String = cmd.chars().take(120).collect();
+                let redacted = crate::redact::redact(cmd);
+                let capped: String = redacted.chars().take(120).collect();
                 let _ = write!(
                     body,
                     "<p class=\"foot\">repeated failing command: \
                      <span class=\"exc\">{}</span></p>",
-                    esc(&crate::redact::redact(&capped))
+                    esc(&capped)
                 );
             }
         }
@@ -744,9 +758,24 @@ fn blind_spots_section(s: &Session, meta: &SessionMeta) -> String {
             } else {
                 ""
             };
+            // The spec requires every listed finding to carry evidence.
+            // idxs travel in the finding's payload JSON; empty ⇒ no proving
+            // actions to show, so the collapsible is skipped.
+            let idxs: Vec<crate::model::Idx> = f["idxs"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|v| v.as_u64())
+                .map(|n| crate::model::Idx(n as u32))
+                .collect();
+            let ev = if idxs.is_empty() {
+                String::new()
+            } else {
+                evidence_details(s, &idxs, meta)
+            };
             let _ = write!(
                 rows,
-                "<li><b>{label}</b>{}{}{tag}</li>",
+                "<li><b>{label}</b>{}{}{tag}{ev}</li>",
                 if file.is_empty() {
                     String::new()
                 } else {
@@ -1010,6 +1039,35 @@ mod tests {
     }
 
     #[test]
+    fn tooltip_secret_straddling_cap_is_redacted() {
+        // 65 filler chars + " key sk-abcdefghijklmnopqrstuv" (a 25-char
+        // prefixed token). Redacting AFTER truncating at 80 chars would slice
+        // the token down to "sk-abcdefg" (10 chars, below the 16-char
+        // MIN_TOKEN_LEN), so it survives un-redacted — the straddling-cap
+        // leak this test guards against. Redacting BEFORE truncating
+        // replaces the whole token first, so the 80-char cap never sees a
+        // secret.
+        let filler = "x".repeat(65);
+        let raw = format!(
+            concat!(
+                r#"{{"type":"user","timestamp":"2026-01-01T00:00:00Z","message":{{"content":[{{"type":"text","text":"{filler} key sk-abcdefghijklmnopqrstuv"}}]}}}}"#,
+                "\n",
+                r#"{{"type":"assistant","timestamp":"2026-01-01T00:00:01Z","message":{{"content":[{{"type":"tool_use","id":"1","name":"Read","input":{{"file_path":"/a.ts"}}}}]}}}}"#,
+            ),
+            filler = filler,
+        );
+        let html = render(&raw);
+        assert!(
+            !html.contains("sk-abcdef"),
+            "partial secret leaked past the truncation cap"
+        );
+        assert!(
+            !html.contains("sk-abcdefghijklmnopqrstuv"),
+            "full secret leaked"
+        );
+    }
+
+    #[test]
     fn renders_blindspots_filestories_health_and_evidence() {
         let mut lines = Vec::new();
         for i in 0..3 {
@@ -1163,6 +1221,30 @@ mod tests {
     }
 
     #[test]
+    fn below_bar_session_does_not_claim_no_signals() {
+        // 6 edits to one file, each with a DIFFERENT new_string ⇒ churn fires
+        // (1 finding, ranked) but nothing meets the needs-review evidence
+        // floor (identical strings would also fire ActionLoop and push the
+        // file over the floor — deliberately avoided here).
+        let mut lines = Vec::new();
+        for i in 0..6 {
+            lines.push(format!(
+                r#"{{"type":"assistant","timestamp":"2026-01-01T00:00:0{i}Z","message":{{"content":[{{"type":"tool_use","id":"e{i}","name":"Edit","input":{{"file_path":"/a.ts","new_string":"x{i}"}}}}]}}}}"#
+            ));
+        }
+        let html = render(&lines.join("\n"));
+        assert!(
+            html.contains("No files met the review bar"),
+            "should not claim there are no signals when struggle areas has rows: {}",
+            &html[..html.len().min(3000)]
+        );
+        assert!(
+            !html.contains("No struggle signals"),
+            "truthfulness regression: claimed no signals while ranked is non-empty"
+        );
+    }
+
+    #[test]
     fn calm_state_when_nothing_qualifies() {
         // One read, no findings at all.
         let raw = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"tool_use","id":"1","name":"Read","input":{"file_path":"/a.ts"}}]}}"#;
@@ -1203,6 +1285,30 @@ mod tests {
         assert!(
             html.contains("rewritten 6x"),
             "story box opens with its why"
+        );
+    }
+
+    #[test]
+    fn blind_spot_findings_carry_evidence_collapsible() {
+        // A blind-write attempt: an Edit rejected by the harness because the
+        // file had not been read yet. Spec-mandated: every listed blind-spot
+        // finding carries its own evidence collapsible.
+        let raw = concat!(
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"tool_use","id":"e1","name":"Edit","input":{"file_path":"/a.ts","new_string":"x"}}]}}"#,
+            "\n",
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:01Z","message":{"content":[{"type":"tool_result","tool_use_id":"e1","is_error":true,"content":"File has not been read yet"}]}}"#,
+        );
+        let html = render(raw);
+        let start = html.find("Blind spots").expect("blind spots section");
+        let section = &html[start..];
+        let end = section
+            .find("</section>")
+            .map(|i| i + "</section>".len())
+            .unwrap_or(section.len());
+        let section = &section[..end];
+        assert!(
+            section.contains("<details class=\"ev\""),
+            "no evidence collapsible inside the blind spots section: {section}"
         );
     }
 

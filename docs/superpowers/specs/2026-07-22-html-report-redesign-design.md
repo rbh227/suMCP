@@ -39,8 +39,13 @@ deterministic byte-identical output. Every dynamic string through `esc()`.
    user-correction, blind-write attempt). Cap 3. Each row: path, strictly
    descriptive reason from a fixed vocabulary with counts attached
    ("rewritten 8x, re-read 4x, 1 failure loop"), jump link to its story box.
-   Calm state when nothing qualifies: one muted line ("No struggle signals.
-   No blind spots."), no empty boxes.
+   The calm state is three-way, so the wording never claims more than the
+   data shows: nothing ranked and no blind spots either ("No struggle
+   signals. No blind spots."); nothing met the review bar but blind-spot
+   findings exist ("No files met the review bar. Blind spots below still
+   apply."); nothing met the review bar but the struggle-areas table is not
+   empty ("No files met the review bar. Minor signals appear in struggle
+   areas below."). No empty boxes in any case.
 3. **Timeline**: Read/Edit/Bash lanes plus finding bands anchored in a labeled
    `findings` strip. X-axis is **ordinal (action sequence), declared in the
    legend**; a small break glyph marks any inter-action gap over 5 minutes.
@@ -89,8 +94,8 @@ deterministic byte-identical output. Every dynamic string through `esc()`.
 - `active_duration(actions, cap) -> (active, span)`
 - Needs-review qualification (evidence floor) + reason-sentence builder with
   the fixed category vocabulary (churn=rewritten, re_read=re-read,
-  rework=reworked, failure_loop=failure loop, fumble=tool fumble, flip=flip,
-  user_corrected=user-corrected, blind_write=blind-write attempt)
+  rework=reworked, failure_loop=failure loop, fumbles=blind-write attempt,
+  flip=flip, user_corrected=user-corrected)
 - Run compression for story events
 - Gap-glyph positions for the timeline
 - Number formatting (thousands separators)
