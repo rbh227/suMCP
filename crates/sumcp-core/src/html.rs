@@ -273,15 +273,6 @@ fn status_bar(s: &Session, o: &crate::report::Overview) -> String {
     )
 }
 
-/// A Win9x sunken group box with a title tab.
-fn group_box(title: &str, body: &str) -> String {
-    format!(
-        "<fieldset class=\"gb\"><legend>{}</legend>{}</fieldset>",
-        esc(title),
-        body
-    )
-}
-
 /// The lead section: which files need eyes, and why — or an explicit calm
 /// state. Reasons are strictly descriptive (grill decision 2026-07-22).
 fn needs_review_section(
@@ -547,99 +538,246 @@ fn struggles_section(ranked: &[FileScore], weights: &Weights, review: &[&FileSco
     )
 }
 
-/// Blind spots: counts of blind-write attempts, review-burden findings, and
-/// approval outliers, plus whether the approval-latency signal is active or
-/// suppressed (auto-accept mode). Reads `payloads::blind_spots` — never
-/// recomputes — so the HTML can't drift from the MCP contract.
-fn blind_spots_section(s: &Session, meta: &SessionMeta) -> String {
-    let p = crate::payloads::blind_spots(s, meta);
-    let count = |key: &str| p[key].as_array().map(|a| a.len()).unwrap_or(0);
-    let latency = p["suppression"]["approval_latency"].as_str().unwrap_or("");
-    let body = format!(
-        "<table class=\"kv\">\
-         <tr><th>blind-write attempts</th><td>{}</td></tr>\
-         <tr><th>review-burden findings</th><td>{}</td></tr>\
-         <tr><th>approval outliers</th><td>{}</td></tr>\
-         <tr><th>approval latency</th><td>{}</td></tr>\
-         </table>",
-        count("blind_write_attempts"),
-        count("review_burden"),
-        count("approval_outliers"),
-        esc(latency),
-    );
-    group_box("Blind spots", &body)
+/// One rendered story row: either a single event or a compressed run of 3+
+/// consecutive same-kind, non-failing events.
+enum StoryRow {
+    One {
+        idx: u64,
+        action: String,
+        outcome: String,
+    },
+    Run {
+        action: String,
+        first: u64,
+        last: u64,
+        n: usize,
+    },
 }
 
-/// One file's chronological story: head events, an "elided" gap marker if the
-/// middle was dropped, then tail events — mirrors `payloads::file_story`
-/// exactly (middle-out elision, same field names).
-fn file_story_section(s: &Session, path: &str, meta: &SessionMeta) -> String {
-    let p = crate::payloads::file_story(s, path, meta);
-    let render_events = |events: &[serde_json::Value]| -> String {
-        let mut items = String::new();
-        for v in events {
-            let _ = write!(
-                items,
-                "<li>#{} · {} · {}</li>",
-                v["idx"].as_u64().unwrap_or(0),
-                esc(v["action"].as_str().unwrap_or("")),
-                esc(v["outcome"].as_str().unwrap_or("n/a")),
-            );
-        }
-        items
+/// Collapse consecutive same-action, same-outcome events (never failures)
+/// into runs of 3 or more. Pure; unit-testable via the rendered HTML.
+fn compress_runs(events: &[serde_json::Value]) -> Vec<StoryRow> {
+    let get = |v: &serde_json::Value| {
+        (
+            v["idx"].as_u64().unwrap_or(0),
+            v["action"].as_str().unwrap_or("").to_string(),
+            v["outcome"].as_str().unwrap_or("n/a").to_string(),
+        )
     };
-    let mut body = String::from("<ol class=\"story\">");
-    body.push_str(&render_events(
-        p["events"].as_array().map(|v| v.as_slice()).unwrap_or(&[]),
-    ));
-    if let Some(elided) = p.get("elided").filter(|v| !v.is_null()) {
-        let _ = write!(
-            body,
-            "<li class=\"cap\">… {} events elided — {} …</li>",
-            elided["count"].as_u64().unwrap_or(0),
-            esc(elided["note"].as_str().unwrap_or("")),
-        );
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < events.len() {
+        let (idx, action, outcome) = get(&events[i]);
+        let mut j = i + 1;
+        while j < events.len() && outcome != "fail" {
+            let (_, a2, o2) = get(&events[j]);
+            if a2 != action || o2 != outcome {
+                break;
+            }
+            j += 1;
+        }
+        if j - i >= 3 {
+            let (last, _, _) = get(&events[j - 1]);
+            out.push(StoryRow::Run {
+                action,
+                first: idx,
+                last,
+                n: j - i,
+            });
+        } else {
+            for v in &events[i..j] {
+                let (idx, action, outcome) = get(v);
+                out.push(StoryRow::One {
+                    idx,
+                    action,
+                    outcome,
+                });
+            }
+        }
+        i = j.max(i + 1);
     }
-    body.push_str(&render_events(
-        p["tail"].as_array().map(|v| v.as_slice()).unwrap_or(&[]),
-    ));
-    body.push_str("</ol>");
-    group_box(&format!("File story: {}", path), &body)
+    out
 }
 
-/// The needs-review files, each with its story and the evidence behind its
-/// findings nested inside. Bridged for Task 4: iterates `review` (the
-/// evidence-floor selection) instead of the old `ranked.iter().take(3)`;
-/// `all` is threaded through for Task 8's rewrite and unused here.
+/// Render story rows; failing events show their redacted error excerpt.
+fn story_rows_html(s: &Session, rows: &[StoryRow]) -> String {
+    let mut out = String::new();
+    for row in rows {
+        match row {
+            StoryRow::Run {
+                action,
+                first,
+                last,
+                n,
+            } => {
+                let _ = write!(
+                    out,
+                    "<li class=\"run\">{}s #{}–#{} x{}</li>",
+                    esc(action),
+                    first,
+                    last,
+                    n
+                );
+            }
+            StoryRow::One {
+                idx,
+                action,
+                outcome,
+            } => {
+                if outcome == "fail" {
+                    let err = s
+                        .actions
+                        .get(*idx as usize)
+                        .and_then(|a| a.error.as_deref())
+                        .unwrap_or("");
+                    let excerpt: String = err.chars().take(120).collect();
+                    let _ = write!(
+                        out,
+                        "<li class=\"fail\">#{idx} · {} · fail \
+                         <span class=\"exc\">{}</span></li>",
+                        esc(action),
+                        esc(&crate::redact::redact(&excerpt)),
+                    );
+                } else {
+                    let _ = write!(out, "<li>#{idx} · {} · {}</li>", esc(action), esc(outcome));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The needs-review files, each opening with its plain-language "why", a
+/// run-compressed chronological story, any repeated failing command behind a
+/// failure loop, and the evidence for its findings nested inside. Iterates
+/// `review` (the evidence-floor selection); boxes carry `id="story-N"`
+/// (1-based) so the needs-review rows and struggle-table links can jump here.
 fn file_stories_section(
     s: &Session,
     review: &[&FileScore],
     all: &[crate::model::Finding],
     meta: &SessionMeta,
 ) -> String {
-    let _ = all;
-    if review.is_empty() {
-        return group_box("File stories", "<p>No files ranked.</p>");
-    }
+    use crate::model::FindingKind;
     let mut out = String::new();
-    for fs in review {
-        let mut section = file_story_section(s, &fs.file, meta);
-        // Nest the evidence for this file's findings inside its story box —
-        // dropped just before the closing </fieldset>.
+    for (i, fs) in review.iter().enumerate() {
+        let p = crate::payloads::file_story(s, &fs.file, meta);
+        let empty = Vec::new();
+        let head = p["events"].as_array().unwrap_or(&empty);
+        let tail = p["tail"].as_array().unwrap_or(&empty);
+        let mut body = String::from("<ol class=\"story\">");
+        body.push_str(&story_rows_html(s, &compress_runs(head)));
+        if let Some(elided) = p.get("elided").filter(|v| !v.is_null()) {
+            let _ = write!(
+                body,
+                "<li class=\"run\">… {} events elided …</li>",
+                elided["count"].as_u64().unwrap_or(0)
+            );
+        }
+        body.push_str(&story_rows_html(s, &compress_runs(tail)));
+        body.push_str("</ol>");
+        // The repeated failing command behind any failure loop, verbatim.
+        for f in fs
+            .findings
+            .iter()
+            .filter(|f| f.kind == FindingKind::FailureLoop)
+        {
+            if let Some(cmd) = f
+                .idxs
+                .first()
+                .and_then(|i| s.actions.get(i.0 as usize))
+                .and_then(|a| a.command.as_deref())
+            {
+                let capped: String = cmd.chars().take(120).collect();
+                let _ = write!(
+                    body,
+                    "<p class=\"foot\">repeated failing command: \
+                     <span class=\"exc\">{}</span></p>",
+                    esc(&crate::redact::redact(&capped))
+                );
+            }
+        }
         let idxs: Vec<crate::model::Idx> = fs
             .findings
             .iter()
             .flat_map(|f| f.idxs.iter().copied())
             .collect();
-        let ev = evidence_details(s, &idxs, meta);
-        if let Some(pos) = section.rfind("</fieldset>") {
-            section.insert_str(pos, &ev);
-        } else {
-            section.push_str(&ev);
-        }
-        out.push_str(&section);
+        body.push_str(&evidence_details(s, &idxs, meta));
+        let _ = write!(
+            out,
+            "<div class=\"story-box\" id=\"story-{n}\">\
+             <h3 class=\"mono\">{file}</h3>\
+             <p class=\"why\">score {score:.1} · {why}</p>{body}</div>",
+            n = i + 1,
+            file = esc(&fs.file),
+            score = fs.score,
+            why = esc(&crate::review::reason_sentence(fs, all)),
+        );
     }
-    out
+    if out.is_empty() {
+        return String::new(); // calm sessions: no story section at all
+    }
+    format!("<section class=\"sec\"><h2>File stories</h2>{out}</section>")
+}
+
+/// Blind spots: calm one-liner when clean; otherwise each finding with its
+/// note and a visible heuristic tag. Suppression states become sentences.
+fn blind_spots_section(s: &Session, meta: &SessionMeta) -> String {
+    let p = crate::payloads::blind_spots(s, meta);
+    let empty = Vec::new();
+    let families = [
+        ("blind_write_attempts", "blind-write attempt"),
+        ("review_burden", "review burden"),
+        ("approval_outliers", "instant accept"),
+    ];
+    let mut rows = String::new();
+    let mut total = 0usize;
+    for (key, label) in families {
+        let arr = p[key].as_array().unwrap_or(&empty);
+        for f in arr.iter().take(5) {
+            total += 1;
+            let file = f["file"].as_str().unwrap_or("");
+            let note = f["note"].as_str().unwrap_or("");
+            let tag = if f["exact"].as_bool() == Some(false) {
+                " <span class=\"tag\" title=\"timing-based inference, not \
+                 proof\">heuristic</span>"
+            } else {
+                ""
+            };
+            let _ = write!(
+                rows,
+                "<li><b>{label}</b>{}{}{tag}</li>",
+                if file.is_empty() {
+                    String::new()
+                } else {
+                    format!(" · <span class=\"mono\">{}</span>", esc(file))
+                },
+                if note.is_empty() {
+                    String::new()
+                } else {
+                    format!(" · {}", esc(note))
+                },
+            );
+        }
+        if arr.len() > 5 {
+            let _ = write!(rows, "<li class=\"run\">… {} more</li>", arr.len() - 5);
+        }
+    }
+    let suppression = if p["suppression"]["approval_latency"].as_str() == Some("suppressed") {
+        "<p class=\"foot\">Approval timing not measured: the session ran \
+         under auto-accept, so edit-to-result deltas say nothing about \
+         human attention. Review-burden is never suppressed.</p>"
+    } else {
+        ""
+    };
+    let body = if total == 0 {
+        "<p class=\"calm\">No blind-write attempts, review-burden findings, \
+         or instant-accept outliers.</p>"
+            .to_string()
+    } else {
+        format!("<ul class=\"story\">{rows}</ul>")
+    };
+    format!("<section class=\"sec\"><h2>Blind spots</h2>{body}{suppression}</section>")
 }
 
 /// A native `<details>` collapsible dereferencing action `idxs` into raw
@@ -887,9 +1025,9 @@ mod tests {
         let html = render(&lines.join("\n"));
         assert!(html.contains("Blind spots"), "no blind-spots section");
         assert!(html.contains("class=\"status\""));
-        // Top file gets a story section.
+        // Top file gets a story box.
         assert!(
-            html.contains("File story") && html.contains("/a.ts"),
+            html.contains("id=\"story-1\"") && html.contains("/a.ts"),
             "no file story"
         );
         // Evidence lives in a native collapsible.
@@ -1038,5 +1176,49 @@ mod tests {
             !html.contains("class=\"nr\""),
             "no review rows on calm sessions"
         );
+    }
+
+    #[test]
+    fn story_boxes_compress_runs_and_show_failures_inline() {
+        // 3 reads then 6 identical edits -> qualifies (2 findings); the edits
+        // render as one run line. A failing bash attributed to the file shows red.
+        let mut lines = Vec::new();
+        for i in 0..3 {
+            lines.push(format!(
+                r#"{{"type":"assistant","timestamp":"2026-01-01T00:00:0{i}Z","message":{{"content":[{{"type":"tool_use","id":"r{i}","name":"Read","input":{{"file_path":"/a.ts"}}}}]}}}}"#
+            ));
+        }
+        for i in 0..6 {
+            lines.push(format!(
+                r#"{{"type":"assistant","timestamp":"2026-01-01T00:01:0{i}Z","message":{{"content":[{{"type":"tool_use","id":"e{i}","name":"Edit","input":{{"file_path":"/a.ts","new_string":"x"}}}}]}}}}"#
+            ));
+        }
+        let html = render(&lines.join("\n"));
+        assert!(
+            html.contains("id=\"story-1\""),
+            "story anchor for review file"
+        );
+        assert!(html.contains("class=\"run\""), "run compression rendered");
+        assert!(html.contains("x6"), "run count shown");
+        assert!(
+            html.contains("rewritten 6x"),
+            "story box opens with its why"
+        );
+    }
+
+    #[test]
+    fn blind_spots_calm_line_when_clean_and_suppression_sentence() {
+        let raw = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","mode":"acceptEdits","message":{"content":[{"type":"tool_use","id":"1","name":"Read","input":{"file_path":"/a.ts"}}]}}"#;
+        let html = render(raw);
+        assert!(
+            html.contains("No blind-write attempts"),
+            "calm line: {}",
+            &html[html.find("Blind spots").unwrap_or(0)..html.len().min(6000)]
+        );
+        assert!(
+            html.contains("auto-accept"),
+            "suppression explained in words"
+        );
+        assert!(!html.contains(">suppressed<"), "bare jargon state removed");
     }
 }
