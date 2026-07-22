@@ -15,7 +15,12 @@
 //!   `~/.claude/sumcp/manifest.json`; `uninstall` reads it and removes only
 //!   what we created (and restores backups of files we replaced). Directories
 //!   we created are removed only if empty by then, so anything the user later
-//!   placed inside them (say, another skill) survives.
+//!   placed inside them (say, another skill) survives. Files carry a content
+//!   hash, so a reinstall can tell "still ours" from "the user changed this"
+//!   and never throws away the only copy of a user's version.
+//! - **Retryable uninstall.** If an undo step fails, uninstall reports the
+//!   error and rewrites the manifest with just the remaining steps, so it can
+//!   simply be run again once the cause is fixed.
 //! - **Safety rails.** We refuse to write through a symlink, and every target
 //!   must resolve to a path under `$HOME`. Files are `0700`, dirs `0700`.
 //!
@@ -147,10 +152,22 @@ impl Paths {
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum Entry {
     /// A file or directory that did not exist before — remove it on uninstall.
-    Created { path: PathBuf },
+    /// For files, `written_hash` records what we wrote (see [`fnv1a64`]) so a
+    /// later reinstall can tell our content from a user's edit. `None` for
+    /// directories and for manifests written before hashes existed.
+    Created {
+        path: PathBuf,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        written_hash: Option<u64>,
+    },
     /// A file that existed and we replaced wholesale — restore `backup` on
-    /// uninstall.
-    Replaced { path: PathBuf, backup: PathBuf },
+    /// uninstall. `written_hash` as above.
+    Replaced {
+        path: PathBuf,
+        backup: PathBuf,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        written_hash: Option<u64>,
+    },
     /// A nested key we spliced into a shared JSON file — delete just that key
     /// on uninstall. `backup` (if the file pre-existed) is kept on disk as a
     /// recovery artifact but is NOT blindly restored, since the user may have
@@ -180,6 +197,21 @@ struct Manifest {
 // ---------------------------------------------------------------------------
 // Low-level safety-checked filesystem primitives (all honor A8).
 // ---------------------------------------------------------------------------
+
+/// Stable 64-bit FNV-1a hash of a byte string. Stored in the manifest beside
+/// each file we write so a reinstall can detect whether the file on disk is
+/// still ours or was edited/replaced by the user since. FNV is not a crypto
+/// hash; it only needs to catch accidental differences, and unlike Rust's
+/// `DefaultHasher` its output is stable across compiler versions, which a
+/// value persisted to disk must be.
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in bytes {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
 
 /// Current wall-clock seconds, used to make backup filenames unique-ish.
 fn now_secs() -> u64 {
@@ -365,7 +397,10 @@ impl<'a> Journal<'a> {
             fs::create_dir_all(dir)?;
             for d in missing {
                 fs::set_permissions(&d, fs::Permissions::from_mode(0o700))?;
-                self.entries.push(Entry::Created { path: d });
+                self.entries.push(Entry::Created {
+                    path: d,
+                    written_hash: None,
+                });
             }
         }
         Ok(())
@@ -385,15 +420,18 @@ impl<'a> Journal<'a> {
             mode
         ));
         if self.apply {
+            let written_hash = Some(fnv1a64(bytes));
             let entry = if existed {
                 let backup = make_backup(dest)?;
                 Entry::Replaced {
                     path: dest.to_path_buf(),
                     backup,
+                    written_hash,
                 }
             } else {
                 Entry::Created {
                     path: dest.to_path_buf(),
+                    written_hash,
                 }
             };
             atomic_write(dest, bytes, mode)?;
@@ -688,19 +726,61 @@ fn entry_key(e: &Entry) -> (u8, PathBuf, String) {
     match e {
         // Created and Replaced share a tag on purpose: either way the entry is
         // "about" that path, and a reinstall pairs old and new entries by it.
-        Entry::Created { path } | Entry::Replaced { path, .. } => (0, path.clone(), String::new()),
+        Entry::Created { path, .. } | Entry::Replaced { path, .. } => {
+            (0, path.clone(), String::new())
+        }
         Entry::JsonKey { file, key_path, .. } => (1, file.clone(), key_path.join(".")),
         Entry::StopHook { file, command, .. } => (2, file.clone(), command.clone()),
     }
 }
 
+/// A copy of `base` with its `written_hash` swapped for `nh` (files only).
+/// Used when a reinstall carries an old entry forward: the entry's history
+/// (created vs replaced, original backup) stays, but the hash must describe
+/// the bytes THIS run just wrote, or the next reinstall would see false drift.
+fn with_written_hash(base: &Entry, nh: Option<u64>) -> Entry {
+    match base.clone() {
+        Entry::Created { path, .. } => Entry::Created {
+            path,
+            written_hash: nh,
+        },
+        Entry::Replaced { path, backup, .. } => Entry::Replaced {
+            path,
+            backup,
+            written_hash: nh,
+        },
+        other => other,
+    }
+}
+
+/// Did the file we just backed up during a reinstall still hold exactly what
+/// the PREVIOUS install wrote (per the hash recorded in the old manifest)?
+/// `None` means the old manifest predates hashes; we assume unmodified, which
+/// matches the old behavior and only ever affects pre-hash installs.
+fn backup_matches_recorded_hash(prev: &Entry, backup: &Path) -> bool {
+    let recorded = match prev {
+        Entry::Created { written_hash, .. } | Entry::Replaced { written_hash, .. } => *written_hash,
+        _ => None,
+    };
+    match recorded {
+        None => true,
+        // Unreadable backup counts as drift: when unsure, keep the backup.
+        Some(h) => fs::read(backup).map(|b| fnv1a64(&b) == h).unwrap_or(false),
+    }
+}
+
 /// Fold a previous install's manifest entries into a reinstall's journal.
 ///
-/// The rule: when both manifests mention the same target, the OLD entry wins,
-/// because it remembers the state before suMCP ever touched the machine (for
-/// example the backup of the user's original skill file). This run's backup of
-/// that same target is then just a copy of our own previous version; those are
-/// returned separately for deletion once the merged manifest is safely on disk.
+/// When both manifests mention the same target and the file still held our
+/// bytes, the OLD entry wins: it remembers the state before suMCP ever touched
+/// the machine (for example the backup of the user's original skill file), and
+/// this run's backup is just a copy of our own previous version, returned
+/// separately for deletion once the merged manifest is safely on disk.
+///
+/// But if the content had DRIFTED (the user edited or replaced our file after
+/// install), this run's backup is the only copy of their version. The new
+/// `Replaced` entry then wins, so uninstall restores their file, and nothing
+/// is deleted.
 fn merge_manifests(prev: &[Entry], new: &[Entry]) -> (Vec<Entry>, Vec<PathBuf>) {
     let mut merged = Vec::new();
     let mut redundant = Vec::new();
@@ -717,16 +797,35 @@ fn merge_manifests(prev: &[Entry], new: &[Entry]) -> (Vec<Entry>, Vec<PathBuf>) 
             None => merged.push(p.clone()),
             Some((i, n)) => {
                 consumed[i] = true;
-                merged.push(p.clone());
                 match n {
-                    Entry::Replaced { backup, .. } => redundant.push(backup.clone()),
+                    Entry::Replaced {
+                        backup,
+                        written_hash,
+                        ..
+                    } => {
+                        if backup_matches_recorded_hash(p, backup) {
+                            merged.push(with_written_hash(p, *written_hash));
+                            redundant.push(backup.clone());
+                        } else {
+                            merged.push(n.clone());
+                        }
+                    }
+                    // File was missing this run (user deleted ours) and got
+                    // recreated: the old entry still describes the pre-suMCP
+                    // state, carry it forward with the fresh content hash.
+                    Entry::Created { written_hash, .. } => {
+                        merged.push(with_written_hash(p, *written_hash));
+                    }
                     Entry::JsonKey {
                         backup: Some(b), ..
                     }
                     | Entry::StopHook {
                         backup: Some(b), ..
-                    } => redundant.push(b.clone()),
-                    _ => {}
+                    } => {
+                        merged.push(p.clone());
+                        redundant.push(b.clone());
+                    }
+                    _ => merged.push(p.clone()),
                 }
             }
         }
@@ -889,62 +988,89 @@ fn run_install(paths: &Paths, exe_dir: &Path, apply: bool) -> io::Result<Vec<Str
     }
 }
 
-/// Undo a list of manifest entries (used both by `uninstall` and by rollback on
-/// a failed apply). Best-effort: we keep going past individual errors so one
-/// stuck file can't strand the rest.
-fn rollback(entries: &[Entry]) {
-    // Reverse order: undo last action first (e.g. remove JSON keys before the
-    // dirs, though these are independent here).
-    for entry in entries.iter().rev() {
-        match entry {
-            Entry::Created { path } => {
-                // A directory is removed only if empty (`remove_dir`, never
-                // `remove_dir_all`): whatever the user added inside it after
-                // install is not ours to delete.
-                let _ = if path.is_dir() {
-                    fs::remove_dir(path)
-                } else {
-                    fs::remove_file(path)
-                };
-            }
-            Entry::Replaced { path, backup } => {
-                // Restore the pre-existing file we overwrote.
-                let _ = fs::rename(backup, path);
-            }
-            Entry::JsonKey {
-                file,
-                key_path,
-                backup,
-            } => {
-                if let Ok(mut root) = read_json_object(file)
-                    && remove_nested(&mut root, key_path)
-                {
-                    // `backup.is_none()` means the file didn't exist before
-                    // install — we created it. If removing our key leaves it
-                    // empty, delete the whole file rather than leave `{}`.
-                    if backup.is_none() && root.is_empty() {
-                        let _ = fs::remove_file(file);
-                    } else if let Ok(bytes) = serde_json::to_vec_pretty(&Value::Object(root)) {
-                        let _ = atomic_write(file, &bytes, 0o600);
-                    }
+/// Undo one manifest entry. Three outcomes:
+///
+/// - `Ok(true)`: fully undone (or already gone; undo is idempotent).
+/// - `Ok(false)`: deliberately left in place. Only directories do this: a
+///   directory that still has content is not ours to force-remove.
+/// - `Err(..)`: the undo failed; the caller should keep the entry recorded
+///   so the operation can be retried.
+fn undo_entry(entry: &Entry) -> io::Result<bool> {
+    /// Treat "already absent" as success so a retried uninstall doesn't trip
+    /// over the steps that worked the first time.
+    fn remove_file_idempotent(path: &Path) -> io::Result<()> {
+        match fs::remove_file(path) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        }
+    }
+    /// Write back a shared JSON file after our key/hook was removed from it.
+    /// `backup.is_none()` means the file didn't exist before install (we
+    /// created it), so if it's now empty we delete it rather than leave `{}`.
+    fn write_back(file: &Path, root: Map<String, Value>, backup: &Option<PathBuf>) -> io::Result<()> {
+        if backup.is_none() && root.is_empty() {
+            remove_file_idempotent(file)
+        } else {
+            let bytes = serde_json::to_vec_pretty(&Value::Object(root))
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            atomic_write(file, &bytes, 0o600)
+        }
+    }
+
+    match entry {
+        Entry::Created { path, .. } => {
+            // A directory is removed only if empty (`remove_dir`, never
+            // `remove_dir_all`): whatever the user added inside it after
+            // install is not ours to delete.
+            if path.is_dir() {
+                match fs::remove_dir(path) {
+                    Ok(()) => Ok(true),
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(true),
+                    Err(_) => Ok(false), // non-empty (or stuck): leave it be
                 }
-            }
-            Entry::StopHook {
-                file,
-                command,
-                backup,
-            } => {
-                if let Ok(mut root) = read_json_object(file)
-                    && remove_stop_command(&mut root, command)
-                {
-                    if backup.is_none() && root.is_empty() {
-                        let _ = fs::remove_file(file);
-                    } else if let Ok(bytes) = serde_json::to_vec_pretty(&Value::Object(root)) {
-                        let _ = atomic_write(file, &bytes, 0o600);
-                    }
-                }
+            } else {
+                remove_file_idempotent(path).map(|()| true)
             }
         }
+        Entry::Replaced { path, backup, .. } => {
+            // Restore the pre-existing file we overwrote. A missing backup is
+            // a real failure: the restore cannot happen.
+            fs::rename(backup, path).map(|()| true)
+        }
+        Entry::JsonKey {
+            file,
+            key_path,
+            backup,
+        } => {
+            let mut root = read_json_object(file)?;
+            if remove_nested(&mut root, key_path) {
+                write_back(file, root, backup)?;
+            }
+            Ok(true)
+        }
+        Entry::StopHook {
+            file,
+            command,
+            backup,
+        } => {
+            let mut root = read_json_object(file)?;
+            if remove_stop_command(&mut root, command) {
+                write_back(file, root, backup)?;
+            }
+            Ok(true)
+        }
+    }
+}
+
+/// Undo a list of manifest entries, best-effort: used to roll back a failed
+/// install, where pressing on past individual errors beats stranding the rest.
+/// (`uninstall` instead walks entries itself so it can report failures and
+/// keep a retryable ledger.)
+fn rollback(entries: &[Entry]) {
+    // Reverse order: undo last action first, and empty out directories'
+    // contents before the directories themselves come up.
+    for entry in entries.iter().rev() {
+        let _ = undo_entry(entry);
     }
 }
 
@@ -975,31 +1101,77 @@ fn run_uninstall(paths: &Paths, apply: bool) -> io::Result<Vec<String>> {
 
     let mut lines = Vec::new();
     for entry in &manifest.entries {
-        match entry {
-            Entry::Created { path } => lines.push(format!("remove  {}", path.display())),
-            Entry::Replaced { path, backup } => lines.push(format!(
-                "restore {}  ← {}",
-                path.display(),
-                backup.display()
-            )),
-            Entry::JsonKey { file, key_path, .. } => lines.push(format!(
-                "unmerge {}  ✗ {}",
-                file.display(),
-                key_path.join(".")
-            )),
-            Entry::StopHook { file, .. } => {
-                lines.push(format!("unhook  {}  ✗ hooks.Stop", file.display()))
-            }
-        }
+        lines.push(entry_undo_desc(entry));
     }
     if apply {
-        // The manifest lives inside the sumcp dir, and directories are only
-        // removed when empty, so delete the ledger file itself first; the
-        // rollback below then empties and removes the tree around it.
-        let _ = fs::remove_file(&manifest_path);
-        rollback(&manifest.entries);
+        // Walk the ledger in reverse (undo last action first), keeping every
+        // entry that is not fully undone. The manifest is NOT deleted up
+        // front: it is the only record of what remains, and a failed step must
+        // leave a retryable ledger behind rather than vanish silently.
+        let mut kept_rev: Vec<Entry> = Vec::new();
+        let mut errors: Vec<String> = Vec::new();
+        for entry in manifest.entries.iter().rev() {
+            match undo_entry(entry) {
+                Ok(true) => {}
+                Ok(false) => kept_rev.push(entry.clone()), // dir with content
+                Err(e) => {
+                    kept_rev.push(entry.clone());
+                    errors.push(format!("{}: {e}", entry_undo_desc(entry)));
+                }
+            }
+        }
+        if errors.is_empty() {
+            // Everything undone except (at most) directories that were still
+            // waiting on the manifest file inside them. Remove the ledger,
+            // then sweep those directories; `kept_rev` is already ordered
+            // children-before-parents.
+            let _ = fs::remove_file(&manifest_path);
+            for entry in &kept_rev {
+                if let Entry::Created { path, .. } = entry
+                    && path.is_dir()
+                {
+                    let _ = fs::remove_dir(path);
+                }
+            }
+        } else {
+            // Rewrite the manifest with what remains (back in original order)
+            // so `uninstall` can simply be run again after the cause is fixed.
+            kept_rev.reverse();
+            let retained = Manifest {
+                version: MANIFEST_VERSION,
+                entries: kept_rev,
+            };
+            let mut msg = format!("uninstall incomplete: {}", errors.join("; "));
+            let rewrite = serde_json::to_vec_pretty(&retained)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+                .and_then(|bytes| atomic_write(&manifest_path, &bytes, 0o600));
+            match rewrite {
+                Ok(()) => msg.push_str("; the remaining steps were kept in the manifest, re-run uninstall to retry"),
+                Err(e) => msg.push_str(&format!("; additionally failed to rewrite the manifest: {e}")),
+            }
+            return Err(io::Error::other(msg));
+        }
     }
     Ok(lines)
+}
+
+/// One human-readable line describing what undoing `entry` means. Used both
+/// for the dry-run plan and to name a failed step in an error message.
+fn entry_undo_desc(entry: &Entry) -> String {
+    match entry {
+        Entry::Created { path, .. } => format!("remove  {}", path.display()),
+        Entry::Replaced { path, backup, .. } => format!(
+            "restore {}  ← {}",
+            path.display(),
+            backup.display()
+        ),
+        Entry::JsonKey { file, key_path, .. } => format!(
+            "unmerge {}  ✗ {}",
+            file.display(),
+            key_path.join(".")
+        ),
+        Entry::StopHook { file, .. } => format!("unhook  {}  ✗ hooks.Stop", file.display()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1126,10 +1298,12 @@ mod tests {
             entries: vec![
                 Entry::Created {
                     path: "/a/b".into(),
+                    written_hash: None,
                 },
                 Entry::Replaced {
                     path: "/c".into(),
                     backup: "/c.bak".into(),
+                    written_hash: Some(fnv1a64(b"content")),
                 },
                 Entry::JsonKey {
                     file: "/d.json".into(),
@@ -1628,6 +1802,88 @@ mod tests {
         );
         assert_eq!(fs::read(&cjp).unwrap(), original, "config modified");
         assert!(!paths.sumcp().exists(), "failed install left artifacts");
+    }
+
+    #[test]
+    fn reinstall_preserves_user_replaced_file() {
+        // First install CREATED the skill file; the user then replaces it with
+        // their own version. Reinstall must notice the drift and treat the
+        // user's version like any pre-existing user file: back it up and
+        // restore it on uninstall, never delete it.
+        let home = temp_home();
+        let (_g, exe) = fake_exe_dir();
+        let paths = Paths::new(home.path().to_path_buf());
+        run_install(&paths, &exe, true).unwrap();
+
+        let skill_md = paths.skill_dest().join("SKILL.md");
+        fs::write(&skill_md, b"USER CONTENT").unwrap();
+
+        run_install(&paths, &exe, true).unwrap(); // reinstall
+        run_uninstall(&paths, true).unwrap();
+
+        assert_eq!(
+            fs::read(&skill_md).unwrap(),
+            b"USER CONTENT",
+            "user's replacement file was deleted instead of restored"
+        );
+    }
+
+    /// Shared setup for the failed-uninstall tests: a user skill that install
+    /// backs up, whose backup we then delete so the restore must fail.
+    fn install_then_break_restore() -> (TempDir, TempDir, Paths, PathBuf, PathBuf) {
+        let home = temp_home();
+        let skill = home.path().join(".claude/skills/debrief");
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(skill.join("SKILL.md"), b"MY CUSTOM SKILL").unwrap();
+
+        let (guard, exe) = fake_exe_dir();
+        let paths = Paths::new(home.path().to_path_buf());
+        run_install(&paths, &exe, true).unwrap();
+
+        let backup = fs::read_dir(&skill)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .find(|e| e.file_name().to_string_lossy().contains(".sumcp-bak."))
+            .expect("expected a backup of the user's skill")
+            .path();
+        fs::remove_file(&backup).unwrap();
+        (home, guard, paths, skill, backup)
+    }
+
+    #[test]
+    fn failed_uninstall_keeps_manifest_and_reports_error() {
+        // A restore that cannot happen (its backup vanished) must surface as
+        // an error and leave the manifest ledger in place for a retry.
+        let (_home, _g, paths, _skill, _backup) = install_then_break_restore();
+
+        let res = run_uninstall(&paths, true);
+        assert!(
+            res.is_err(),
+            "uninstall reported success despite a failed restore"
+        );
+        assert!(
+            paths.manifest().exists(),
+            "uninstall deleted its ledger despite failing"
+        );
+    }
+
+    #[test]
+    fn failed_uninstall_is_retryable() {
+        // Same sabotage, then repair: putting the backup file back and
+        // re-running uninstall must finish the job cleanly.
+        let (_home, _g, paths, skill, backup) = install_then_break_restore();
+        assert!(run_uninstall(&paths, true).is_err());
+
+        fs::write(&backup, b"MY CUSTOM SKILL").unwrap();
+        run_uninstall(&paths, true).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(skill.join("SKILL.md")).unwrap(),
+            "MY CUSTOM SKILL",
+            "retry did not restore the user's skill"
+        );
+        assert!(!paths.manifest().exists(), "manifest left after clean retry");
+        assert!(!paths.sumcp().exists(), "sumcp tree left after clean retry");
     }
 
     #[test]
