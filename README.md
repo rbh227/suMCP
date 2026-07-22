@@ -111,6 +111,16 @@ signals. Every finding carries a **tier**, an **exact-vs-heuristic** flag, a
 
 ## The numbers
 
+**Do the flags mean anything?** In a frozen-weights retrospective study on the
+author's own corpus (42 substantial sessions across 6 projects), files suMCP
+flagged for review were **6.2x more likely** to show renewed struggle signals
+(failure loops, user corrections, reverts, or re-qualifying for review) in the
+next 3 sessions than unflagged edited files, and the effect survives
+stratifying by how heavily the file was edited. Precision is honest, not
+magic: about half of flagged files get re-edited soon, about a quarter
+struggle again. Single-author corpus; method, full tables, and caveats in
+[docs/validation/2026-07-22-predictive-validity.md](docs/validation/2026-07-22-predictive-validity.md).
+
 <p align="center">
   <img src="docs/assets/diagram-tokens.svg" alt="A full transcript of tens of thousands to about one million tokens versus a suMCP payload of about 150 to 290 tokens: a median 800x reduction." width="520">
 </p>
@@ -132,10 +142,12 @@ magnitude smaller than re-reading the transcript.
 
 Read these before trusting a ranking:
 
-- **Accuracy not yet systematically validated.** The ranking is proven to *run*
-  and *generalize* across many real projects, but whether its top-3 struggle
-  files match what you *actually* struggled with has only been spot-checked, not
-  measured. Treat the ranking as a strong hint, not ground truth, in v0.1.
+- **Validated retrospectively, on one author.** Flagged files predicted future
+  struggle at ~6x relative risk on the author's own 42-session corpus (see
+  [the study](docs/validation/2026-07-22-predictive-validity.md)), but
+  precision is moderate (about a quarter of flags struggle again) and the
+  corpus is one person's working style. Treat the ranking as a strong,
+  measured hint, not ground truth.
 - **Heuristic signals.** Several signals (e.g. approval latency, instant-accept)
   infer intent from edit shape and timing; they're labeled heuristic and are
   suppressed when the session ran under auto-accept.
