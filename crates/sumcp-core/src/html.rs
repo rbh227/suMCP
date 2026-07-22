@@ -480,37 +480,71 @@ fn timeline_section(s: &Session, ranked: &[FileScore]) -> String {
     format!("<section class=\"sec\"><h2>Timeline</h2>{body}</section>")
 }
 
-/// Struggle areas: ranked files with their category breakdown. `weights` and
-/// `review` are wired in by Task 7's rewrite; bridged here (ignored) so the
-/// crate compiles against the new `render_html` call shape.
+/// Ranked files: cap 10, plain-language breakdown, top-3 emphasized and
+/// linked to their stories, formula + exact weights footnoted (the
+/// transparency promise in SPEC decision 6).
 fn struggles_section(ranked: &[FileScore], weights: &Weights, review: &[&FileScore]) -> String {
-    let _ = (weights, review);
     if ranked.is_empty() {
-        return group_box("Struggle areas", "<p>No struggle signals fired.</p>");
+        return "<section class=\"sec\"><h2>Struggle areas</h2>\
+             <p class=\"calm\">No struggle signals fired.</p></section>"
+            .to_string();
     }
+    let story_anchor = |file: &str| -> Option<usize> {
+        review.iter().position(|fs| fs.file == file).map(|i| i + 1)
+    };
     let mut rows = String::new();
-    for (i, f) in ranked.iter().enumerate() {
-        let cats: Vec<String> = f
-            .breakdown
+    for (i, f) in ranked.iter().take(10).enumerate() {
+        let phrases: Vec<String> = crate::review::SEVERITY_ORDER
             .iter()
-            .map(|(k, v)| format!("{} {}", esc(k), v))
+            .filter_map(|cat| {
+                f.breakdown
+                    .get(*cat)
+                    .map(|n| crate::review::category_phrase(cat, *n))
+            })
             .collect();
+        let file_cell = match story_anchor(&f.file) {
+            Some(n) => format!("<a class=\"mono\" href=\"#story-{n}\">{}</a>", esc(&f.file)),
+            None => format!("<span class=\"mono\">{}</span>", esc(&f.file)),
+        };
         let _ = write!(
             rows,
-            "<tr><td class=\"rank\">{}</td><td class=\"file\">{}</td>\
-             <td class=\"score\">{:.1}</td><td>{}</td></tr>",
-            i + 1,
-            esc(&f.file),
-            f.score,
-            esc(&cats.join(", ")),
+            "<tr{top}><td class=\"r\">{rank}</td><td>{file_cell}</td>\
+             <td class=\"r\">{score:.1}</td><td>{phrases}</td></tr>",
+            top = if i < 3 { " class=\"top\"" } else { "" },
+            rank = i + 1,
+            score = f.score,
+            phrases = esc(&phrases.join(", ")),
         );
     }
-    let body = format!(
-        "<table class=\"rank-tbl\"><thead><tr><th>#</th><th>file</th>\
-         <th>score</th><th>breakdown</th></tr></thead><tbody>{}</tbody></table>",
-        rows
+    let overflow = if ranked.len() > 10 {
+        format!(
+            "<p class=\"foot\">{} more file{} with minor signals (see \
+             struggle_areas via the MCP tools).</p>",
+            ranked.len() - 10,
+            if ranked.len() - 10 == 1 { "" } else { "s" }
+        )
+    } else {
+        String::new()
+    };
+    let footnote = format!(
+        "<p class=\"foot\">score = weight x count, low-confidence x{lcf} · \
+         weights: rewrites {c} · rework {rw} · failure loops {fl} · \
+         re-reads {rr} · blind-writes {fu} · loops {al} ({src})</p>",
+        lcf = weights.low_confidence_factor,
+        c = weights.churn,
+        rw = weights.rework,
+        fl = weights.failure_loop,
+        rr = weights.re_read,
+        fu = weights.fumble,
+        al = weights.action_loop,
+        src = esc(&weights.source),
     );
-    group_box("Struggle areas", &body)
+    format!(
+        "<section class=\"sec\"><h2>Struggle areas</h2>\
+         <table class=\"tbl\"><thead><tr><th>#</th><th>file</th>\
+         <th>score</th><th>signals</th></tr></thead>\
+         <tbody>{rows}</tbody></table>{overflow}{footnote}</section>"
+    )
 }
 
 /// Blind spots: counts of blind-write attempts, review-burden findings, and
@@ -874,7 +908,48 @@ mod tests {
         let html = render(&lines.join("\n"));
         assert!(html.contains("Struggle"), "no struggle heading");
         assert!(html.contains("/a.ts"), "ranked file not shown");
-        assert!(html.contains("churn"), "breakdown category not shown");
+        assert!(html.contains("rewritten 6x"), "plain-language breakdown");
+    }
+
+    #[test]
+    fn struggle_breakdown_is_plain_language_with_weights_footnote() {
+        let mut lines = Vec::new();
+        for i in 0..6 {
+            lines.push(format!(
+                r#"{{"type":"assistant","timestamp":"2026-01-01T00:00:0{i}Z","message":{{"content":[{{"type":"tool_use","id":"e{i}","name":"Edit","input":{{"file_path":"/a.ts","new_string":"x"}}}}]}}}}"#
+            ));
+        }
+        let html = render(&lines.join("\n"));
+        assert!(html.contains("rewritten 6x"), "plain-language breakdown");
+        assert!(!html.contains("re_read"), "no internal jargon in the table");
+        assert!(
+            html.contains("score = weight x count"),
+            "formula footnote present"
+        );
+        assert!(html.contains("rework 3"), "actual weights echoed");
+    }
+
+    #[test]
+    fn struggle_table_caps_at_ten_rows() {
+        // 12 files, each churned twice -> 12 ranked, 10 shown, overflow note.
+        let mut lines = Vec::new();
+        for f in 0..12 {
+            for i in 0..2 {
+                lines.push(format!(
+                    r#"{{"type":"assistant","timestamp":"2026-01-01T00:{f:02}:0{i}Z","message":{{"content":[{{"type":"tool_use","id":"f{f}e{i}","name":"Edit","input":{{"file_path":"/f{f}.ts","new_string":"x"}}}}]}}}}"#
+                ));
+            }
+        }
+        let html = render(&lines.join("\n"));
+        // Each data row has exactly two .r cells (rank + score); top-3 rows carry
+        // class="top" so counting "<tr><td" would undercount.
+        assert_eq!(
+            html.matches("<td class=\"r\">").count(),
+            20,
+            "ten data rows expected"
+        );
+        assert_eq!(html.matches("class=\"top\"").count(), 3, "top-3 emphasized");
+        assert!(html.contains("2 more file"), "overflow note");
     }
 
     #[test]
