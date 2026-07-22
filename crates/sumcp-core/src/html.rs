@@ -282,17 +282,47 @@ fn group_box(title: &str, body: &str) -> String {
     )
 }
 
-/// Needs-review section: placeholder pending Task 5's plain-language
-/// rewrite. Kept minimal here so the shell compiles; Task 5 replaces the
-/// body with the full evidence-floor rendering (`review::needs_review`,
-/// `reason_sentence`, `category_phrase`).
+/// The lead section: which files need eyes, and why — or an explicit calm
+/// state. Reasons are strictly descriptive (grill decision 2026-07-22).
 fn needs_review_section(
     review: &[&FileScore],
     all: &[crate::model::Finding],
     s: &Session,
 ) -> String {
-    let _ = (review, all, s);
-    "<section class=\"sec\"><h2>Needs review</h2></section>".to_string()
+    use crate::model::FindingKind;
+    if review.is_empty() {
+        let has_blind = all.iter().any(|f| {
+            matches!(
+                f.kind,
+                FindingKind::BlindWriteAttempt
+                    | FindingKind::ReviewBurden
+                    | FindingKind::LargeWriteInstantAccept
+            )
+        });
+        let msg = if has_blind {
+            "No files met the review bar. Blind spots below still apply."
+        } else {
+            "No struggle signals. No blind spots."
+        };
+        return format!(
+            "<section class=\"sec\"><h2>Needs review</h2>\
+             <p class=\"calm\">{msg}</p></section>"
+        );
+    }
+    let _ = s; // session reserved for future per-row context
+    let mut rows = String::new();
+    for (i, fs) in review.iter().enumerate() {
+        let _ = write!(
+            rows,
+            "<div class=\"nr\"><span class=\"mono\">{file}</span>\
+             <span class=\"why\">{why}</span>\
+             <a href=\"#story-{n}\">story</a></div>",
+            file = esc(&fs.file),
+            why = esc(&crate::review::reason_sentence(fs, all)),
+            n = i + 1,
+        );
+    }
+    format!("<section class=\"sec\"><h2>Needs review</h2>{rows}</section>")
 }
 
 /// The timeline centerpiece: action ticks in Read/Edit/Bash lanes, finding
@@ -814,5 +844,41 @@ mod tests {
         assert!(html.contains("addEventListener"), "no interaction wiring");
         // Still zero-network after adding JS (robust escaped-attribute form).
         assert!(!html.contains("=\"http"), "external URL reference present");
+    }
+
+    #[test]
+    fn needs_review_lists_qualifying_files_with_reasons_and_links() {
+        // churn + re_read on /a.ts -> qualifies; reason in fixed vocabulary.
+        let mut lines = Vec::new();
+        for i in 0..3 {
+            lines.push(format!(
+                r#"{{"type":"assistant","timestamp":"2026-01-01T00:00:0{i}Z","message":{{"content":[{{"type":"tool_use","id":"r{i}","name":"Read","input":{{"file_path":"/a.ts"}}}}]}}}}"#
+            ));
+        }
+        for i in 0..6 {
+            lines.push(format!(
+                r#"{{"type":"assistant","timestamp":"2026-01-01T00:01:0{i}Z","message":{{"content":[{{"type":"tool_use","id":"e{i}","name":"Edit","input":{{"file_path":"/a.ts","new_string":"x"}}}}]}}}}"#
+            ));
+        }
+        let html = render(&lines.join("\n"));
+        assert!(html.contains("Needs review"), "section heading");
+        assert!(html.contains("rewritten 6x"), "vocabulary reason");
+        assert!(html.contains("href=\"#story-1\""), "jump link to story");
+    }
+
+    #[test]
+    fn calm_state_when_nothing_qualifies() {
+        // One read, no findings at all.
+        let raw = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"tool_use","id":"1","name":"Read","input":{"file_path":"/a.ts"}}]}}"#;
+        let html = render(raw);
+        assert!(
+            html.contains("No struggle signals"),
+            "calm line shown: {}",
+            &html[..html.len().min(2000)]
+        );
+        assert!(
+            !html.contains("class=\"nr\""),
+            "no review rows on calm sessions"
+        );
     }
 }
