@@ -10,7 +10,7 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 HTML="$(mktemp -t sumcp-demo-XXXX).html"
-PNG="$ROOT/docs/assets/report-screenshot.png"
+PNG="$ROOT/docs/assets/report-hero.png"
 CHROME="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 
 cargo build --release --manifest-path "$ROOT/Cargo.toml"

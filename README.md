@@ -12,7 +12,7 @@
 </p>
 
 <p align="center">
-  <img src="docs/assets/report-screenshot.png" alt="suMCP HTML report: session timeline, ranked struggle areas, blind spots, and per-file evidence" width="820">
+  <img src="docs/assets/report-hero.png" alt="suMCP HTML report: needs-review directives, session timeline with finding spans, and ranked struggle areas with plain-language signals" width="820">
 </p>
 
 > **v0.1 pre-release.** Validated on the author's own projects across many
