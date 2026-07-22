@@ -15,6 +15,7 @@ pub mod model;
 pub mod payloads;
 pub mod redact;
 pub mod report;
+pub mod review;
 pub mod score;
 pub mod signals;
 

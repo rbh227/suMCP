@@ -1007,7 +1007,11 @@ fn undo_entry(entry: &Entry) -> io::Result<bool> {
     /// Write back a shared JSON file after our key/hook was removed from it.
     /// `backup.is_none()` means the file didn't exist before install (we
     /// created it), so if it's now empty we delete it rather than leave `{}`.
-    fn write_back(file: &Path, root: Map<String, Value>, backup: &Option<PathBuf>) -> io::Result<()> {
+    fn write_back(
+        file: &Path,
+        root: Map<String, Value>,
+        backup: &Option<PathBuf>,
+    ) -> io::Result<()> {
         if backup.is_none() && root.is_empty() {
             remove_file_idempotent(file)
         } else {
@@ -1146,8 +1150,12 @@ fn run_uninstall(paths: &Paths, apply: bool) -> io::Result<Vec<String>> {
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
                 .and_then(|bytes| atomic_write(&manifest_path, &bytes, 0o600));
             match rewrite {
-                Ok(()) => msg.push_str("; the remaining steps were kept in the manifest, re-run uninstall to retry"),
-                Err(e) => msg.push_str(&format!("; additionally failed to rewrite the manifest: {e}")),
+                Ok(()) => msg.push_str(
+                    "; the remaining steps were kept in the manifest, re-run uninstall to retry",
+                ),
+                Err(e) => msg.push_str(&format!(
+                    "; additionally failed to rewrite the manifest: {e}"
+                )),
             }
             return Err(io::Error::other(msg));
         }
@@ -1160,16 +1168,12 @@ fn run_uninstall(paths: &Paths, apply: bool) -> io::Result<Vec<String>> {
 fn entry_undo_desc(entry: &Entry) -> String {
     match entry {
         Entry::Created { path, .. } => format!("remove  {}", path.display()),
-        Entry::Replaced { path, backup, .. } => format!(
-            "restore {}  ← {}",
-            path.display(),
-            backup.display()
-        ),
-        Entry::JsonKey { file, key_path, .. } => format!(
-            "unmerge {}  ✗ {}",
-            file.display(),
-            key_path.join(".")
-        ),
+        Entry::Replaced { path, backup, .. } => {
+            format!("restore {}  ← {}", path.display(), backup.display())
+        }
+        Entry::JsonKey { file, key_path, .. } => {
+            format!("unmerge {}  ✗ {}", file.display(), key_path.join("."))
+        }
         Entry::StopHook { file, .. } => format!("unhook  {}  ✗ hooks.Stop", file.display()),
     }
 }
@@ -1882,7 +1886,10 @@ mod tests {
             "MY CUSTOM SKILL",
             "retry did not restore the user's skill"
         );
-        assert!(!paths.manifest().exists(), "manifest left after clean retry");
+        assert!(
+            !paths.manifest().exists(),
+            "manifest left after clean retry"
+        );
         assert!(!paths.sumcp().exists(), "sumcp tree left after clean retry");
     }
 

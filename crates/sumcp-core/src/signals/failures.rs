@@ -311,6 +311,7 @@ mod tests {
         let s = Session {
             actions: vec![edit(0, Lane::Sub("z".into()), "/sub-file"), bash, bash2],
             user_texts: vec![],
+            cwd: None,
             tokens: Default::default(),
             type_counts: Default::default(),
             parse_errors: 0,

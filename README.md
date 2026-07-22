@@ -24,39 +24,18 @@
 
 ## Why I built this
 
-I ship code an agent wrote faster than I can fully understand it. That gap,
-the comprehension debt, is the thing I actually wanted a tool for.
+I ship code an agent wrote faster than I can fully review it. The question
+at the end of a session is not "what did we do?" but "which of this do I
+actually need to look at before I trust it?"
 
-When you ask an agent "what did we struggle with this session?", it answers
-from a lossy, self-flattering memory of its own context, or it re-reads the
-entire transcript, which is enormous. Neither is trustworthy: the first is
-narrative, the second is expensive, and both drift from what actually
-happened.
-
-The transcript is the evidence. Every edit, every failed command, every time
-I pushed back, ordered and timestamped. That record survives compaction and it
-survives the agent's self-report. suMCP reads it deterministically, in Rust,
-with no LLM and no network, and hands a connected agent a few hundred tokens of
-cited, structured evidence instead of a vibe. The tool does not judge; it shows
-its work, and the agent is the only intelligence in the loop.
-
----
-
-## The numbers
-
-<p align="center">
-  <img src="docs/assets/diagram-tokens.svg" alt="A full transcript of tens of thousands to about one million tokens versus a suMCP payload of about 150 to 290 tokens: a median 800x reduction." width="520">
-</p>
-
-On 15 real sessions across 6 project types (Rust, Python/ML, TS/React, prose,
-and more), the core debrief payload was about 150 to 290 tokens against raw
-transcripts of tens of thousands to about 1,000,000 tokens: a median ~800x
-reduction.[^tok] Same answer, a fraction of the context.
-
-[^tok]: Measured as the `session_overview` payload vs the full transcript at
-`chars/3.5`. A full debrief that also reads `struggle_areas` plus a few
-`evidence` calls is a small multiple of that, still one to three orders of
-magnitude smaller than re-reading the transcript.
+Ask the agent and it answers from a lossy, self-flattering memory of its own
+context, or it re-reads an enormous transcript. The transcript is the real
+evidence: every edit, every failed command, every time I pushed back, ordered
+and timestamped. suMCP reads that record deterministically, in Rust, with no
+LLM and no network, and turns it into review targeting: the files the session
+actually struggled with, why, and the exact actions that prove it. The tool
+does not judge; it shows its work, so your limited review time goes where the
+risk is.
 
 ---
 
@@ -127,6 +106,25 @@ signals. Every finding carries a **tier**, an **exact-vs-heuristic** flag, a
 **confidence**, and the action indices that prove it. See
 [docs/metrics.md](docs/metrics.md) for the reader-facing catalog, or
 [docs/metrics-spec.md](docs/metrics-spec.md) for the authoritative spec.
+
+---
+
+## The numbers
+
+<p align="center">
+  <img src="docs/assets/diagram-tokens.svg" alt="A full transcript of tens of thousands to about one million tokens versus a suMCP payload of about 150 to 290 tokens: a median 800x reduction." width="520">
+</p>
+
+A supporting point: the evidence arrives cheap. On 15 real sessions across 6
+project types (Rust, Python/ML, TS/React, prose, and more), the core debrief
+payload was about 150 to 290 tokens against raw transcripts of tens of
+thousands to about 1,000,000 tokens: a median ~800x reduction.[^tok] Same
+answer, a fraction of the context.
+
+[^tok]: Measured as the `session_overview` payload vs the full transcript at
+`chars/3.5`. A full debrief that also reads `struggle_areas` plus a few
+`evidence` calls is a small multiple of that, still one to three orders of
+magnitude smaller than re-reading the transcript.
 
 ---
 
