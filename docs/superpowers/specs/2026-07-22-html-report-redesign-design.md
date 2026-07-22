@@ -38,7 +38,8 @@ deterministic byte-identical output. Every dynamic string through `esc()`.
    total, or 1 finding of a high-signal kind (failure loop, flip,
    user-correction, blind-write attempt). Cap 3. Each row: path, strictly
    descriptive reason from a fixed vocabulary with counts attached
-   ("rewritten 8x, re-read 4x, 1 failure loop"), jump link to its story box.
+   ("rewritten 8x, re-read 4x, 1 looped failing command"), jump link to its
+   story box.
    The calm state is three-way, so the wording never claims more than the
    data shows: nothing ranked and no blind spots either ("No struggle
    signals. No blind spots."); nothing met the review bar but blind-spot
@@ -56,8 +57,9 @@ deterministic byte-identical output. Every dynamic string through `esc()`.
 4. **Struggle areas**: up to 10 rows plus a "+N more files with minor
    signals" line. Columns: rank, file, score, breakdown in plain language
    ("rewrites x8, re-reads x4"). Top-3 rows emphasized and anchor-linked.
-   Footnote states the formula and the exact weights used (score = sum of
-   weight x evidence count per category).
+   Footnote states the formula and the exact weights used (score = weight x
+   count, low-confidence x{factor}, churn scaled by relative churn when known
+   [x0.5 to x2]).
 5. **File stories**: only for Needs-review files (0 to 3 boxes). Each box
    opens with the why (score + findings in plain language), then a compressed
    chronology: consecutive same-kind events collapse into runs
@@ -94,7 +96,7 @@ deterministic byte-identical output. Every dynamic string through `esc()`.
 - `active_duration(actions, cap) -> (active, span)`
 - Needs-review qualification (evidence floor) + reason-sentence builder with
   the fixed category vocabulary (churn=rewritten, re_read=re-read,
-  rework=reworked, failure_loop=failure loop, fumbles=blind-write attempt,
+  rework=reworked, failure_loop=looped failing command, fumbles=blind-write attempt,
   flip=flip, user_corrected=user-corrected)
 - Run compression for story events
 - Gap-glyph positions for the timeline

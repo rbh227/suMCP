@@ -201,12 +201,23 @@ pub struct ActiveSpan {
 
 /// Compute active/span durations over the session's action timestamps.
 /// `None` when no action has a parseable timestamp.
+///
+/// Actions are ordered by ingest on the RAW TIMESTAMP STRING (a locked SPEC
+/// contract; ingest itself is never reordered by parsed value). String order
+/// is lexicographic, so it matches chronological (UTC) order only when every
+/// timestamp shares the same numeric offset — a transcript that mixes "Z" and
+/// "-02:00" lines can have string order invert UTC order. Sorting the parsed
+/// seconds here (not relying on `s.actions`' string-sorted order) makes span
+/// and active-time computation robust to that: whatever order the strings
+/// happened to sort in, the durations reported are always the true elapsed
+/// time between the earliest and latest real timestamps.
 pub fn active_span(s: &Session, cap_secs: i64) -> Option<ActiveSpan> {
-    let times: Vec<i64> = s
+    let mut times: Vec<i64> = s
         .actions
         .iter()
         .filter_map(|a| ts_secs(&a.effective_ts))
         .collect();
+    times.sort_unstable();
     let (first, last) = (times.first()?, times.last()?);
     let span_secs = (last - first).max(0);
     let active_secs = times
@@ -296,5 +307,34 @@ mod tests {
         // empty session -> None
         let empty = crate::ingest::ingest_str("", crate::model::Lane::Main);
         assert!(active_span(&empty, ACTIVE_GAP_CAP_SECS).is_none());
+    }
+
+    #[test]
+    fn active_span_handles_mixed_offset_ordering() {
+        // Line 1 is "2026-01-01T00:00:00-02:00" (02:00 UTC), line 2 is
+        // "2026-01-01T00:30:00Z" (00:30 UTC). Ingest orders actions by raw
+        // timestamp STRING (locked contract), and "00:00:00-02:00" sorts
+        // before "00:30:00Z" lexicographically — so the action list is in
+        // the OPPOSITE order from real UTC time. Without sorting parsed
+        // seconds first, `active_span` would clamp the negative gap to 0 and
+        // report "active 0m (span 0m)" for a real 1h30m gap. True elapsed
+        // time is 5400s; one capped 300s gap.
+        let mk = |ts: &str, id: &str| {
+            format!(
+                r#"{{"type":"assistant","timestamp":"{ts}","message":{{"content":[{{"type":"tool_use","id":"{id}","name":"Read","input":{{"file_path":"/a"}}}}]}}}}"#
+            )
+        };
+        let raw = [
+            mk("2026-01-01T00:00:00-02:00", "a"),
+            mk("2026-01-01T00:30:00Z", "b"),
+        ]
+        .join("\n");
+        let s = crate::ingest::ingest_str(&raw, crate::model::Lane::Main);
+        // Sanity: ingest really did keep the string-inverted order.
+        assert_eq!(s.actions[0].effective_ts, "2026-01-01T00:00:00-02:00");
+        assert_eq!(s.actions[1].effective_ts, "2026-01-01T00:30:00Z");
+        let d = active_span(&s, ACTIVE_GAP_CAP_SECS).unwrap();
+        assert_eq!(d.span_secs, 5_400);
+        assert_eq!(d.active_secs, 300);
     }
 }

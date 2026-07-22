@@ -6,6 +6,7 @@
 
 use crate::model::{Finding, FindingKind};
 use crate::score::FileScore;
+use std::collections::BTreeMap;
 
 /// Categories in the order reasons list them: most alarming first. Fixed, so
 /// output is deterministic and independent of BTreeMap's alphabetical order.
@@ -25,62 +26,133 @@ pub fn category_phrase(category: &str, n: u64) -> String {
         "churn" => format!("rewritten {n}x"),
         "rework" => format!("reworked {n}x"),
         "re_read" => format!("re-read {n}x"),
-        "failure_loops" => format!("{n} failure loop{s}"),
+        "failure_loops" => format!("{n} looped failing command{s}"),
         "fumbles" => format!("{n} blind-write attempt{s}"),
         "action_loops" => format!("{n} repeated-call loop{s}"),
         other => format!("{other} {n}"),
     }
 }
 
-/// Does `all` contain a non-ranking high-signal finding (flip or
-/// user-correction) for this file? Those never enter `FileScore.findings`
-/// (they don't rank), so qualification has to look at the full finding list.
-fn has_flip_or_correction(all: &[Finding], file: &str) -> bool {
-    all.iter().any(|f| {
-        f.file.as_deref() == Some(file)
-            && matches!(f.kind, FindingKind::Flip | FindingKind::UserCorrected)
-    })
+/// One file that needs human eyes: every file-scoped finding about it, plus
+/// its ranked entry when the file also ranked. `ranked` is `None` when the
+/// file's only findings are non-ranking kinds (flip, user-correction,
+/// true-revert, large-write-instant-accept) that never enter `score::rank`.
+pub struct ReviewCandidate<'a> {
+    /// The file path.
+    pub file: String,
+    /// The file's ranked entry, if `score::rank` ranked it.
+    pub ranked: Option<&'a FileScore>,
+    /// Every file-scoped finding about this file (OpeningMove excluded: it's
+    /// per-segment information, not a review signal).
+    pub findings: Vec<&'a Finding>,
+}
+
+/// A single non-ranking finding kind that qualifies a file alone.
+fn is_solo_qualifying(kind: &FindingKind) -> bool {
+    matches!(
+        kind,
+        FindingKind::FailureLoop
+            | FindingKind::BlindWriteAttempt
+            | FindingKind::Flip
+            | FindingKind::UserCorrected
+    )
 }
 
 /// The evidence floor (grill decision, 2026-07-22): a file needs review when
-/// it has 2+ findings, or a single high-signal one (failure loop, blind-write
-/// attempt, flip, user-correction). Cap 3. Order follows `ranked`. Known,
-/// accepted edge: a file whose ONLY findings are non-ranking kinds (flip,
-/// user-correction) never enters `ranked` in the first place, so it cannot
-/// qualify no matter what `has_flip_or_correction` would say about it.
-pub fn needs_review<'a>(ranked: &'a [FileScore], all: &[Finding]) -> Vec<&'a FileScore> {
-    ranked
-        .iter()
-        .filter(|fs| {
-            let ranked_high = fs.findings.iter().any(|f| {
-                matches!(
-                    f.kind,
-                    FindingKind::FailureLoop | FindingKind::BlindWriteAttempt
-                )
+/// it has 2+ collected findings, or a single high-signal one (failure loop,
+/// blind-write attempt, flip, user-correction). Candidates are built from
+/// ALL file-scoped findings in `all` (not just the ones that made it into
+/// `score::rank`'s output), so files whose only findings are non-ranking
+/// kinds (flip, user-correction) can still qualify — `score::rank` excludes
+/// those kinds entirely, so looking only at `ranked` would silently drop
+/// them. Order: qualifying files in `ranked` order first, then qualifying
+/// unranked files by path (BTreeMap order). Cap 3.
+pub fn needs_review<'a>(ranked: &'a [FileScore], all: &'a [Finding]) -> Vec<ReviewCandidate<'a>> {
+    let mut by_file: BTreeMap<&str, Vec<&Finding>> = BTreeMap::new();
+    for f in all {
+        if f.kind == FindingKind::OpeningMove {
+            continue; // per-segment information, not a review signal
+        }
+        if let Some(file) = f.file.as_deref() {
+            by_file.entry(file).or_default().push(f);
+        }
+    }
+
+    let qualifies = |findings: &[&Finding]| {
+        findings.len() >= 2 || findings.iter().any(|f| is_solo_qualifying(&f.kind))
+    };
+
+    let mut out: Vec<ReviewCandidate<'a>> = Vec::new();
+    let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+
+    for fs in ranked {
+        let file = fs.file.as_str();
+        if let Some(findings) = by_file.get(file)
+            && qualifies(findings)
+        {
+            out.push(ReviewCandidate {
+                file: fs.file.clone(),
+                ranked: Some(fs),
+                findings: findings.clone(),
             });
-            fs.findings.len() >= 2 || ranked_high || has_flip_or_correction(all, &fs.file)
-        })
-        .take(3)
-        .collect()
+            seen.insert(file);
+        }
+    }
+    for (file, findings) in &by_file {
+        if seen.contains(file) {
+            continue;
+        }
+        if qualifies(findings) {
+            out.push(ReviewCandidate {
+                file: (*file).to_string(),
+                ranked: None,
+                findings: findings.clone(),
+            });
+        }
+    }
+    out.truncate(3);
+    out
 }
 
-/// One strictly descriptive sentence for a file: category phrases in severity
-/// order, then flip/user-correction markers when present.
-pub fn reason_sentence(fs: &FileScore, all: &[Finding]) -> String {
-    let mut parts: Vec<String> = SEVERITY_ORDER
-        .iter()
-        .filter_map(|cat| fs.breakdown.get(*cat).map(|n| category_phrase(cat, *n)))
-        .collect();
-    if all
-        .iter()
-        .any(|f| f.file.as_deref() == Some(fs.file.as_str()) && f.kind == FindingKind::Flip)
-    {
-        parts.push("flipped after pushback".into());
+/// One strictly descriptive sentence for a candidate: when ranked, category
+/// phrases in severity order first; then phrases for non-ranking kinds
+/// present in its findings, each rendered once with its count.
+pub fn reason_sentence(c: &ReviewCandidate) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(fs) = c.ranked {
+        parts.extend(
+            SEVERITY_ORDER
+                .iter()
+                .filter_map(|cat| fs.breakdown.get(*cat).map(|n| category_phrase(cat, *n))),
+        );
     }
-    if all.iter().any(|f| {
-        f.file.as_deref() == Some(fs.file.as_str()) && f.kind == FindingKind::UserCorrected
-    }) {
-        parts.push("user-corrected".into());
+    let count_of =
+        |kind: &FindingKind| c.findings.iter().filter(|f| &f.kind == kind).count() as u64;
+
+    let flip_n = count_of(&FindingKind::Flip);
+    if flip_n > 0 {
+        parts.push(if flip_n > 1 {
+            format!("flipped after pushback {flip_n}x")
+        } else {
+            "flipped after pushback".into()
+        });
+    }
+    let uc_n = count_of(&FindingKind::UserCorrected);
+    if uc_n > 0 {
+        parts.push(if uc_n > 1 {
+            format!("user-corrected {uc_n}x")
+        } else {
+            "user-corrected".into()
+        });
+    }
+    let tr_n = count_of(&FindingKind::TrueRevert);
+    if tr_n > 0 {
+        parts.push(format!("self-reverted {tr_n}x"));
+    }
+    let lw_n = count_of(&FindingKind::LargeWriteInstantAccept);
+    if lw_n > 0 {
+        let s = if lw_n == 1 { "" } else { "s" };
+        parts.push(format!("{lw_n} large write{s} accepted instantly"));
     }
     parts.join(", ")
 }
@@ -105,99 +177,125 @@ mod tests {
         }
     }
 
-    fn fs(file: &str, findings: Vec<Finding>, breakdown: &[(&str, u64)]) -> FileScore {
+    fn fs(file: &str, breakdown: &[(&str, u64)]) -> FileScore {
         FileScore {
             file: file.into(),
             score: 1.0,
             breakdown: breakdown.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
-            findings,
+            findings: Vec::new(),
         }
     }
 
     #[test]
     fn two_findings_meet_the_floor_one_does_not() {
-        let yes = fs(
-            "/a.rs",
-            vec![
-                finding(FindingKind::Churn, "/a.rs"),
-                finding(FindingKind::ReRead, "/a.rs"),
-            ],
-            &[("churn", 4), ("re_read", 2)],
-        );
-        let no = fs(
-            "/b.rs",
-            vec![finding(FindingKind::Churn, "/b.rs")],
-            &[("churn", 2)],
-        );
+        let yes = fs("/a.rs", &[("churn", 4), ("re_read", 2)]);
+        let no = fs("/b.rs", &[("churn", 2)]);
         let ranked = vec![yes, no];
-        let picked = needs_review(&ranked, &[]);
+        let all = vec![
+            finding(FindingKind::Churn, "/a.rs"),
+            finding(FindingKind::ReRead, "/a.rs"),
+            finding(FindingKind::Churn, "/b.rs"),
+        ];
+        let picked = needs_review(&ranked, &all);
         assert_eq!(picked.len(), 1);
         assert_eq!(picked[0].file, "/a.rs");
     }
 
     #[test]
     fn one_high_signal_finding_qualifies_alone() {
-        let loop_file = fs(
-            "/c.rs",
-            vec![finding(FindingKind::FailureLoop, "/c.rs")],
-            &[("failure_loops", 3)],
-        );
+        let loop_file = fs("/c.rs", &[("failure_loops", 3)]);
         let ranked = vec![loop_file];
-        assert_eq!(needs_review(&ranked, &[]).len(), 1);
+        let all = vec![finding(FindingKind::FailureLoop, "/c.rs")];
+        assert_eq!(needs_review(&ranked, &all).len(), 1);
     }
 
     #[test]
     fn nonranking_flip_qualifies_via_all_findings() {
         // Flip findings never enter FileScore.findings (they don't rank), so
         // qualification must see them through `all`.
-        let churn_only = fs(
-            "/d.rs",
-            vec![finding(FindingKind::Churn, "/d.rs")],
-            &[("churn", 2)],
-        );
-        let all = vec![finding(FindingKind::Flip, "/d.rs")];
+        let churn_only = fs("/d.rs", &[("churn", 2)]);
+        let all = vec![
+            finding(FindingKind::Churn, "/d.rs"),
+            finding(FindingKind::Flip, "/d.rs"),
+        ];
         let ranked = vec![churn_only];
         assert_eq!(needs_review(&ranked, &all).len(), 1);
     }
 
     #[test]
+    fn sole_user_corrected_file_qualifies() {
+        // No ranked entry at all; a single UserCorrected finding is a
+        // solo-qualifying kind, so the file must appear as an unranked
+        // candidate.
+        let all = vec![finding(FindingKind::UserCorrected, "/x.rs")];
+        let picked = needs_review(&[], &all);
+        assert_eq!(picked.len(), 1);
+        assert_eq!(picked[0].file, "/x.rs");
+        assert!(picked[0].ranked.is_none());
+        assert_eq!(reason_sentence(&picked[0]), "user-corrected");
+    }
+
+    #[test]
+    fn two_nonranking_findings_qualify() {
+        let all = vec![
+            finding(FindingKind::TrueRevert, "/y.rs"),
+            finding(FindingKind::Flip, "/y.rs"),
+        ];
+        let picked = needs_review(&[], &all);
+        assert_eq!(picked.len(), 1);
+        let reason = reason_sentence(&picked[0]);
+        assert!(reason.contains("flipped after pushback"), "{reason}");
+        assert!(reason.contains("self-reverted 1x"), "{reason}");
+    }
+
+    #[test]
     fn cap_is_three() {
-        let mk = |i: usize| {
-            fs(
-                &format!("/f{i}.rs"),
-                vec![
-                    finding(FindingKind::Churn, &format!("/f{i}.rs")),
-                    finding(FindingKind::ReRead, &format!("/f{i}.rs")),
-                ],
-                &[("churn", 3), ("re_read", 2)],
-            )
-        };
+        let mk = |i: usize| fs(&format!("/f{i}.rs"), &[("churn", 3), ("re_read", 2)]);
         let ranked: Vec<FileScore> = (0..5).map(mk).collect();
-        assert_eq!(needs_review(&ranked, &[]).len(), 3);
+        let all: Vec<Finding> = (0..5)
+            .flat_map(|i| {
+                let file = format!("/f{i}.rs");
+                vec![
+                    finding(FindingKind::Churn, &file),
+                    finding(FindingKind::ReRead, &file),
+                ]
+            })
+            .collect();
+        assert_eq!(needs_review(&ranked, &all).len(), 3);
     }
 
     #[test]
     fn reason_sentence_uses_fixed_vocabulary_in_severity_order() {
         let f = fs(
             "/a.rs",
-            vec![],
             &[("churn", 8), ("re_read", 4), ("failure_loops", 1)],
         );
+        let all = [finding(FindingKind::FailureLoop, "/a.rs")];
+        let c = ReviewCandidate {
+            file: f.file.clone(),
+            ranked: Some(&f),
+            findings: all.iter().collect(),
+        };
         assert_eq!(
-            reason_sentence(&f, &[]),
-            "1 failure loop, rewritten 8x, re-read 4x"
+            reason_sentence(&c),
+            "1 looped failing command, rewritten 8x, re-read 4x"
         );
     }
 
     #[test]
     fn reason_sentence_appends_flip_and_user_corrected() {
-        let f = fs("/a.rs", vec![], &[("churn", 2)]);
-        let all = vec![
+        let f = fs("/a.rs", &[("churn", 2)]);
+        let all = [
             finding(FindingKind::Flip, "/a.rs"),
             finding(FindingKind::UserCorrected, "/a.rs"),
         ];
+        let c = ReviewCandidate {
+            file: f.file.clone(),
+            ranked: Some(&f),
+            findings: all.iter().collect(),
+        };
         assert_eq!(
-            reason_sentence(&f, &all),
+            reason_sentence(&c),
             "rewritten 2x, flipped after pushback, user-corrected"
         );
     }
@@ -236,8 +334,14 @@ mod tests {
 
     #[test]
     fn category_phrase_pluralizes() {
-        assert_eq!(category_phrase("failure_loops", 1), "1 failure loop");
-        assert_eq!(category_phrase("failure_loops", 2), "2 failure loops");
+        assert_eq!(
+            category_phrase("failure_loops", 1),
+            "1 looped failing command"
+        );
+        assert_eq!(
+            category_phrase("failure_loops", 2),
+            "2 looped failing commands"
+        );
         assert_eq!(category_phrase("fumbles", 1), "1 blind-write attempt");
         assert_eq!(category_phrase("churn", 3), "rewritten 3x");
         // unknown categories fall back to raw "name n" rather than panicking

@@ -31,7 +31,7 @@ fn esc(raw: &str) -> String {
 /// evidence collapsible whose idxs it overlaps and scrolls to it.
 fn inline_js() -> &'static str {
     "document.addEventListener('DOMContentLoaded',function(){\
-       document.querySelectorAll('.band').forEach(function(b){\
+       document.querySelectorAll('.band.linked').forEach(function(b){\
          b.addEventListener('click',function(){\
            var want=(b.getAttribute('data-idxs')||'').split(',')[0];\
            var hit=[].find.call(document.querySelectorAll('details.ev'),function(d){\
@@ -65,9 +65,9 @@ pub fn render_html(
     h.push_str(&header_band(s, meta));
     h.push_str(&facts_strip(&o, s));
     h.push_str(&needs_review_section(&review, &all, ranked, s)); // Task 5
-    h.push_str(&timeline_section(s, ranked)); // Task 6
+    h.push_str(&timeline_section(s, ranked, &review)); // Task 6
     h.push_str(&struggles_section(ranked, weights, &review)); // Task 7
-    h.push_str(&file_stories_section(s, &review, &all, meta)); // Task 8
+    h.push_str(&file_stories_section(s, &review, meta)); // Task 8
     h.push_str(&blind_spots_section(s, meta)); // Task 8
     h.push_str(&status_bar(s, &o));
     let _ = write!(h, "</div><script>{}</script></body></html>", inline_js());
@@ -121,8 +121,9 @@ fn base_css() -> &'static str {
        background:var(--navy)}\
      .tick-err{background:var(--red);width:3px}\
      .band{position:absolute;top:5px;height:12px;\
-       background:rgba(0,0,128,.12);border:1px solid var(--navy);\
-       cursor:pointer}\
+       background:rgba(0,0,128,.12);border:1px dashed var(--navy);\
+       cursor:default}\
+     .band.linked{border-style:solid;cursor:pointer}\
      .rules{pointer-events:none}\
      .urule{position:absolute;top:0;bottom:0;width:1px;\
        background:var(--line);pointer-events:auto}\
@@ -280,7 +281,7 @@ fn status_bar(s: &Session, o: &crate::report::Overview) -> String {
 /// The lead section: which files need eyes, and why — or an explicit calm
 /// state. Reasons are strictly descriptive (grill decision 2026-07-22).
 fn needs_review_section(
-    review: &[&FileScore],
+    review: &[crate::review::ReviewCandidate],
     all: &[crate::model::Finding],
     ranked: &[FileScore],
     s: &Session,
@@ -310,14 +311,14 @@ fn needs_review_section(
     }
     let _ = s; // session reserved for future per-row context
     let mut rows = String::new();
-    for (i, fs) in review.iter().enumerate() {
+    for (i, c) in review.iter().enumerate() {
         let _ = write!(
             rows,
             "<div class=\"nr\"><span class=\"mono\">{file}</span>\
              <span class=\"why\">{why}</span>\
              <a href=\"#story-{n}\">story</a></div>",
-            file = esc(&fs.file),
-            why = esc(&crate::review::reason_sentence(fs, all)),
+            file = esc(&c.file),
+            why = esc(&crate::review::reason_sentence(c)),
             n = i + 1,
         );
     }
@@ -327,7 +328,11 @@ fn needs_review_section(
 /// The timeline centerpiece: action ticks in Read/Edit/Bash lanes, finding
 /// bands overlaid, user turns as vertical rules. Pure positioned divs so it
 /// prints and works with JS disabled.
-fn timeline_section(s: &Session, ranked: &[FileScore]) -> String {
+fn timeline_section(
+    s: &Session,
+    ranked: &[FileScore],
+    review: &[crate::review::ReviewCandidate],
+) -> String {
     use crate::model::ActionKind;
     let n = s.actions.len();
     if n == 0 {
@@ -344,29 +349,38 @@ fn timeline_section(s: &Session, ranked: &[FileScore]) -> String {
     };
 
     // Finding bands: one per ranking finding that has idxs, spanning min..max.
+    // Only files that qualified as review candidates have an evidence
+    // collapsible to jump to, so only their bands are clickable (Fix 2:
+    // the rest render but stay honestly inert).
+    let candidate_files: std::collections::BTreeSet<&str> =
+        review.iter().map(|c| c.file.as_str()).collect();
     let mut bands = String::new();
-    for f in ranked.iter().flat_map(|fs| &fs.findings) {
-        if f.idxs.is_empty() {
-            continue;
+    for fs in ranked {
+        let linked = candidate_files.contains(fs.file.as_str());
+        let class = if linked { "band linked" } else { "band" };
+        for f in &fs.findings {
+            if f.idxs.is_empty() {
+                continue;
+            }
+            let lo = f.idxs.iter().map(|i| i.0 as usize).min().unwrap();
+            let hi = f.idxs.iter().map(|i| i.0 as usize).max().unwrap();
+            let idxs_attr = f
+                .idxs
+                .iter()
+                .map(|i| i.0.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            let kind = format!("{:?}", f.kind);
+            let _ = write!(
+                bands,
+                "<div class=\"{class}\" style=\"left:{:.2}%;width:{:.2}%\" \
+                 data-idxs=\"{}\" title=\"{}\"></div>",
+                x(lo),
+                (x(hi) - x(lo)).max(0.6),
+                esc(&idxs_attr),
+                esc(&kind),
+            );
         }
-        let lo = f.idxs.iter().map(|i| i.0 as usize).min().unwrap();
-        let hi = f.idxs.iter().map(|i| i.0 as usize).max().unwrap();
-        let idxs_attr = f
-            .idxs
-            .iter()
-            .map(|i| i.0.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
-        let kind = format!("{:?}", f.kind);
-        let _ = write!(
-            bands,
-            "<div class=\"band\" style=\"left:{:.2}%;width:{:.2}%\" \
-             data-idxs=\"{}\" title=\"{}\"></div>",
-            x(lo),
-            (x(hi) - x(lo)).max(0.6),
-            esc(&idxs_attr),
-            esc(&kind),
-        );
     }
 
     // Lane ticks.
@@ -460,7 +474,7 @@ fn timeline_section(s: &Session, ranked: &[FileScore]) -> String {
         "<div class=\"legend\">\
         <span><i class=\"sw sw-tick\"></i>action</span>\
         <span><i class=\"sw sw-err\"></i>error</span>\
-        <span><i class=\"sw sw-band\"></i>finding span (click for evidence)</span>\
+        <span><i class=\"sw sw-band\"></i>finding span (solid: click for evidence)</span>\
         <span><i class=\"sw sw-turn\"></i>your turn (hover for prompt)</span>\
         <span><i class=\"sw sw-gap\"></i>gap &gt; {} min</span>\
         <span>x = action sequence, not time</span></div>",
@@ -486,15 +500,18 @@ fn timeline_section(s: &Session, ranked: &[FileScore]) -> String {
 /// Ranked files: cap 10, plain-language breakdown, top-3 emphasized and
 /// linked to their stories, formula + exact weights footnoted (the
 /// transparency promise in SPEC decision 6).
-fn struggles_section(ranked: &[FileScore], weights: &Weights, review: &[&FileScore]) -> String {
+fn struggles_section(
+    ranked: &[FileScore],
+    weights: &Weights,
+    review: &[crate::review::ReviewCandidate],
+) -> String {
     if ranked.is_empty() {
         return "<section class=\"sec\"><h2>Struggle areas</h2>\
              <p class=\"calm\">No struggle signals fired.</p></section>"
             .to_string();
     }
-    let story_anchor = |file: &str| -> Option<usize> {
-        review.iter().position(|fs| fs.file == file).map(|i| i + 1)
-    };
+    let story_anchor =
+        |file: &str| -> Option<usize> { review.iter().position(|c| c.file == file).map(|i| i + 1) };
     let mut rows = String::new();
     for (i, f) in ranked.iter().take(10).enumerate() {
         let phrases: Vec<String> = crate::review::SEVERITY_ORDER
@@ -530,7 +547,8 @@ fn struggles_section(ranked: &[FileScore], weights: &Weights, review: &[&FileSco
         String::new()
     };
     let footnote = format!(
-        "<p class=\"foot\">score = weight x count, low-confidence x{lcf} · \
+        "<p class=\"foot\">score = weight x count, low-confidence x{lcf}, \
+         churn scaled by relative churn when known (x0.5 to x2) · \
          weights: rewrites {c} · rework {rw} · failure loops {fl} · \
          re-reads {rr} · blind-writes {fu} · loops {al} ({src})</p>",
         lcf = weights.low_confidence_factor,
@@ -550,13 +568,16 @@ fn struggles_section(ranked: &[FileScore], weights: &Weights, review: &[&FileSco
     )
 }
 
-/// One rendered story row: either a single event or a compressed run of 3+
-/// consecutive same-kind, non-failing events.
+/// One rendered story row: either a single event, a compressed run of 3+
+/// consecutive same-kind non-failing events, or an "elided middle" marker
+/// (also a single event under the hood, `outcome == "elided"`; `count`
+/// carries how many events it stands for).
 enum StoryRow {
     One {
         idx: u64,
         action: String,
         outcome: String,
+        count: Option<u64>,
     },
     Run {
         action: String,
@@ -566,30 +587,33 @@ enum StoryRow {
     },
 }
 
-/// Collapse consecutive same-action, same-outcome events (never failures)
-/// into runs of 3 or more. Pure; unit-testable via the rendered HTML.
+/// Collapse consecutive same-action, same-outcome events (never failures,
+/// never the elided marker — its synthetic `__elided__` action never matches
+/// a real neighbor) into runs of 3 or more. Pure; unit-testable via the
+/// rendered HTML.
 fn compress_runs(events: &[serde_json::Value]) -> Vec<StoryRow> {
     let get = |v: &serde_json::Value| {
         (
             v["idx"].as_u64().unwrap_or(0),
             v["action"].as_str().unwrap_or("").to_string(),
             v["outcome"].as_str().unwrap_or("n/a").to_string(),
+            v["count"].as_u64(),
         )
     };
     let mut out = Vec::new();
     let mut i = 0;
     while i < events.len() {
-        let (idx, action, outcome) = get(&events[i]);
+        let (idx, action, outcome, _) = get(&events[i]);
         let mut j = i + 1;
         while j < events.len() && outcome != "fail" {
-            let (_, a2, o2) = get(&events[j]);
+            let (_, a2, o2, _) = get(&events[j]);
             if a2 != action || o2 != outcome {
                 break;
             }
             j += 1;
         }
         if j - i >= 3 {
-            let (last, _, _) = get(&events[j - 1]);
+            let (last, _, _, _) = get(&events[j - 1]);
             out.push(StoryRow::Run {
                 action,
                 first: idx,
@@ -598,11 +622,12 @@ fn compress_runs(events: &[serde_json::Value]) -> Vec<StoryRow> {
             });
         } else {
             for v in &events[i..j] {
-                let (idx, action, outcome) = get(v);
+                let (idx, action, outcome, count) = get(v);
                 out.push(StoryRow::One {
                     idx,
                     action,
                     outcome,
+                    count,
                 });
             }
         }
@@ -611,7 +636,8 @@ fn compress_runs(events: &[serde_json::Value]) -> Vec<StoryRow> {
     out
 }
 
-/// Render story rows; failing events show their redacted error excerpt.
+/// Render story rows; failing events show their redacted error excerpt, the
+/// elided marker renders its own "N events elided" line.
 fn story_rows_html(s: &Session, rows: &[StoryRow]) -> String {
     let mut out = String::new();
     for row in rows {
@@ -635,8 +661,15 @@ fn story_rows_html(s: &Session, rows: &[StoryRow]) -> String {
                 idx,
                 action,
                 outcome,
+                count,
             } => {
-                if outcome == "fail" {
+                if outcome == "elided" {
+                    let _ = write!(
+                        out,
+                        "<li class=\"run\">… {} events elided …</li>",
+                        count.unwrap_or(0)
+                    );
+                } else if outcome == "fail" {
                     let err = s
                         .actions
                         .get(*idx as usize)
@@ -660,6 +693,20 @@ fn story_rows_html(s: &Session, rows: &[StoryRow]) -> String {
     out
 }
 
+/// Mirror of `payloads::kind_str` (private to that module): the action-name
+/// string used to render an attributed Bash failure the same way a real
+/// `file_story` event would.
+fn action_kind_str(k: &crate::model::ActionKind) -> String {
+    use crate::model::ActionKind;
+    match k {
+        ActionKind::Read => "Read".into(),
+        ActionKind::Edit => "Edit".into(),
+        ActionKind::Write => "Write".into(),
+        ActionKind::Bash => "Bash".into(),
+        ActionKind::Other(n) => n.clone(),
+    }
+}
+
 /// The needs-review files, each opening with its plain-language "why", a
 /// run-compressed chronological story, any repeated failing command behind a
 /// failure loop, and the evidence for its findings nested inside. Iterates
@@ -667,30 +714,76 @@ fn story_rows_html(s: &Session, rows: &[StoryRow]) -> String {
 /// (1-based) so the needs-review rows and struggle-table links can jump here.
 fn file_stories_section(
     s: &Session,
-    review: &[&FileScore],
-    all: &[crate::model::Finding],
+    review: &[crate::review::ReviewCandidate],
     meta: &SessionMeta,
 ) -> String {
     use crate::model::FindingKind;
     let mut out = String::new();
-    for (i, fs) in review.iter().enumerate() {
-        let p = crate::payloads::file_story(s, &fs.file, meta);
+    for (i, c) in review.iter().enumerate() {
+        let p = crate::payloads::file_story(s, &c.file, meta);
         let empty = Vec::new();
-        let head = p["events"].as_array().unwrap_or(&empty);
-        let tail = p["tail"].as_array().unwrap_or(&empty);
-        let mut body = String::from("<ol class=\"story\">");
-        body.push_str(&story_rows_html(s, &compress_runs(head)));
-        if let Some(elided) = p.get("elided").filter(|v| !v.is_null()) {
-            let _ = write!(
-                body,
-                "<li class=\"run\">… {} events elided …</li>",
-                elided["count"].as_u64().unwrap_or(0)
-            );
+        let head: Vec<serde_json::Value> = p["events"].as_array().unwrap_or(&empty).clone();
+        let tail: Vec<serde_json::Value> = p["tail"].as_array().unwrap_or(&empty).clone();
+
+        // Merge in attributed failing Bash commands from this file's
+        // FailureLoop findings. `payloads::file_story` filters strictly by
+        // `file_path`, and Bash actions never carry one — attribution lives
+        // only in the finding's idxs — so without this merge those failures
+        // never reach the chronology (Fix 5). `payloads.rs` itself stays
+        // untouched: this is HTML-layer-only stitching of two already-frozen
+        // payloads (`file_story`'s events, `struggle_areas`'s findings).
+        let mut present: std::collections::BTreeSet<u64> = head
+            .iter()
+            .chain(tail.iter())
+            .filter_map(|v| v["idx"].as_u64())
+            .collect();
+        let mut merged: Vec<serde_json::Value> = head.iter().chain(tail.iter()).cloned().collect();
+        for f in c
+            .findings
+            .iter()
+            .filter(|f| f.kind == FindingKind::FailureLoop)
+        {
+            for idx in &f.idxs {
+                let idx_u64 = idx.0 as u64;
+                if present.contains(&idx_u64) {
+                    continue;
+                }
+                if let Some(a) = s.actions.get(idx.0 as usize) {
+                    merged.push(serde_json::json!({
+                        "idx": idx_u64,
+                        "action": action_kind_str(&a.kind),
+                        "outcome": "fail",
+                    }));
+                    present.insert(idx_u64);
+                }
+            }
         }
-        body.push_str(&story_rows_html(s, &compress_runs(tail)));
+        // The elided-middle marker (if any) sorts right after the last head
+        // event, before any tail or attributed-failure event.
+        if let Some(elided) = p.get("elided").filter(|v| !v.is_null()) {
+            let last_head_idx = head.last().and_then(|v| v["idx"].as_u64()).unwrap_or(0);
+            merged.push(serde_json::json!({
+                "idx": last_head_idx + 1,
+                "action": "__elided__",
+                "outcome": "elided",
+                "count": elided["count"].as_u64().unwrap_or(0),
+            }));
+        }
+        // Sort by idx; on a tie the elided marker sorts first (secondary key
+        // 0 vs 1), matching the design: a marker never loses its place to a
+        // same-idx event.
+        merged.sort_by_key(|v| {
+            let idx = v["idx"].as_u64().unwrap_or(0);
+            let is_marker = v["outcome"].as_str() == Some("elided");
+            (idx, if is_marker { 0u8 } else { 1u8 })
+        });
+        merged.dedup_by_key(|v| v["idx"].as_u64().unwrap_or(0));
+
+        let mut body = String::from("<ol class=\"story\">");
+        body.push_str(&story_rows_html(s, &compress_runs(&merged)));
         body.push_str("</ol>");
         // The repeated failing command behind any failure loop, verbatim.
-        for f in fs
+        for f in c
             .findings
             .iter()
             .filter(|f| f.kind == FindingKind::FailureLoop)
@@ -711,21 +804,24 @@ fn file_stories_section(
                 );
             }
         }
-        let idxs: Vec<crate::model::Idx> = fs
+        let idxs: Vec<crate::model::Idx> = c
             .findings
             .iter()
             .flat_map(|f| f.idxs.iter().copied())
             .collect();
         body.push_str(&evidence_details(s, &idxs, meta));
+        let why = crate::review::reason_sentence(c);
+        let why_line = match c.ranked {
+            Some(fs) => format!("score {:.1} · {}", fs.score, esc(&why)),
+            None => esc(&why),
+        };
         let _ = write!(
             out,
             "<div class=\"story-box\" id=\"story-{n}\">\
              <h3 class=\"mono\">{file}</h3>\
-             <p class=\"why\">score {score:.1} · {why}</p>{body}</div>",
+             <p class=\"why\">{why_line}</p>{body}</div>",
             n = i + 1,
-            file = esc(&fs.file),
-            score = fs.score,
-            why = esc(&crate::review::reason_sentence(fs, all)),
+            file = esc(&c.file),
         );
     }
     if out.is_empty() {
@@ -1122,6 +1218,10 @@ mod tests {
             html.contains("score = weight x count"),
             "formula footnote present"
         );
+        assert!(
+            html.contains("relative churn"),
+            "Fix 4: footnote must disclose the churn-scaling clause"
+        );
         assert!(html.contains("rework 3"), "actual weights echoed");
     }
 
@@ -1286,6 +1386,138 @@ mod tests {
             html.contains("rewritten 6x"),
             "story box opens with its why"
         );
+    }
+
+    #[test]
+    fn user_corrected_edit_reaches_needs_review() {
+        // A single Edit whose tool_result carries `userModified: true` fires
+        // a UserCorrected finding -- a non-ranking kind that `score::rank`
+        // never includes (it doesn't contribute to any `FileScore`). Fix 1:
+        // `needs_review` must still surface it: it's a solo-qualifying kind,
+        // so the file appears as an unranked candidate.
+        let raw = concat!(
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"tool_use","id":"e1","name":"Edit","input":{"file_path":"/a.ts","new_string":"x"}}]}}"#,
+            "\n",
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:01Z","message":{"content":[{"type":"tool_result","tool_use_id":"e1","is_error":false}]},"toolUseResult":{"userModified":true}}"#,
+        );
+        let html = render(raw);
+        let start = html.find("Needs review").expect("needs review section");
+        let end = html[start..]
+            .find("</section>")
+            .map(|i| start + i)
+            .unwrap_or(html.len());
+        let section = &html[start..end];
+        assert!(section.contains("/a.ts"), "file not listed: {section}");
+        assert!(
+            section.contains("user-corrected"),
+            "reason missing: {section}"
+        );
+        assert!(
+            !section.contains("No struggle signals"),
+            "falsely claimed calm: {section}"
+        );
+    }
+
+    #[test]
+    fn below_floor_band_is_not_clickable() {
+        // 6 edits to one file with DISTINCT new_string values: churn fires
+        // and ranks (a band is drawn), but nothing meets the needs-review
+        // evidence floor, so there's no evidence collapsible for the band to
+        // open. Fix 2: it must render dashed/unclickable, never solid.
+        let mut lines = Vec::new();
+        for i in 0..6 {
+            lines.push(format!(
+                r#"{{"type":"assistant","timestamp":"2026-01-01T00:00:0{i}Z","message":{{"content":[{{"type":"tool_use","id":"e{i}","name":"Edit","input":{{"file_path":"/a.ts","new_string":"x{i}"}}}}]}}}}"#
+            ));
+        }
+        let html = render(&lines.join("\n"));
+        assert!(html.contains("class=\"band\""), "no unlinked band rendered");
+        assert!(
+            !html.contains("class=\"band linked\""),
+            "band should not be linked when below the review floor"
+        );
+        assert!(
+            !html.contains("<details"),
+            "nothing qualifies for review, so no evidence collapsible should \
+             exist for the band to link to: {html}"
+        );
+    }
+
+    #[test]
+    fn review_band_links_to_evidence() {
+        // 3 reads + 6 identical edits -> qualifies for review (churn +
+        // re_read). Fix 2: its band must be linked/clickable, and its first
+        // idx must appear in some evidence collapsible's data-idxs.
+        let mut lines = Vec::new();
+        for i in 0..3 {
+            lines.push(format!(
+                r#"{{"type":"assistant","timestamp":"2026-01-01T00:00:0{i}Z","message":{{"content":[{{"type":"tool_use","id":"r{i}","name":"Read","input":{{"file_path":"/a.ts"}}}}]}}}}"#
+            ));
+        }
+        for i in 0..6 {
+            lines.push(format!(
+                r#"{{"type":"assistant","timestamp":"2026-01-01T00:01:0{i}Z","message":{{"content":[{{"type":"tool_use","id":"e{i}","name":"Edit","input":{{"file_path":"/a.ts","new_string":"x"}}}}]}}}}"#
+            ));
+        }
+        let html = render(&lines.join("\n"));
+        let band_pos = html
+            .find("class=\"band linked\"")
+            .expect("no linked band rendered");
+        let band_html = &html[band_pos..];
+        let idxs_attr = band_html
+            .split("data-idxs=\"")
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap();
+        let first_idx = idxs_attr.split(',').next().unwrap();
+        assert!(!first_idx.is_empty(), "band should carry at least one idx");
+        let found = html
+            .match_indices("<details class=\"ev\" data-idxs=\"")
+            .any(|(pos, m)| {
+                let after = &html[pos + m.len()..];
+                let attr = after.split('"').next().unwrap();
+                attr.split(',').any(|x| x == first_idx)
+            });
+        assert!(
+            found,
+            "band's first idx {first_idx} not found in any evidence \
+             collapsible: {html}"
+        );
+    }
+
+    #[test]
+    fn attributed_bash_failures_render_inline() {
+        // Edit /a.ts, then two failing Bash commands whose stderr names the
+        // file (the failures.rs path-match attribution chain) -> a
+        // FailureLoop finding attributed to /a.ts. `payloads::file_story`
+        // filters strictly by `file_path`, and Bash actions never carry one,
+        // so without the Fix 5 merge these two failures would never reach
+        // the chronology.
+        let raw = concat!(
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"tool_use","id":"e","name":"Edit","input":{"file_path":"/a.ts","new_string":"x"}}]}}"#,
+            "\n",
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:01Z","message":{"content":[{"type":"tool_use","id":"b1","name":"Bash","input":{"command":"npm test"}}]}}"#,
+            "\n",
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:02Z","message":{"content":[{"type":"tool_result","tool_use_id":"b1","is_error":true,"content":"Exit code 1"}]},"toolUseResult":{"stderr":"TypeError at /a.ts:10"}}"#,
+            "\n",
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:03Z","message":{"content":[{"type":"tool_use","id":"b2","name":"Bash","input":{"command":"npm test"}}]}}"#,
+            "\n",
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:04Z","message":{"content":[{"type":"tool_result","tool_use_id":"b2","is_error":true,"content":"Exit code 1"}]},"toolUseResult":{"stderr":"TypeError at /a.ts:11"}}"#,
+        );
+        let html = render(raw);
+        assert!(
+            html.contains("id=\"story-1\""),
+            "FailureLoop is a solo-qualifying kind, /a.ts should get a story box"
+        );
+        let fail_count = html.matches("class=\"fail\"").count();
+        assert_eq!(
+            fail_count, 2,
+            "expected the two attributed Bash failures inline: {html}"
+        );
+        assert!(html.contains("· Bash ·"), "action name Bash not shown");
+        assert!(html.contains("class=\"exc\""), "no rendered error excerpt");
     }
 
     #[test]
