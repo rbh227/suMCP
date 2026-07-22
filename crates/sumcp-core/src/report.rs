@@ -111,6 +111,81 @@ impl Overview {
     }
 }
 
+/// Gaps between consecutive actions longer than this are counted at the cap
+/// when summing "active" time (a session left open over lunch is not 3h of
+/// work). A documented constant, not a Weights field: it shapes display,
+/// never ranking, so it must not appear in the weights payload echo.
+pub const ACTIVE_GAP_CAP_SECS: i64 = 300;
+
+/// Parse an ISO-8601 timestamp ("2026-01-01T10:00:00Z", fractional seconds
+/// and numeric offsets tolerated) into Unix seconds. Dependency-free by
+/// design (core's budget is serde-only): date math is Howard Hinnant's
+/// days-from-civil algorithm. Returns `None` on anything malformed — callers
+/// treat unparseable time as absent, never as an error.
+pub fn ts_secs(ts: &str) -> Option<i64> {
+    let b = ts.as_bytes();
+    if b.len() < 19
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || b[10] != b'T'
+        || b[13] != b':'
+        || b[16] != b':'
+    {
+        return None;
+    }
+    let num = |r: std::ops::Range<usize>| -> Option<i64> { ts.get(r)?.parse().ok() };
+    let (y, mo, d) = (num(0..4)?, num(5..7)?, num(8..10)?);
+    let (h, mi, sec) = (num(11..13)?, num(14..16)?, num(17..19)?);
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) {
+        return None;
+    }
+    let (y2, mo2) = if mo <= 2 { (y - 1, mo + 12) } else { (y, mo) };
+    let era = y2.div_euclid(400);
+    let yoe = y2 - era * 400;
+    let doy = (153 * (mo2 - 3) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    let mut secs = days * 86_400 + h * 3_600 + mi * 60 + sec;
+    // After seconds: optional ".fff", then "Z" or "+HH:MM"/"-HH:MM".
+    let rest = &ts[19..];
+    let off = rest.trim_start_matches(|c: char| c == '.' || c.is_ascii_digit());
+    if let Some(sign @ ('+' | '-')) = off.chars().next() {
+        let oh: i64 = off.get(1..3)?.parse().ok()?;
+        let om: i64 = off.get(4..6)?.parse().ok()?;
+        let delta = oh * 3_600 + om * 60;
+        secs += if sign == '+' { -delta } else { delta };
+    }
+    Some(secs)
+}
+
+/// Active vs wall-clock time for a session.
+pub struct ActiveSpan {
+    /// Sum of inter-action gaps, each capped at the given cap.
+    pub active_secs: i64,
+    /// Last minus first action timestamp.
+    pub span_secs: i64,
+}
+
+/// Compute active/span durations over the session's action timestamps.
+/// `None` when no action has a parseable timestamp.
+pub fn active_span(s: &Session, cap_secs: i64) -> Option<ActiveSpan> {
+    let times: Vec<i64> = s
+        .actions
+        .iter()
+        .filter_map(|a| ts_secs(&a.effective_ts))
+        .collect();
+    let (first, last) = (times.first()?, times.last()?);
+    let span_secs = (last - first).max(0);
+    let active_secs = times
+        .windows(2)
+        .map(|w| (w[1] - w[0]).clamp(0, cap_secs))
+        .sum();
+    Some(ActiveSpan {
+        active_secs,
+        span_secs,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,5 +208,43 @@ mod tests {
         assert_eq!(o.bash, 1);
         assert_eq!(o.files_touched, 1, "same file read+edited counts once");
         assert_eq!(o.span.unwrap().0, "2026-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn ts_secs_parses_iso_zulu_fractions_and_offsets() {
+        assert_eq!(ts_secs("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(ts_secs("1970-01-02T00:00:00Z"), Some(86_400));
+        // fractional seconds are ignored, not fatal
+        assert_eq!(ts_secs("1970-01-01T00:00:01.500Z"), Some(1));
+        // +02:00 is two hours EARLIER in UTC
+        assert_eq!(ts_secs("1970-01-01T02:00:00+02:00"), Some(0));
+        // a leap-year day: 2024-03-01 is day 60 of 2024
+        assert_eq!(ts_secs("2024-03-01T00:00:00Z"), Some(1_709_251_200));
+        assert_eq!(ts_secs("garbage"), None);
+        assert_eq!(ts_secs(""), None);
+    }
+
+    #[test]
+    fn active_span_caps_idle_gaps() {
+        // Three actions: 0s, 60s, then a 2-hour gap. Span = 7260s;
+        // active = 60 + cap(300) = 360s.
+        let mk = |ts: &str, id: &str| {
+            format!(
+                r#"{{"type":"assistant","timestamp":"{ts}","message":{{"content":[{{"type":"tool_use","id":"{id}","name":"Read","input":{{"file_path":"/a"}}}}]}}}}"#
+            )
+        };
+        let raw = [
+            mk("2026-01-01T10:00:00Z", "a"),
+            mk("2026-01-01T10:01:00Z", "b"),
+            mk("2026-01-01T12:01:00Z", "c"),
+        ]
+        .join("\n");
+        let s = crate::ingest::ingest_str(&raw, crate::model::Lane::Main);
+        let d = active_span(&s, ACTIVE_GAP_CAP_SECS).unwrap();
+        assert_eq!(d.span_secs, 7_260);
+        assert_eq!(d.active_secs, 360);
+        // empty session -> None
+        let empty = crate::ingest::ingest_str("", crate::model::Lane::Main);
+        assert!(active_span(&empty, ACTIVE_GAP_CAP_SECS).is_none());
     }
 }
