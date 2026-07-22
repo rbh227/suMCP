@@ -266,7 +266,7 @@ mod tests {
         // Day out of range for month (with leap year logic)
         assert_eq!(ts_secs("2025-02-30T00:00:00Z"), None);
         assert_eq!(ts_secs("2025-04-31T00:00:00Z"), None);
-        assert_eq!(ts_secs("2024-02-29T00:00:00Z").is_some(), true); // leap day valid
+        assert!(ts_secs("2024-02-29T00:00:00Z").is_some()); // leap day valid
         assert_eq!(ts_secs("2023-02-29T00:00:00Z"), None); // not a leap year
         // Offset validation: bad separator and out-of-range
         assert_eq!(ts_secs("1970-01-01T02:00:00+02X00"), None); // bad offset separator
