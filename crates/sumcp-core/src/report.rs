@@ -136,9 +136,35 @@ pub fn ts_secs(ts: &str) -> Option<i64> {
     let num = |r: std::ops::Range<usize>| -> Option<i64> { ts.get(r)?.parse().ok() };
     let (y, mo, d) = (num(0..4)?, num(5..7)?, num(8..10)?);
     let (h, mi, sec) = (num(11..13)?, num(14..16)?, num(17..19)?);
-    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) {
+
+    // Validate month
+    if !(1..=12).contains(&mo) {
         return None;
     }
+
+    // Validate day (accounting for month and leap year)
+    let is_leap = (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0);
+    let days_in_month = match mo {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if is_leap {
+                29
+            } else {
+                28
+            }
+        }
+        _ => return None,
+    };
+    if !(1..=days_in_month).contains(&d) {
+        return None;
+    }
+
+    // Validate time components
+    if !(0..=23).contains(&h) || !(0..=59).contains(&mi) || !(0..=59).contains(&sec) {
+        return None;
+    }
+
     let (y2, mo2) = if mo <= 2 { (y - 1, mo + 12) } else { (y, mo) };
     let era = y2.div_euclid(400);
     let yoe = y2 - era * 400;
@@ -150,8 +176,15 @@ pub fn ts_secs(ts: &str) -> Option<i64> {
     let rest = &ts[19..];
     let off = rest.trim_start_matches(|c: char| c == '.' || c.is_ascii_digit());
     if let Some(sign @ ('+' | '-')) = off.chars().next() {
+        // Validate offset format: must have ':' at position 3 and valid ranges
+        if off.len() < 6 || off.as_bytes()[3] != b':' {
+            return None;
+        }
         let oh: i64 = off.get(1..3)?.parse().ok()?;
         let om: i64 = off.get(4..6)?.parse().ok()?;
+        if !(0..=23).contains(&oh) || !(0..=59).contains(&om) {
+            return None;
+        }
         let delta = oh * 3_600 + om * 60;
         secs += if sign == '+' { -delta } else { delta };
     }
@@ -222,6 +255,23 @@ mod tests {
         assert_eq!(ts_secs("2024-03-01T00:00:00Z"), Some(1_709_251_200));
         assert_eq!(ts_secs("garbage"), None);
         assert_eq!(ts_secs(""), None);
+    }
+
+    #[test]
+    fn ts_secs_rejects_malformed_components() {
+        // Hour, minute, second out of range
+        assert_eq!(ts_secs("1970-01-01T99:00:00Z"), None);
+        assert_eq!(ts_secs("1970-01-01T00:99:00Z"), None);
+        assert_eq!(ts_secs("1970-01-01T00:00:99Z"), None);
+        // Day out of range for month (with leap year logic)
+        assert_eq!(ts_secs("2025-02-30T00:00:00Z"), None);
+        assert_eq!(ts_secs("2025-04-31T00:00:00Z"), None);
+        assert_eq!(ts_secs("2024-02-29T00:00:00Z").is_some(), true); // leap day valid
+        assert_eq!(ts_secs("2023-02-29T00:00:00Z"), None); // not a leap year
+        // Offset validation: bad separator and out-of-range
+        assert_eq!(ts_secs("1970-01-01T02:00:00+02X00"), None); // bad offset separator
+        assert_eq!(ts_secs("1970-01-01T00:00:00+02:99"), None); // offset minutes out of range
+        assert_eq!(ts_secs("1970-01-01T00:00:00+99:00"), None); // offset hours out of range
     }
 
     #[test]
