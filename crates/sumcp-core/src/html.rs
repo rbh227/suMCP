@@ -332,7 +332,8 @@ fn timeline_section(s: &Session, ranked: &[FileScore]) -> String {
     use crate::model::ActionKind;
     let n = s.actions.len();
     if n == 0 {
-        return group_box("Timeline", "<p>No actions.</p>");
+        return "<section class=\"sec\"><h2>Timeline</h2><p class=\"calm\">No actions.</p></section>"
+            .to_string();
     }
     // x% for an ordinal; guard n==1 (avoid divide-by-zero → put it at 0%).
     let x = |idx: usize| -> f64 {
@@ -814,7 +815,11 @@ mod tests {
             r#"{"type":"assistant","timestamp":"2026-01-01T12:00:00Z","message":{"content":[{"type":"tool_use","id":"2","name":"Read","input":{"file_path":"/a.ts"}}]}}"#,
         );
         let html = render(raw);
-        assert!(html.contains("gapmark"), "gap glyph rendered");
+        assert!(html.contains("class=\"gapmark\""), "gap glyph rendered");
+        assert!(
+            html.contains("title=\"gap over 5 minutes\""),
+            "gap glyph tooltip"
+        );
     }
 
     #[test]
