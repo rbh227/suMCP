@@ -49,63 +49,228 @@ pub fn render_html(
     weights: &Weights,
     meta: &SessionMeta,
 ) -> String {
-    let _ = weights; // wired in later tasks
+    let all = crate::score::all_findings(s);
+    let review = crate::review::needs_review(ranked, &all);
+    let o = crate::report::Overview::from_session(s);
     let mut h = String::new();
-    // Shell. CSS is filled out in Task 2; kept minimal-but-inline here so the
-    // zero-network invariant holds from the first task.
     let _ = write!(
         h,
         "<!DOCTYPE html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">\
-         <title>suMCP report — {id}</title><style>{css}</style></head><body>",
+         <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
+         <title>suMCP report — {id}</title><style>{css}</style></head><body>\
+         <div class=\"page\">",
         id = esc(&meta.id),
         css = base_css(),
     );
-    let _ = write!(
-        h,
-        "<div class=\"titlebar\">suMCP — session {id}</div>",
-        id = esc(&meta.id),
-    );
-    let _ = write!(h, "<div class=\"desktop\">");
-    let o = crate::report::Overview::from_session(s);
-    h.push_str(&overview_section(&o));
-    h.push_str(&timeline_section(s, ranked));
-    h.push_str(&struggles_section(ranked));
-    h.push_str(&blind_spots_section(s, meta));
-    h.push_str(&file_stories_section(s, ranked, meta));
-    h.push_str(&context_health_footer(s, meta));
+    h.push_str(&header_band(s, meta));
+    h.push_str(&facts_strip(&o, s));
+    h.push_str(&needs_review_section(&review, &all, s)); // Task 5
+    h.push_str(&timeline_section(s, ranked)); // Task 6
+    h.push_str(&struggles_section(ranked, weights, &review)); // Task 7
+    h.push_str(&file_stories_section(s, &review, &all, meta)); // Task 8
+    h.push_str(&blind_spots_section(s, meta)); // Task 8
+    h.push_str(&status_bar(s, &o));
     let _ = write!(h, "</div><script>{}</script></body></html>", inline_js());
     h
 }
 
-/// Inline base stylesheet — Win9x surfaces. Extended in later tasks.
+/// Inline stylesheet: flat utilitarian (spec 2026-07-22). Win95's discipline
+/// (one column, hard grid, grouped sections, status bar) rendered flat: white
+/// page, navy accent, 1px hairlines, sharp corners, system fonts. No external
+/// asset of any kind (zero-network invariant).
 fn base_css() -> &'static str {
-    "body{margin:0;font:13px/1.4 'MS Sans Serif',Tahoma,sans-serif;\
-     background:#008080;color:#000}\
-     .titlebar{background:navy;color:#fff;font-weight:bold;padding:3px 6px}\
-     .desktop{padding:8px}\
-     .gb{border:2px groove #fff;background:#c0c0c0;margin:8px 0;padding:8px}\
-     .gb>legend{padding:0 4px;font-weight:bold}\
-     table{border-collapse:collapse}\
-     .kv th{text-align:left;padding:2px 8px 2px 0;color:navy}\
-     .kv td{padding:2px 16px 2px 0}\
-     .rank-tbl{width:100%;background:#fff;border:2px inset #fff}\
-     .rank-tbl th{background:#c0c0c0;text-align:left;padding:2px 6px}\
-     .rank-tbl td{padding:2px 6px;border-top:1px solid #dfdfdf}\
-     .rank-tbl .file{font-family:'Courier New',monospace}\
-     .timeline{position:relative;background:#fff;border:2px inset #fff;\
-       padding:18px 4px 4px;min-height:96px}\
-     .bands{position:absolute;left:0;right:0;top:0;height:14px}\
-     .band{position:absolute;top:2px;height:10px;background:rgba(128,0,0,.35);\
-       border:1px solid maroon;cursor:pointer}\
-     .lane{position:relative;height:22px;margin:2px 0;border-bottom:1px dotted #bbb}\
-     .lane-lbl{position:absolute;left:2px;top:3px;color:navy;font-size:11px}\
-     .tick{position:absolute;top:4px;width:3px;height:14px;background:navy;\
-       margin-left:38px}\
-     .tick-err{background:red}\
-     .urule{position:absolute;top:14px;bottom:0;width:1px;background:#888}\
-     .cap{color:#444;font-size:11px;margin:4px 0 0}\
-     .exc{font-family:'Courier New',monospace;white-space:pre-wrap;word-break:break-all}\
-     details.ev{margin:4px 0}"
+    ":root{--ink:#16161d;--navy:#000080;--red:#c41000;--mut:#6b6b76;\
+      --line:#d8d8de;--soft:#f4f4fb}\
+     *{box-sizing:border-box}\
+     body{margin:0;background:#fff;color:var(--ink);\
+       font:14px/1.45 system-ui,-apple-system,'Segoe UI',sans-serif}\
+     .page{max-width:920px;margin:0 auto;padding:0 16px 32px}\
+     .mono,code{font-family:ui-monospace,'SF Mono',Menlo,Consolas,monospace;\
+       font-size:13px}\
+     .num{font-variant-numeric:tabular-nums}\
+     .hdr{background:var(--navy);color:#fff;margin-top:16px;padding:10px 14px;\
+       display:flex;justify-content:space-between;align-items:baseline;\
+       gap:12px;flex-wrap:wrap}\
+     .hdr .brand{font-weight:700;letter-spacing:.04em}\
+     .hdr-meta{font-size:12px;color:#dfdfff;display:flex;gap:10px;\
+       flex-wrap:wrap;align-items:baseline}\
+     .chip{border:1px solid #dfdfff;padding:0 6px;font-size:11px;\
+       text-transform:uppercase;letter-spacing:.05em}\
+     .facts{display:flex;gap:20px;flex-wrap:wrap;border:1px solid var(--line);\
+       border-top:none;padding:8px 14px;font-size:13px;color:var(--mut)}\
+     .facts b{color:var(--ink);font-variant-numeric:tabular-nums;\
+       font-weight:600}\
+     .sec{margin-top:28px}\
+     .sec>h2{font-size:12px;font-weight:700;letter-spacing:.08em;\
+       text-transform:uppercase;color:var(--navy);margin:0 0 10px;\
+       padding-bottom:4px;border-bottom:1px solid var(--ink)}\
+     .calm{color:var(--mut)}\
+     .nr{border:1px solid var(--line);border-left:3px solid var(--navy);\
+       padding:8px 12px;margin:8px 0;display:flex;gap:12px;flex-wrap:wrap;\
+       align-items:baseline;justify-content:space-between}\
+     .nr .why{color:var(--mut)}\
+     .nr a{color:var(--navy)}\
+     .timeline{position:relative;border:1px solid var(--line);\
+       padding:6px 8px 4px}\
+     .track{position:absolute;left:64px;right:10px;top:0;bottom:0}\
+     .lane{position:relative;height:22px;border-bottom:1px dotted var(--line)}\
+     .lane:last-child{border-bottom:none}\
+     .lane-lbl{position:absolute;left:4px;top:4px;color:var(--mut);\
+       font-size:11px;text-transform:uppercase;letter-spacing:.05em}\
+     .tick{position:absolute;top:4px;width:2px;height:14px;\
+       background:var(--navy)}\
+     .tick-err{background:var(--red);width:3px}\
+     .band{position:absolute;top:5px;height:12px;\
+       background:rgba(0,0,128,.12);border:1px solid var(--navy);\
+       cursor:pointer}\
+     .rules{pointer-events:none}\
+     .urule{position:absolute;top:0;bottom:0;width:1px;\
+       background:var(--line);pointer-events:auto}\
+     .gapmark{position:absolute;top:0;bottom:0;width:0;\
+       border-left:2px dashed #b6b6c2}\
+     .legend{display:flex;gap:18px;flex-wrap:wrap;font-size:12px;\
+       color:var(--mut);margin-top:8px;align-items:center}\
+     .legend .sw{display:inline-block;vertical-align:-2px;margin-right:5px}\
+     .sw-tick{width:2px;height:12px;background:var(--navy)}\
+     .sw-err{width:3px;height:12px;background:var(--red)}\
+     .sw-band{width:16px;height:10px;background:rgba(0,0,128,.12);\
+       border:1px solid var(--navy)}\
+     .sw-turn{width:1px;height:12px;background:#9a9aa4}\
+     .sw-gap{width:0;height:12px;border-left:2px dashed #b6b6c2}\
+     .tbl{width:100%;border-collapse:collapse}\
+     .tbl th{text-align:left;font-size:11px;text-transform:uppercase;\
+       letter-spacing:.06em;color:var(--mut);border-bottom:1px solid var(--ink);\
+       padding:4px 8px}\
+     .tbl td{padding:5px 8px;border-bottom:1px solid var(--line);\
+       vertical-align:top}\
+     .tbl .r{text-align:right;font-variant-numeric:tabular-nums}\
+     .tbl tr.top td{background:var(--soft)}\
+     .foot{font-size:12px;color:var(--mut);margin-top:6px}\
+     .story-box{border:1px solid var(--line);margin:14px 0;padding:10px 14px}\
+     .story-box h3{margin:0 0 2px;font-size:13px;font-weight:600}\
+     .story-box .why{color:var(--mut);font-size:13px;margin:0 0 8px}\
+     .story{margin:6px 0;padding-left:1.6em;font-size:13px}\
+     .story li{padding:1px 0}\
+     .story .fail{color:var(--red)}\
+     .story .run{color:var(--mut)}\
+     .exc{font-family:ui-monospace,'SF Mono',Menlo,Consolas,monospace;\
+       font-size:12px;white-space:pre-wrap;word-break:break-all}\
+     .tag{font-size:11px;text-transform:uppercase;letter-spacing:.05em;\
+       border:1px solid var(--mut);color:var(--mut);padding:0 4px}\
+     details.ev{margin:6px 0}\
+     details.ev summary{cursor:pointer;color:var(--navy);font-size:13px}\
+     .ev-tbl td{padding:3px 8px;border-bottom:1px solid var(--line);\
+       font-size:12px;vertical-align:top}\
+     .status{margin-top:32px;border-top:1px solid var(--ink);padding-top:8px;\
+       font-size:12px;color:var(--mut);display:flex;gap:6px;flex-wrap:wrap}\
+     .status .sep{color:var(--line)}"
+}
+
+/// 254703 -> "254,703". Display only; payloads keep raw numbers.
+fn fmt_thousands(n: u64) -> String {
+    let s = n.to_string();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Whole-minute duration: "47m", "1h 02m". Sub-minute clamps to "0m".
+fn fmt_duration(secs: i64) -> String {
+    let m = secs.max(0) / 60;
+    if m >= 60 {
+        format!("{}h {:02}m", m / 60, m % 60)
+    } else {
+        format!("{m}m")
+    }
+}
+
+/// Flat navy identity band: project, date, durations, session, mode chip.
+fn header_band(s: &Session, meta: &SessionMeta) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(cwd) = &s.cwd {
+        parts.push(format!("<span class=\"mono\">{}</span>", esc(cwd)));
+    }
+    if let Some(a) = s.actions.first() {
+        parts.push(esc(a.effective_ts.get(0..10).unwrap_or("")));
+    }
+    if let Some(d) = crate::report::active_span(s, crate::report::ACTIVE_GAP_CAP_SECS) {
+        parts.push(format!(
+            "<span class=\"num\" title=\"active time sums the gaps between \
+             actions, each capped at 5 minutes\">active {} (span {})</span>",
+            fmt_duration(d.active_secs),
+            fmt_duration(d.span_secs),
+        ));
+    }
+    let short: String = meta.id.chars().take(8).collect();
+    parts.push(format!("session {}", esc(&short)));
+    if s.auto_accept {
+        parts.push("<span class=\"chip\">auto-accept</span>".into());
+    }
+    format!(
+        "<header class=\"hdr\"><span class=\"brand\">suMCP</span>\
+         <span class=\"hdr-meta\">{}</span></header>",
+        parts.join(" · ")
+    )
+}
+
+/// One aligned row of deterministic totals (replaces the Overview box).
+fn facts_strip(o: &crate::report::Overview, s: &Session) -> String {
+    let mut facts = vec![
+        format!(
+            "<span><b>{}</b> actions</span>",
+            fmt_thousands(o.actions as u64)
+        ),
+        format!(
+            "<span><b>{}</b> files</span>",
+            fmt_thousands(o.files_touched as u64)
+        ),
+        format!(
+            "<span><b>{}</b> edits</span>",
+            fmt_thousands(o.edits as u64)
+        ),
+        format!(
+            "<span><b>{}</b> writes</span>",
+            fmt_thousands(o.writes as u64)
+        ),
+        format!(
+            "<span><b>{}</b> reads</span>",
+            fmt_thousands(o.reads as u64)
+        ),
+        format!("<span><b>{}</b> bash</span>", fmt_thousands(o.bash as u64)),
+    ];
+    if !s.spawns.is_empty() {
+        facts.push(format!("<span><b>{}</b> subagents</span>", s.spawns.len()));
+    }
+    format!("<div class=\"facts\">{}</div>", facts.join(""))
+}
+
+/// Bottom trust line (replaces the Context health section).
+fn status_bar(s: &Session, o: &crate::report::Overview) -> String {
+    let ratio = o
+        .cache_hit_ratio
+        .map(|r| format!("{:.0}%", r * 100.0))
+        .unwrap_or_else(|| "n/a".into());
+    let parsed: u64 = s.type_counts.values().sum();
+    let items = [
+        format!("cache hit {ratio}"),
+        format!("output {} tok", fmt_thousands(o.output_tokens)),
+        format!(
+            "parsed {} lines ({} unparsable)",
+            fmt_thousands(parsed),
+            fmt_thousands(o.parse_errors)
+        ),
+        "deterministic · no LLM".to_string(),
+        format!("suMCP v{}", env!("CARGO_PKG_VERSION")),
+    ];
+    format!(
+        "<footer class=\"status\">{}</footer>",
+        items.join("<span class=\"sep\">|</span>")
+    )
 }
 
 /// A Win9x sunken group box with a title tab.
@@ -117,22 +282,17 @@ fn group_box(title: &str, body: &str) -> String {
     )
 }
 
-/// Overview: the deterministic totals.
-fn overview_section(o: &crate::report::Overview) -> String {
-    let ratio = o
-        .cache_hit_ratio
-        .map(|r| format!("{:.0}%", r * 100.0))
-        .unwrap_or_else(|| "n/a".into());
-    let body = format!(
-        "<table class=\"kv\">\
-         <tr><th>actions</th><td>{}</td><th>files</th><td>{}</td></tr>\
-         <tr><th>edits</th><td>{}</td><th>writes</th><td>{}</td></tr>\
-         <tr><th>reads</th><td>{}</td><th>bash</th><td>{}</td></tr>\
-         <tr><th>cache hit</th><td>{}</td><th>output tok</th><td>{}</td></tr>\
-         </table>",
-        o.actions, o.files_touched, o.edits, o.writes, o.reads, o.bash, ratio, o.output_tokens,
-    );
-    group_box("Overview", &body)
+/// Needs-review section: placeholder pending Task 5's plain-language
+/// rewrite. Kept minimal here so the shell compiles; Task 5 replaces the
+/// body with the full evidence-floor rendering (`review::needs_review`,
+/// `reason_sentence`, `category_phrase`).
+fn needs_review_section(
+    review: &[&FileScore],
+    all: &[crate::model::Finding],
+    s: &Session,
+) -> String {
+    let _ = (review, all, s);
+    "<section class=\"sec\"><h2>Needs review</h2></section>".to_string()
 }
 
 /// The timeline centerpiece: action ticks in Read/Edit/Bash lanes, finding
@@ -257,8 +417,11 @@ fn timeline_section(s: &Session, ranked: &[FileScore]) -> String {
     group_box("Timeline", &body)
 }
 
-/// Struggle areas: ranked files with their category breakdown.
-fn struggles_section(ranked: &[FileScore]) -> String {
+/// Struggle areas: ranked files with their category breakdown. `weights` and
+/// `review` are wired in by Task 7's rewrite; bridged here (ignored) so the
+/// crate compiles against the new `render_html` call shape.
+fn struggles_section(ranked: &[FileScore], weights: &Weights, review: &[&FileScore]) -> String {
+    let _ = (weights, review);
     if ranked.is_empty() {
         return group_box("Struggle areas", "<p>No struggle signals fired.</p>");
     }
@@ -347,14 +510,22 @@ fn file_story_section(s: &Session, path: &str, meta: &SessionMeta) -> String {
     group_box(&format!("File story: {}", path), &body)
 }
 
-/// The top-3 ranked files, each with its story and the evidence behind its
-/// findings nested inside.
-fn file_stories_section(s: &Session, ranked: &[FileScore], meta: &SessionMeta) -> String {
-    if ranked.is_empty() {
+/// The needs-review files, each with its story and the evidence behind its
+/// findings nested inside. Bridged for Task 4: iterates `review` (the
+/// evidence-floor selection) instead of the old `ranked.iter().take(3)`;
+/// `all` is threaded through for Task 8's rewrite and unused here.
+fn file_stories_section(
+    s: &Session,
+    review: &[&FileScore],
+    all: &[crate::model::Finding],
+    meta: &SessionMeta,
+) -> String {
+    let _ = all;
+    if review.is_empty() {
         return group_box("File stories", "<p>No files ranked.</p>");
     }
     let mut out = String::new();
-    for fs in ranked.iter().take(3) {
+    for fs in review {
         let mut section = file_story_section(s, &fs.file, meta);
         // Nest the evidence for this file's findings inside its story box —
         // dropped just before the closing </fieldset>.
@@ -372,24 +543,6 @@ fn file_stories_section(s: &Session, ranked: &[FileScore], meta: &SessionMeta) -
         out.push_str(&section);
     }
     out
-}
-
-/// Context-health footer: cache economics, informational only (v0.1 makes no
-/// waste judgment — see `payloads::context_health`'s note).
-fn context_health_footer(s: &Session, meta: &SessionMeta) -> String {
-    let p = crate::payloads::context_health(s, meta);
-    let ratio = p["cache_hit_ratio"]
-        .as_f64()
-        .map(|r| format!("{:.0}%", r * 100.0))
-        .unwrap_or_else(|| "n/a".into());
-    let body = format!(
-        "<p>cache hit {} · output {} · cache-read {} tok. \
-         <em>Informational only — v0.1 makes no waste judgment.</em></p>",
-        ratio,
-        p["tokens"]["output"].as_u64().unwrap_or(0),
-        p["tokens"]["cache_read"].as_u64().unwrap_or(0),
-    );
-    group_box("Context health", &body)
 }
 
 /// A native `<details>` collapsible dereferencing action `idxs` into raw
@@ -464,13 +617,49 @@ mod tests {
     }
 
     #[test]
-    fn overview_precedes_struggles() {
-        let raw = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"tool_use","id":"1","name":"Read","input":{"file_path":"/a.ts"}}]}}"#;
+    fn header_and_facts_precede_struggles() {
+        let raw = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","cwd":"/work/proj","message":{"content":[{"type":"tool_use","id":"1","name":"Read","input":{"file_path":"/a.ts"}}]}}"#;
         let html = render(raw);
+        let hdr = html.find("class=\"hdr\"").expect("header band");
+        let facts = html.find("class=\"facts\"").expect("facts strip");
+        let strug = html.find("Struggle").expect("struggle section");
         assert!(
-            html.find("Overview").unwrap() < html.find("Struggle").unwrap(),
-            "overview must precede struggles"
+            hdr < facts && facts < strug,
+            "order: header, facts, struggles"
         );
+        assert!(html.contains("/work/proj"), "project dir shown");
+        assert!(html.contains("active "), "active duration shown");
+    }
+
+    #[test]
+    fn facts_strip_shows_totals_and_status_bar_replaces_context_health() {
+        let raw = concat!(
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"tool_use","id":"1","name":"Read","input":{"file_path":"/a.ts"}}]}}"#,
+            "\n",
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:01Z","message":{"content":[{"type":"tool_use","id":"2","name":"Edit","input":{"file_path":"/a.ts","new_string":"x"}}]}}"#,
+        );
+        let html = render(raw);
+        assert!(html.contains("class=\"facts\""), "facts strip present");
+        assert!(html.contains("2</b> actions"), "action count rendered");
+        assert!(!html.contains("Context health"), "old footer removed");
+        assert!(html.contains("class=\"status\""), "status bar present");
+        assert!(html.contains("no LLM"), "trust line present");
+        assert!(html.contains("parsed"), "parse trust count present");
+    }
+
+    #[test]
+    fn numbers_are_thousands_formatted() {
+        assert_eq!(fmt_thousands(0), "0");
+        assert_eq!(fmt_thousands(999), "999");
+        assert_eq!(fmt_thousands(254_703), "254,703");
+        assert_eq!(fmt_thousands(1_000_000), "1,000,000");
+    }
+
+    #[test]
+    fn durations_format_compactly() {
+        assert_eq!(fmt_duration(59), "0m");
+        assert_eq!(fmt_duration(60 * 47), "47m");
+        assert_eq!(fmt_duration(3600 + 120), "1h 02m");
     }
 
     #[test]
@@ -499,26 +688,6 @@ mod tests {
         assert!(
             !html.contains("<script src") && !html.contains("<link") && !html.contains("<img"),
             "external-loading element present"
-        );
-    }
-
-    #[test]
-    fn overview_section_shows_totals() {
-        let raw = concat!(
-            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"tool_use","id":"1","name":"Read","input":{"file_path":"/a.ts"}}]}}"#,
-            "\n",
-            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:01Z","message":{"content":[{"type":"tool_use","id":"2","name":"Edit","input":{"file_path":"/a.ts","new_string":"x"}}]}}"#,
-        );
-        let html = render(raw);
-        assert!(html.contains("Overview"), "no overview heading");
-        assert!(html.contains("actions"), "no action total label");
-        // 2 actions in this session.
-        assert!(
-            html.contains(">2<")
-                || html.contains("actions</th><td>2")
-                || html.contains("actions 2"),
-            "action count 2 not rendered: {}",
-            &html[..html.len().min(4000)]
         );
     }
 
@@ -558,14 +727,19 @@ mod tests {
     #[test]
     fn renders_blindspots_filestories_health_and_evidence() {
         let mut lines = Vec::new();
+        for i in 0..3 {
+            lines.push(format!(
+                r#"{{"type":"assistant","timestamp":"2026-01-01T00:00:0{i}Z","message":{{"content":[{{"type":"tool_use","id":"r{i}","name":"Read","input":{{"file_path":"/a.ts"}}}}]}}}}"#
+            ));
+        }
         for i in 0..6 {
             lines.push(format!(
-                r#"{{"type":"assistant","timestamp":"2026-01-01T00:00:0{i}Z","message":{{"content":[{{"type":"tool_use","id":"e{i}","name":"Edit","input":{{"file_path":"/a.ts","new_string":"xxxxxxxx"}}}}]}}}}"#
+                r#"{{"type":"assistant","timestamp":"2026-01-01T00:01:0{i}Z","message":{{"content":[{{"type":"tool_use","id":"e{i}","name":"Edit","input":{{"file_path":"/a.ts","new_string":"xxxxxxxx"}}}}]}}}}"#
             ));
         }
         let html = render(&lines.join("\n"));
         assert!(html.contains("Blind spots"), "no blind-spots section");
-        assert!(html.contains("Context health"), "no context-health footer");
+        assert!(html.contains("class=\"status\""));
         // Top file gets a story section.
         assert!(
             html.contains("File story") && html.contains("/a.ts"),
