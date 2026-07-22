@@ -33,6 +33,7 @@ pub fn ingest_str(raw: &str, default_lane: Lane) -> Session {
     let mut parse_errors = 0u64;
     let mut untimestamped = 0u64;
     let mut last_ts = String::new(); // carried forward for untimestamped lines
+    let mut cwd: Option<String> = None;
     let mut seen_tool_ids = HashSet::new();
     let mut pending: Vec<PendingAction> = Vec::new();
     let mut user_texts: Vec<UserText> = Vec::new();
@@ -58,6 +59,12 @@ pub fn ingest_str(raw: &str, default_lane: Lane) -> Session {
 
         if let Some(t) = v.get("type").and_then(Value::as_str) {
             *type_counts.entry(t.to_string()).or_insert(0) += 1;
+        }
+
+        if cwd.is_none()
+            && let Some(c) = v.get("cwd").and_then(Value::as_str)
+        {
+            cwd = Some(c.to_string());
         }
 
         // Auto-accept permission modes make approval latency meaningless.
@@ -310,6 +317,7 @@ pub fn ingest_str(raw: &str, default_lane: Lane) -> Session {
     Session {
         actions,
         user_texts,
+        cwd,
         tokens,
         type_counts,
         parse_errors,
@@ -606,5 +614,21 @@ mod tests {
         assert_eq!(s.actions[0].input_hash, s.actions[1].input_hash);
         assert_ne!(s.actions[0].input_hash, s.actions[2].input_hash);
         assert!(s.actions[0].input_hash.is_some());
+    }
+
+    #[test]
+    fn cwd_is_captured_from_first_line_carrying_one() {
+        let raw = concat!(
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","cwd":"/work/proj","message":{"content":[{"type":"tool_use","id":"1","name":"Read","input":{"file_path":"/a.ts"}}]}}"#,
+            "\n",
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:01Z","cwd":"/other","message":{"content":[{"type":"tool_use","id":"2","name":"Read","input":{"file_path":"/b.ts"}}]}}"#,
+        );
+        let s = ingest_str(raw, Lane::Main);
+        assert_eq!(s.cwd.as_deref(), Some("/work/proj"), "first cwd wins");
+        let none = ingest_str(
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[]}}"#,
+            Lane::Main,
+        );
+        assert_eq!(none.cwd, None, "no cwd line -> None");
     }
 }

@@ -271,6 +271,10 @@ pub struct Session {
     pub actions: Vec<Action>,
     /// User text messages, in source order (pushback/flip detection).
     pub user_texts: Vec<UserText>,
+    /// The working directory recorded in the transcript (first `cwd` field
+    /// seen). Used by the HTML report header; `None` for synthetic sessions.
+    #[serde(default)]
+    pub cwd: Option<String>,
     /// Token totals (deduped per `message.id`).
     pub tokens: Tokens,
     /// Histogram of every event `type` seen (including ones we don't model).

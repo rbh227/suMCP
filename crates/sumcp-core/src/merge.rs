@@ -16,6 +16,7 @@ pub fn merge_sessions(main: Session, subs: Vec<Session>, files_missing: u64) -> 
     // Start from main's counters and user_texts; main is privileged.
     let mut actions: Vec<Action> = main.actions;
     let user_texts = main.user_texts; // subagent user turns are dropped
+    let cwd = main.cwd.clone();
     let mut tokens = main.tokens;
     let mut type_counts = main.type_counts;
     let mut parse_errors = main.parse_errors;
@@ -57,6 +58,7 @@ pub fn merge_sessions(main: Session, subs: Vec<Session>, files_missing: u64) -> 
     Session {
         actions,
         user_texts,
+        cwd,
         tokens,
         type_counts,
         parse_errors,
@@ -98,6 +100,7 @@ mod tests {
                 approval_latency_s: None,
             }],
             user_texts: vec![],
+            cwd: None,
             tokens: Default::default(),
             type_counts: Default::default(),
             parse_errors: 0,
@@ -237,6 +240,7 @@ mod tests {
         let empty = Session {
             actions: vec![],
             user_texts: vec![],
+            cwd: None,
             tokens: Default::default(),
             type_counts: Default::default(),
             parse_errors: 0,
