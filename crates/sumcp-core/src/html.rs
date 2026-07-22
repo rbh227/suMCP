@@ -407,8 +407,27 @@ fn timeline_section(s: &Session, ranked: &[FileScore]) -> String {
         );
     }
 
-    // User-turn rules: place at the ordinal of the first action at/after the
-    // user text's source line. Deterministic; falls at 100% if none follow.
+    // Gap glyphs: between consecutive actions more than the active-gap cap
+    // apart. Placed at the midpoint of the two ordinals.
+    let mut gaps = String::new();
+    for w in s.actions.windows(2) {
+        if let (Some(a), Some(b)) = (
+            crate::report::ts_secs(&w[0].effective_ts),
+            crate::report::ts_secs(&w[1].effective_ts),
+        ) && b - a > crate::report::ACTIVE_GAP_CAP_SECS
+        {
+            let mid = (x(w[0].idx.0 as usize) + x(w[1].idx.0 as usize)) / 2.0;
+            let _ = write!(
+                gaps,
+                "<div class=\"gapmark\" style=\"left:{mid:.2}%\" \
+                 title=\"gap over 5 minutes\"></div>"
+            );
+        }
+    }
+
+    // User-turn rules with a redacted prompt excerpt as tooltip (grill
+    // decision 2026-07-22: sharing the file is deliberate; excerpts pass the
+    // same redaction as evidence).
     let mut rules = String::new();
     for ut in &s.user_texts {
         let ord = s
@@ -416,35 +435,48 @@ fn timeline_section(s: &Session, ranked: &[FileScore]) -> String {
             .iter()
             .position(|a| a.line_no >= ut.line_no)
             .unwrap_or(n - 1);
+        let excerpt: String = ut.text.chars().take(80).collect();
+        let excerpt = crate::redact::redact(&excerpt);
         let _ = write!(
             rules,
-            "<div class=\"urule\" style=\"left:{:.2}%\"></div>",
-            x(ord)
+            "<div class=\"urule\" style=\"left:{:.2}%\" title=\"{}\"></div>",
+            x(ord),
+            esc(excerpt
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .as_str()),
         );
     }
 
-    let lane = |name: &str, label: &str| {
+    let lane = |name: &str, label: &str, content: &str| {
         format!(
-            "<div class=\"lane lane-{name}\"><span class=\"lane-lbl\">{label}</span>{}</div>",
-            ticks[name]
+            "<div class=\"lane lane-{name}\"><span class=\"lane-lbl\">{label}</span>\
+             <div class=\"track\">{content}</div></div>"
         )
     };
+    let legend = "<div class=\"legend\">\
+        <span><i class=\"sw sw-tick\"></i>action</span>\
+        <span><i class=\"sw sw-err\"></i>error</span>\
+        <span><i class=\"sw sw-band\"></i>finding span (click for evidence)</span>\
+        <span><i class=\"sw sw-turn\"></i>your turn (hover for prompt)</span>\
+        <span><i class=\"sw sw-gap\"></i>gap &gt; 5 min</span>\
+        <span>x = action sequence, not time</span></div>";
     let caption = if other > 0 {
-        format!(
-            "<p class=\"cap\">{} action(s) in other tools not laned.</p>",
-            other
-        )
+        format!("<p class=\"foot\">{other} actions in other tools not laned.</p>")
     } else {
         String::new()
     };
-
     let body = format!(
-        "<div class=\"timeline\"><div class=\"bands\">{bands}</div>{rules}{}{}{}</div>{caption}",
-        lane("read", "Read"),
-        lane("edit", "Edit"),
-        lane("bash", "Bash"),
+        "<div class=\"timeline\">\
+         <div class=\"track rules\">{rules}{gaps}</div>\
+         {findings}{read}{edit}{bash}</div>{legend}{caption}",
+        findings = lane("findings", "findings", &bands),
+        read = lane("read", "read", &ticks["read"]),
+        edit = lane("edit", "edit", &ticks["edit"]),
+        bash = lane("bash", "bash", &ticks["bash"]),
     );
-    group_box("Timeline", &body)
+    format!("<section class=\"sec\"><h2>Timeline</h2>{body}</section>")
 }
 
 /// Struggle areas: ranked files with their category breakdown. `weights` and
@@ -752,6 +784,52 @@ mod tests {
         );
         let html = render(raw);
         assert!(html.contains("tick-err"), "error tick not marked");
+    }
+
+    #[test]
+    fn timeline_has_legend_findings_lane_and_declared_axis() {
+        let mut lines = vec![
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"tool_use","id":"r","name":"Read","input":{"file_path":"/a.ts"}}]}}"#.to_string(),
+        ];
+        for i in 0..5 {
+            lines.push(format!(
+                r#"{{"type":"assistant","timestamp":"2026-01-01T00:01:0{i}Z","message":{{"content":[{{"type":"tool_use","id":"e{i}","name":"Edit","input":{{"file_path":"/a.ts","new_string":"x"}}}}]}}}}"#
+            ));
+        }
+        let html = render(&lines.join("\n"));
+        assert!(html.contains("class=\"legend\""), "legend row");
+        assert!(html.contains("action sequence, not time"), "axis declared");
+        assert!(
+            html.contains("lane-findings"),
+            "findings strip is a labeled lane"
+        );
+    }
+
+    #[test]
+    fn timeline_marks_long_gaps() {
+        // Two actions 2 hours apart -> one gap glyph.
+        let raw = concat!(
+            r#"{"type":"assistant","timestamp":"2026-01-01T10:00:00Z","message":{"content":[{"type":"tool_use","id":"1","name":"Read","input":{"file_path":"/a.ts"}}]}}"#,
+            "\n",
+            r#"{"type":"assistant","timestamp":"2026-01-01T12:00:00Z","message":{"content":[{"type":"tool_use","id":"2","name":"Read","input":{"file_path":"/a.ts"}}]}}"#,
+        );
+        let html = render(raw);
+        assert!(html.contains("gapmark"), "gap glyph rendered");
+    }
+
+    #[test]
+    fn user_turn_tooltips_carry_redacted_prompt_excerpts() {
+        let raw = concat!(
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"text","text":"fix auth, my key is sk-abcdefghijklmnopqrstuv"}]}}"#,
+            "\n",
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:01Z","message":{"content":[{"type":"tool_use","id":"1","name":"Read","input":{"file_path":"/a.ts"}}]}}"#,
+        );
+        let html = render(raw);
+        assert!(html.contains("fix auth"), "prompt excerpt in tooltip");
+        assert!(
+            !html.contains("sk-abcdefghijklmnopqrstuv"),
+            "secret redacted"
+        );
     }
 
     #[test]
