@@ -87,6 +87,12 @@ suppression object says so explicitly.
 |---|---|---|
 | `session_overview.flags` | `subagent_files_missing` | count of subagent spawns whose child transcript could not be analyzed — not found, unreadable, oversized, parsed to zero actions, or beyond the 64-file cap. `0` when every spawn's work was merged in (the common case) and when no subagents ran. Replaces the pre-merge `subagents_excluded` counter. |
 
+## 2026-07-23 additive fields (codex-review P0, non-breaking, `v` stays 0)
+
+| payload | field | contents |
+|---|---|---|
+| `session_overview.session` | `started`, `duration_min` | wall-clock span of the parsed actions (first timestamp, whole minutes first→last). The mock contract always promised these; the shipped builder now emits them so the debrief's duration line is backed by data. Both `null` when no action has a parseable timestamp. |
+
 ## Versioning
 
 `v` bumps on any breaking shape change; the checker and mock payloads update

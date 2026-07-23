@@ -21,11 +21,17 @@ record. Never answer from memory what the tools can answer from evidence.
    (Claude Code flushes transcript writes late, so the live session is often
    not the newest file). Ask the user which session to debrief, listing the
    candidates' ids and mtimes.
-2. Call `struggle_areas(3)`.
-3. Only if a top finding needs a concrete quote: `evidence(idxs)` for ONE
-   finding. Do not bulk-fetch.
-4. Write the debrief. **Hard budget: 500 tokens.** Do not re-read any
-   transcript, file history, or prior conversation to "check" the tools.
+2. Note the resolved id from the response (`session.id`) and pass it as
+   `session_id` on EVERY later call — opportunistic identification is not
+   guaranteed to resolve twice.
+3. Call `struggle_areas(3, session_id=...)`.
+4. Call `blind_spots(session_id=...)`.
+5. Only if a top finding needs a concrete quote: `evidence(idxs,
+   session_id=...)` for ONE finding. Do not bulk-fetch.
+6. Write the debrief. The duration comes from `session.duration_min` in the
+   overview (say "duration unknown" if it is null — do not estimate).
+   **Hard budget: 500 tokens.** Do not re-read any transcript, file history,
+   or prior conversation to "check" the tools.
 
 ## Output contract
 
@@ -39,8 +45,8 @@ record. Never answer from memory what the tools can answer from evidence.
 3. …
 
 **Blind spots for you:**
-- <blind-write attempts / files written and never re-read / approval
-  outliers, each with [idx]>
+- <blind-write attempts / review burden (LOC per human turn) / approval
+  outliers — the three `blind_spots` categories — each with [idx]>
 
 **One takeaway:** <single most useful action for the developer, one sentence>
 ```
