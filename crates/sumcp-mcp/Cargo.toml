@@ -16,10 +16,10 @@ path = "src/main.rs"
 rmcp = { version = "2.2.0", features = ["server", "transport-io"] }
 serde.workspace = true
 serde_json.workspace = true
-sumcp-core = { path = "../sumcp-core" }
+sumcp-core = { path = "../sumcp-core", version = "0.1.0" }
 tokio = { version = "1.52.4", features = ["macros", "rt", "time"] }
 toml = "1.1.3"
 
 [dev-dependencies]
-sumcp-core = { path = "../sumcp-core" }
+sumcp-core = { path = "../sumcp-core", version = "0.1.0" }
 tempfile = "3.27.0"

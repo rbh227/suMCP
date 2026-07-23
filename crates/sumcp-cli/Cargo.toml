@@ -11,7 +11,7 @@ name = "sumcp"
 path = "src/main.rs"
 
 [dependencies]
-sumcp-core = { path = "../sumcp-core" }
+sumcp-core = { path = "../sumcp-core", version = "0.1.0" }
 clap = { version = "4", features = ["derive"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
