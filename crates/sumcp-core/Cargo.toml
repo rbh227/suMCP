@@ -15,3 +15,12 @@ serde_json = { workspace = true }
 # Test-only: real on-disk temp dirs for discovery tests (already in the lockfile
 # via the mcp crate).
 tempfile = "3"
+
+# `validity_dump` carries the predictive-validity study's `last_edit_verified`
+# heuristic, whose contingency cells are small enough that a misclassified
+# action can move a reported conclusion. Cargo only *builds* examples by
+# default; `test = true` makes its `#[cfg(test)]` module run under
+# `cargo test` like any other target.
+[[example]]
+name = "validity_dump"
+test = true

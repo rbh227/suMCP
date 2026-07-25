@@ -93,6 +93,28 @@ suppression object says so explicitly.
 |---|---|---|
 | `session_overview.session` | `started`, `duration_min` | wall-clock span of the parsed actions (first timestamp, whole minutes first→last). The mock contract always promised these; the shipped builder now emits them so the debrief's duration line is backed by data. Both `null` when no action has a parseable timestamp. |
 
+## 2026-07-25 additive fields (headline undercount, non-breaking, `v` stays 0)
+
+| payload | field | contents |
+|---|---|---|
+| `session_overview.totals` | `file_ops` | file-modifying operations that **confirmed success** (`is_error == Some(false)`). `edits` alone reads as "everything that changed a file" but omits `Write`, undercounting by 20-50% on a typical session. Both operands stay in the payload for consumers that want the split. |
+| `session_overview.totals` | `lines_written` | lines of NEW content across every **confirmed-successful** Edit (`new_string`) and Write (`content`), summed over all lanes so subagent work counts. A tool-call count says how *often* a tool fired, not how much changed: one Edit can rewrite hundreds of lines. Counted at ingest on the full string before capping, so large writes stay accurate. **Scope: lines written.** Deletions are excluded (an Edit removing 50 lines and adding 2 contributes 2), because the stored `old_string` is capped and would undercount exactly the largest edits. |
+| `session_overview.totals` | `file_ops_unconfirmed` | Edit/Write actions whose result did NOT confirm success: explicit `is_error: true`, or no tool result at all (truncated or mid-flight session). Excluded from the two fields above and disclosed here rather than silently counted either way. `edits`/`writes` stay unfiltered and describe what was *attempted*, which the failure signals need. |
+
+Why: `session_overview` led with `edits`, which measured neither all
+file-modifying operations nor the volume of change. On a real 401-action
+session it read `edits 71` where the honest figures are 88 operations and
+3,751 lines written. Both surfaces (text view and HTML facts strip) now lead
+with `file_ops` + `lines_written` and keep edits/writes as the breakdown.
+
+The success filter matters because ingest captures `write_lines` from the
+*proposed* tool input, before the result is known. Across the 75-session
+development corpus, 57 of 2,237 Edit/Write actions (2.5%) failed, carrying
+3,692 proposed lines (4.4%) that never reached a file. Counting those as
+"lines written" would overstate real work, so `file_ops`/`lines_written`
+require a confirmed-successful result and the remainder is disclosed in
+`file_ops_unconfirmed`.
+
 ## Versioning
 
 `v` bumps on any breaking shape change; the checker and mock payloads update

@@ -231,13 +231,16 @@ fn facts_strip(o: &crate::report::Overview, s: &Session) -> String {
             "<span><b>{}</b> files</span>",
             fmt_thousands(o.files_touched as u64)
         ),
+        // File-modifying operations as ONE number, then the volume of change.
+        // Showing "edits" alone here undercounted every session by the Write
+        // count, and a call count says nothing about how much actually changed.
         format!(
-            "<span><b>{}</b> edits</span>",
-            fmt_thousands(o.edits as u64)
+            "<span><b>{}</b> file ops</span>",
+            fmt_thousands(o.file_ops as u64)
         ),
         format!(
-            "<span><b>{}</b> writes</span>",
-            fmt_thousands(o.writes as u64)
+            "<span><b>{}</b> lines written</span>",
+            fmt_thousands(o.lines_written as u64)
         ),
         format!(
             "<span><b>{}</b> reads</span>",
@@ -249,6 +252,13 @@ fn facts_strip(o: &crate::report::Overview, s: &Session) -> String {
         facts.push(format!(
             "<span><b>{}</b> subagents</span>",
             fmt_thousands(s.spawns.len() as u64)
+        ));
+    }
+    // Only when nonzero: explains why `file ops` is below the attempted count.
+    if o.file_ops_unconfirmed > 0 {
+        facts.push(format!(
+            "<span><b>{}</b> unconfirmed</span>",
+            fmt_thousands(o.file_ops_unconfirmed as u64)
         ));
     }
     format!("<div class=\"facts\">{}</div>", facts.join(""))

@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "frozen_at": "2026-07-22",
+  "rule": "Holdout membership is frozen by project fingerprint, NOT by position in a sorted list. Adding or removing a project must never change which projects are held out.",
+  "fingerprint": "sha256(project path as reported by the dump's `project` field), first 16 hex chars. One-way: the real path is not recoverable from this file, so the snapshot is safe to commit while the path->fingerprint mapping stays in untracked scratch.",
+  "held_out_fingerprints": [
+    "016b86cddcb0709a",
+    "3aa009d27c321bf5"
+  ],
+  "note": "These two fingerprints are exactly the projects that the original 2026-07-22 index-based rule (sorted anonymized ids, indices 1 and 4) selected against the corpus as it stood at freeze time. Recording them by fingerprint preserves that membership permanently. scripts/validity_sweep.py fails closed if any of these is absent from the discovered corpus."
+}

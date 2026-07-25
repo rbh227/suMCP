@@ -21,10 +21,22 @@ Pipeline:
      edit-count-stratified relative risk for both flag definitions
      (flagged_nr, flagged_top3).
 
+Holdout discipline (two rules, both enforced here rather than by convention):
+  - Membership is FROZEN BY FINGERPRINT in docs/validation/holdout-snapshot.json,
+    never by position in a sorted list. Positional selection silently swaps
+    which projects are held out whenever the corpus grows. Missing frozen
+    projects fail the run closed rather than degrading quietly.
+  - Development runs never compute or persist held-out results. The split
+    happens before any metric is calculated, and held-out pair records stay
+    out of the raw output entirely. Scoring them requires the explicit
+    `--release-eval` invocation, which writes to its own file.
+
 Outputs:
-  - .superpowers/sdd/validity-raw.json: full per-pair records + aggregates.
-    Scratch. NOT for the repo. Contains real project names/paths (the
-    anonymization mapping lives here, nowhere else).
+  - .superpowers/sdd/validity-raw.json: tune-split per-pair records +
+    aggregates. Scratch. NOT for the repo. Contains real project names/paths
+    (the anonymization mapping lives here, nowhere else).
+  - .superpowers/sdd/validity-heldout-eval.json: held-out scores. Written
+    ONLY by `--release-eval`. Scratch, NOT for the repo.
   - docs/validation/2026-07-22-predictive-validity.md: aggregate-only DRAFT
     report. No real paths, no project names, no prompt text -- projects are
     anonymized as proj-01..proj-NN.
@@ -50,6 +62,11 @@ REPO = Path(__file__).resolve().parent.parent
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
 CACHE_DIR = REPO / ".superpowers" / "sdd" / "validity"
 RAW_OUT = REPO / ".superpowers" / "sdd" / "validity-raw.json"
+# Committed, fingerprints only (no real paths): the immutable holdout roster.
+HOLDOUT_SNAPSHOT = REPO / "docs" / "validation" / "holdout-snapshot.json"
+# Held-out evaluation output. Written ONLY under --release-eval, never by a
+# development run, so held-out outcomes cannot leak into day-to-day work.
+RELEASE_EVAL_OUT = REPO / ".superpowers" / "sdd" / "validity-heldout-eval.json"
 DRAFT_OUT = REPO / "docs" / "validation" / "2026-07-22-predictive-validity.md"
 DUMP_BIN = REPO / "target" / "release" / "examples" / "validity_dump"
 
@@ -205,6 +222,71 @@ def anonymize_projects(groups: dict[str, list[dict]]) -> dict[str, str]:
     }
 
 
+def project_fingerprint(real: str) -> str:
+    """Stable, corpus-independent identity for a project.
+
+    A holdout is only a holdout if its MEMBERSHIP is immutable. Anonymized
+    ids (proj-01..proj-NN) are positional: they are assigned by sorting the
+    real project names, so adding a project that sorts earlier renumbers
+    everything after it. Selecting held-out projects by position in that list
+    therefore silently swaps which projects are held out whenever the corpus
+    grows -- contaminating the tune split with previously held-out data and
+    invalidating any later held-out evaluation.
+
+    Hashing the real project path gives an identity that never moves. It is
+    one-way, so `docs/validation/holdout-snapshot.json` can be committed
+    without disclosing the paths themselves.
+    """
+    return hashlib.sha256(real.encode("utf-8")).hexdigest()[:16]
+
+
+def held_out_project_ids(
+    groups: dict[str, list[dict]], anon: dict[str, str]
+) -> tuple[set[str], list[str]]:
+    """Resolve the frozen roster against this corpus.
+
+    Returns (held_out_anon_ids, absent_fingerprints).
+
+    Resolution is by fingerprint, so a frozen project that IS present is
+    always held out no matter how the anonymized numbering shifted. That is
+    the property that matters: contamination means a held-out project
+    silently landing in the TUNE split, and fingerprint resolution makes that
+    unrepresentable.
+
+    A frozen project that is ABSENT from the corpus is a different case, and
+    not contamination -- it is in neither split, so it can leak nothing. It
+    happens legitimately (a project whose only session drops below
+    MIN_ACTIONS disappears entirely). Rather than blocking every run, we
+    carry the absent fingerprints out to the caller so they are recorded in
+    the output and printed, and we keep them in the snapshot so the project
+    is held out again automatically if it ever returns.
+
+    We DO fail closed when the roster resolves to nothing at all: an empty
+    holdout would silently turn a "held-out evaluation" into a no-op that
+    still looks like it ran.
+    """
+    if not HOLDOUT_SNAPSHOT.exists():
+        sys.exit(
+            f"holdout snapshot missing: {HOLDOUT_SNAPSHOT}\n"
+            "Refusing to guess membership -- a recomputed holdout is not a holdout."
+        )
+    snapshot = json.loads(HOLDOUT_SNAPSHOT.read_text())
+    frozen = set(snapshot["held_out_fingerprints"])
+
+    by_fingerprint = {project_fingerprint(real): anon[real] for real in groups}
+    resolved = {by_fingerprint[fp] for fp in frozen if fp in by_fingerprint}
+    absent = sorted(frozen - set(by_fingerprint))
+
+    if not resolved:
+        sys.exit(
+            "fail closed: NO frozen held-out project is present in this corpus "
+            f"(roster: {sorted(frozen)}).\n"
+            "Every metric would silently become an all-data metric. Restore the "
+            "missing project(s), or deliberately re-freeze."
+        )
+    return resolved, absent
+
+
 # ---- pair construction -----------------------------------------------------
 
 
@@ -273,6 +355,11 @@ def build_pairs(groups: dict[str, list[dict]], anon: dict[str, str]) -> tuple[li
                         "stratum": edit_stratum(entry["edits"]),
                         "flagged_nr": entry["flagged_nr"],
                         "flagged_top3": entry["flagged_top3"],
+                        # Study heuristic (T5.4-followup, 2026-07-22), not a
+                        # product signal: see validity_dump.rs's
+                        # `last_edit_verified` doc comment for the exact
+                        # definition. Used only by hypothesis_table() below.
+                        "last_edit_verified": entry.get("last_edit_verified", False),
                         "next3_weak": outcome_in_window(next3, file, strong=False),
                         "next3_strong": outcome_in_window(next3, file, strong=True),
                         "within14d_weak": outcome_in_window(within14d, file, strong=False),
@@ -371,6 +458,88 @@ def compute_metrics(pairs: list[dict]) -> dict:
     return metrics
 
 
+def hypothesis_table(tune: list[dict]) -> dict:
+    """Unverified-ending hypothesis (T5.4-followup, 2026-07-22, no tuning --
+    pure stratification, tune-split only): flags on files whose last edit
+    was never verified recur more than flags on verified files. Strong
+    outcome, next-3-sessions window, throughout (fixed, not swept).
+
+    Two views:
+      - "flagged_nr_split": within flagged_nr's usual RR/precision, the
+        tune-split population is first split by last_edit_verified, so each
+        cell answers "how well does flagged_nr do among files that WERE
+        verified" vs "among files that were NOT" -- same contingency/RR/
+        precision machinery as the edit-count stratification above, just a
+        different stratifier.
+      - "standalone": last_edit_verified used AS the predictor by itself
+        (unverified = positive), over every tune-split edited file,
+        ignoring flagged_nr entirely -- does the field carry signal on its
+        own, independent of the product's existing flags.
+
+    Takes the already-filtered tune split. Filtering here from a full pair
+    list would mean the caller had held-out records in hand anyway, which is
+    exactly the exposure this study is supposed to prevent.
+    """
+    flagged_nr_split = {}
+    for verified in (True, False):
+        sub = [p for p in tune if p["last_edit_verified"] == verified]
+        a, b, c, d = contingency(sub, "flagged_nr", "next3_strong")
+        flagged_nr_split[str(verified)] = {
+            "n": len(sub),
+            "counts": {"a": a, "b": b, "c": c, "d": d},
+            "relative_risk": relative_risk(a, b, c, d),
+            "precision": precision(a, b),
+        }
+
+    a = sum(1 for p in tune if not p["last_edit_verified"] and p["next3_strong"])
+    b = sum(1 for p in tune if not p["last_edit_verified"] and not p["next3_strong"])
+    c = sum(1 for p in tune if p["last_edit_verified"] and p["next3_strong"])
+    d = sum(1 for p in tune if p["last_edit_verified"] and not p["next3_strong"])
+    standalone = {
+        "n": len(tune),
+        "counts": {"a": a, "b": b, "c": c, "d": d},
+        "relative_risk": relative_risk(a, b, c, d),
+        "precision": precision(a, b),
+    }
+
+    return {
+        "n_tune_pairs": len(tune),
+        "flagged_nr_split": flagged_nr_split,
+        "standalone": standalone,
+    }
+
+
+def render_hypothesis_table(h: dict) -> str:
+    """Plain-text rendering for stdout / the autopsy draft (this table is
+    NOT part of render_draft()/DRAFT_OUT -- it lives in the autopsy draft
+    only, per the T5.4-followup brief)."""
+    lines = []
+    lines.append("Unverified-ending hypothesis (tune-split only, strong outcome, next-3-sessions window):")
+    lines.append(f"  tune-split pairs: {h['n_tune_pairs']}")
+    lines.append("")
+    lines.append("  flagged_nr RR/precision, split by last_edit_verified:")
+    lines.append("  | last_edit_verified | n | RR | precision | a | b | c | d |")
+    lines.append("  |---|---|---|---|---|---|---|---|")
+    for key in ("True", "False"):
+        s = h["flagged_nr_split"][key]
+        c = s["counts"]
+        lines.append(
+            f"  | {key} | {s['n']} | {fmt(s['relative_risk'])} | {fmt(s['precision'])} | "
+            f"{c['a']} | {c['b']} | {c['c']} | {c['d']} |"
+        )
+    lines.append("")
+    s = h["standalone"]
+    c = s["counts"]
+    lines.append("  standalone signal (unverified vs verified, ALL edited files, flagged_nr ignored):")
+    lines.append(
+        f"  | n | RR | precision | a | b | c | d |\n"
+        f"  |---|---|---|---|---|---|---|\n"
+        f"  | {s['n']} | {fmt(s['relative_risk'])} | {fmt(s['precision'])} | "
+        f"{c['a']} | {c['b']} | {c['c']} | {c['d']} |"
+    )
+    return "\n".join(lines)
+
+
 # ---- report rendering -----------------------------------------------------
 
 
@@ -385,7 +554,10 @@ def render_draft(
     n_projects: int,
     n_sessions: int,
     date_range: tuple[str, str],
+    held_out_ids: list[str],
 ) -> str:
+    """`pairs`/`metrics` are the TUNE SPLIT only; `held_out_ids` is reported
+    so the reader knows what was withheld rather than inferring it."""
     flag_label = {"flagged_nr": "flagged_nr (review::needs_review)", "flagged_top3": "flagged_top3 (score::rank top-3)"}
     window_label = {"next3": "next 3 sessions", "within14d": "within 14 days"}
     outcome_label = {"weak": "weak (any future edit)", "strong": "strong (struggle recurrence)"}
@@ -398,6 +570,13 @@ def render_draft(
     lines.append("predict-then-check rule: parameters would be set on one subset of")
     lines.append("projects and re-run, unchanged, on the held-out remainder, never")
     lines.append("fit and reported on the same data.")
+    lines.append("")
+    lines.append("Scope: every number in this report is computed on the TUNE SPLIT only.")
+    lines.append("Held-out projects contribute nothing to any table here, and their")
+    lines.append("per-pair outcomes are not written to the raw output either. Holdout")
+    lines.append("membership is frozen by project fingerprint in")
+    lines.append("`docs/validation/holdout-snapshot.json`, so it cannot drift as the")
+    lines.append("corpus grows.")
     lines.append("")
     lines.append("## Method")
     lines.append("")
@@ -426,7 +605,11 @@ def render_draft(
     lines.append(f"- projects: {n_projects} (anonymized as proj-01..proj-{n_projects:02d})")
     lines.append(f"- sessions analyzed: {n_sessions}")
     lines.append(f"- date range: {date_range[0]} to {date_range[1]}")
-    lines.append(f"- (session, edited-file) pairs in the metrics below: {len(pairs)}")
+    lines.append(
+        f"- held out, excluded from every number below: {', '.join(held_out_ids)} "
+        f"(scored only at a release gate, via `validity_sweep.py --release-eval`)"
+    )
+    lines.append(f"- (session, edited-file) pairs in the metrics below: {len(pairs)} (tune split)")
     lines.append(
         f"- pairs excluded (session N is the last session of its project, no window "
         f"successor exists): {excluded_pairs}"
@@ -516,33 +699,84 @@ def main() -> int:
         print("no eligible sessions found", file=sys.stderr)
         return 1
 
+    release_eval = "--release-eval" in sys.argv
+
     groups = group_by_project(sessions)
     anon = anonymize_projects(groups)
     pairs, excluded_pairs = build_pairs(groups, anon)
-    metrics = compute_metrics(pairs)
+    held_out, held_out_absent = held_out_project_ids(groups, anon)
+
+    # Split BEFORE any metric is computed or persisted. Computing over all
+    # pairs first and filtering afterwards would still put held-out labels,
+    # outcomes and aggregates into the development output on every run, which
+    # makes the holdout recoverable and defeats the once-per-release rule.
+    tune_pairs = [p for p in pairs if p["project"] not in held_out]
+    held_out_pairs = [p for p in pairs if p["project"] in held_out]
 
     times = [
         session_time(s["dump"], s["transcript"]).isoformat() for s in sessions
     ]
     date_range = (min(times), max(times)) if times else ("", "")
 
+    if release_eval:
+        # The gated once-per-release evaluation. Deliberately a separate file
+        # and a separate invocation so held-out results can never appear as a
+        # side effect of ordinary development.
+        RELEASE_EVAL_OUT.parent.mkdir(parents=True, exist_ok=True)
+        RELEASE_EVAL_OUT.write_text(
+            json.dumps(
+                {
+                    "scope": "HELD-OUT PROJECTS ONLY -- once-per-release gate",
+                    "held_out_project_ids": sorted(held_out),
+                    "n_held_out_pairs": len(held_out_pairs),
+                    "metrics": compute_metrics(held_out_pairs),
+                    "hypothesis_unverified_ending": hypothesis_table(held_out_pairs),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        print(f"HELD-OUT EVALUATION (release gate) -> {RELEASE_EVAL_OUT}")
+        print(f"held-out projects: {sorted(held_out)}  pairs: {len(held_out_pairs)}")
+        return 0
+
+    # ---- development run: tune split only, from here down --------------
+    metrics = compute_metrics(tune_pairs)
+    hypothesis = hypothesis_table(tune_pairs)
+
     raw = {
+        "scope": "TUNE SPLIT ONLY -- held-out projects excluded from every "
+        "record and aggregate below",
         "counters": counters,
         "project_mapping": {v: k for k, v in anon.items()},
         "n_projects": len(groups),
         "n_sessions": len(sessions),
         "date_range": date_range,
         "excluded_pairs_last_session": excluded_pairs,
-        "n_pairs": len(pairs),
-        "pairs": pairs,
+        "n_pairs": len(tune_pairs),
+        "pairs": tune_pairs,
         "metrics": metrics,
+        "held_out_project_ids": sorted(held_out),
+        # Frozen roster entries with no project in this corpus. Recorded so a
+        # partially-satisfiable freeze is visible, never inferred.
+        "held_out_absent_fingerprints": held_out_absent,
+        # Count only. The held-out pair records, their labels and their
+        # outcomes are deliberately absent from this file.
+        "n_held_out_pairs_withheld": len(held_out_pairs),
+        "hypothesis_unverified_ending": hypothesis,
     }
     RAW_OUT.parent.mkdir(parents=True, exist_ok=True)
     RAW_OUT.write_text(json.dumps(raw, indent=2, sort_keys=True))
 
     DRAFT_OUT.parent.mkdir(parents=True, exist_ok=True)
     draft = render_draft(
-        metrics, pairs, excluded_pairs, len(groups), len(sessions), date_range
+        metrics,
+        tune_pairs,
+        excluded_pairs,
+        len(groups),
+        len(sessions),
+        date_range,
+        sorted(held_out),
     )
     DRAFT_OUT.write_text(draft)
 
@@ -551,7 +785,20 @@ def main() -> int:
     print(f"  excluded (dump failed): {counters['excluded_dump_failed']}")
     print(f"  excluded (actions <{MIN_ACTIONS}): {counters['excluded_low_actions']}")
     print(f"  used: {counters['sessions']}  across {len(groups)} projects")
-    print(f"pairs: {len(pairs)}  excluded (last session of project): {excluded_pairs}")
+    print(
+        f"tune-split pairs: {len(tune_pairs)}  "
+        f"(held out and withheld: {len(held_out_pairs)})  "
+        f"excluded (last session of project): {excluded_pairs}"
+    )
+    print(f"held-out project ids: {sorted(held_out)}  [run --release-eval to score them]")
+    if held_out_absent:
+        print(
+            f"  NOTE: {len(held_out_absent)} frozen held-out project(s) are not in "
+            f"this corpus and contribute nothing: {held_out_absent}"
+        )
+    print()
+    print(render_hypothesis_table(hypothesis))
+    print()
     print(f"raw: {RAW_OUT}")
     print(f"draft: {DRAFT_OUT}")
     return 0

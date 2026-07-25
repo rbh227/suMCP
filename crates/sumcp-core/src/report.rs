@@ -18,6 +18,32 @@ pub struct Overview {
     pub edits: usize,
     /// Write count.
     pub writes: usize,
+    /// File-modifying operations that CONFIRMED success (`is_error ==
+    /// Some(false)`). Reported because `edits` alone reads as "everything that
+    /// changed a file" but omits Write, which undercounts by 20-50% on a
+    /// typical session.
+    ///
+    /// Only confirmed-successful actions count: ingest records an action from
+    /// the proposed tool call, before the result is known, so a failed Edit
+    /// (old_string mismatch, rejected write) would otherwise be reported as
+    /// work that changed a file when it changed nothing. Anything not confirmed
+    /// successful is disclosed in [`Self::file_ops_unconfirmed`].
+    pub file_ops: usize,
+    /// Lines of NEW content across every CONFIRMED-successful Edit
+    /// (`new_string`) and Write (`content`). A tool-call count says how often a
+    /// tool fired, not how much changed — one Edit can rewrite hundreds of
+    /// lines. Summed from `Action::write_lines`, which ingest counts on the
+    /// full string before capping, so large writes stay accurate.
+    ///
+    /// Scope: lines *written*. Deletions are not counted (an Edit that removes
+    /// 50 lines and adds 2 contributes 2), because `edit_old` is stored capped
+    /// and would undercount exactly the largest edits.
+    pub lines_written: usize,
+    /// Edit/Write actions whose result did NOT confirm success: an explicit
+    /// `is_error: true`, or no tool result at all (a truncated or mid-flight
+    /// session). Excluded from `file_ops`/`lines_written` and surfaced here so
+    /// the gap is visible rather than silently counted either way.
+    pub file_ops_unconfirmed: usize,
     /// Read count.
     pub reads: usize,
     /// Bash count.
@@ -65,11 +91,41 @@ impl Overview {
             _ => None,
         };
 
+        let edits = count(&ActionKind::Edit);
+        let writes = count(&ActionKind::Write);
+
+        // Headline totals count only file-modifying actions whose result
+        // CONFIRMED success. `write_lines` is captured from the proposed input
+        // before the result is known, so an errored or result-less action would
+        // otherwise report lines that never reached the file. Every lane is
+        // included, so subagent work counts.
+        let modifying = s
+            .actions
+            .iter()
+            .filter(|a| matches!(a.kind, ActionKind::Edit | ActionKind::Write));
+        let (mut file_ops, mut lines_written, mut file_ops_unconfirmed) = (0, 0, 0);
+        for a in modifying {
+            if a.is_error == Some(false) {
+                file_ops += 1;
+                // `unwrap_or(0)` because an Edit whose input carried no
+                // `new_string` (a malformed line) contributes no known volume
+                // rather than breaking the total.
+                lines_written += a.write_lines.unwrap_or(0);
+            } else {
+                // Some(true) = confirmed failure; None = no tool result, so the
+                // outcome is unknown. Neither is a confirmed write.
+                file_ops_unconfirmed += 1;
+            }
+        }
+
         Overview {
             actions: s.actions.len(),
             files_touched: files.len(),
-            edits: count(&ActionKind::Edit),
-            writes: count(&ActionKind::Write),
+            edits,
+            writes,
+            file_ops,
+            lines_written,
+            file_ops_unconfirmed,
             reads: count(&ActionKind::Read),
             bash: count(&ActionKind::Bash),
             output_tokens: s.tokens.output,
@@ -90,10 +146,26 @@ impl Overview {
             .unwrap_or_else(|| "n/a".into());
         let mut out = String::new();
         out.push_str("── session overview ──\n");
+        // Lead with the two honest numbers: how many operations changed files,
+        // and how much they changed. The edits/writes split stays on the second
+        // line for anyone who wants the breakdown.
         out.push_str(&format!(
-            "actions {}  |  files {}  |  edits {}  writes {}  reads {}  bash {}\n",
-            self.actions, self.files_touched, self.edits, self.writes, self.reads, self.bash
+            "actions {}  |  files {}  |  file ops {}  lines written {}\n",
+            self.actions, self.files_touched, self.file_ops, self.lines_written
         ));
+        out.push_str(&format!(
+            "  attempted: edits {}  writes {}  |  reads {}  bash {}\n",
+            self.edits, self.writes, self.reads, self.bash
+        ));
+        // Only shown when nonzero: on a clean session this line is noise, but
+        // when edits failed the headline is smaller than the attempt counts
+        // above and that difference must be explained, not left to inference.
+        if self.file_ops_unconfirmed > 0 {
+            out.push_str(&format!(
+                "  {} file op(s) did not confirm success (errored or no result)\n",
+                self.file_ops_unconfirmed
+            ));
+        }
         out.push_str(&format!(
             "tokens: output {}  cache-read {}  (cache hit {})\n",
             self.output_tokens, self.cache_read_tokens, ratio
@@ -252,6 +324,154 @@ mod tests {
         assert_eq!(o.bash, 1);
         assert_eq!(o.files_touched, 1, "same file read+edited counts once");
         assert_eq!(o.span.unwrap().0, "2026-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn file_ops_sums_edits_and_writes() {
+        // WHY: `edits` alone reads as "all file modifications" but excludes
+        // Write, undercounting file-modifying operations. `file_ops` is the
+        // honest single number: every Edit plus every Write.
+        let raw = concat!(
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"tool_use","id":"1","name":"Edit","input":{"file_path":"/a.ts","new_string":"a\nb"}}]}}"#,
+            "\n",
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:01Z","message":{"content":[{"type":"tool_result","tool_use_id":"1","is_error":false}]}}"#,
+            "\n",
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:02Z","message":{"content":[{"type":"tool_use","id":"2","name":"Edit","input":{"file_path":"/b.ts","new_string":"c"}}]}}"#,
+            "\n",
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:03Z","message":{"content":[{"type":"tool_result","tool_use_id":"2","is_error":false}]}}"#,
+            "\n",
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:04Z","message":{"content":[{"type":"tool_use","id":"3","name":"Write","input":{"file_path":"/c.ts","content":"x\ny\nz"}}]}}"#,
+            "\n",
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:05Z","message":{"content":[{"type":"tool_result","tool_use_id":"3","is_error":false}]}}"#,
+            "\n",
+            // A Read must NOT count as a file-modifying operation.
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:06Z","message":{"content":[{"type":"tool_use","id":"4","name":"Read","input":{"file_path":"/a.ts"}}]}}"#,
+            "\n",
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:07Z","message":{"content":[{"type":"tool_result","tool_use_id":"4","is_error":false}]}}"#,
+        );
+        let o = Overview::from_session(&ingest_str(raw, Lane::Main));
+        assert_eq!(o.edits, 2);
+        assert_eq!(o.writes, 1);
+        assert_eq!(o.file_ops, 3, "2 edits + 1 write, the Read excluded");
+        assert_eq!(o.file_ops_unconfirmed, 0, "all three confirmed");
+    }
+
+    #[test]
+    fn lines_written_sums_new_content_over_edits_and_writes() {
+        // WHY: a tool-call count undershoots the volume of change — one Edit
+        // can rewrite hundreds of lines. `lines_written` sums the NEW content
+        // of every Edit (`new_string`) and Write (`content`), so the headline
+        // reports scale, not just how many times a tool fired.
+        let raw = concat!(
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"tool_use","id":"1","name":"Edit","input":{"file_path":"/a.ts","new_string":"a\nb\nc"}}]}}"#,
+            "\n",
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:01Z","message":{"content":[{"type":"tool_result","tool_use_id":"1","is_error":false}]}}"#,
+            "\n",
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:02Z","message":{"content":[{"type":"tool_use","id":"2","name":"Write","input":{"file_path":"/c.ts","content":"x\ny"}}]}}"#,
+            "\n",
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:03Z","message":{"content":[{"type":"tool_result","tool_use_id":"2","is_error":false}]}}"#,
+            "\n",
+            // Reads carry no new content and must contribute nothing.
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:04Z","message":{"content":[{"type":"tool_use","id":"3","name":"Read","input":{"file_path":"/a.ts"}}]}}"#,
+            "\n",
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:05Z","message":{"content":[{"type":"tool_result","tool_use_id":"3","is_error":false}]}}"#,
+        );
+        let o = Overview::from_session(&ingest_str(raw, Lane::Main));
+        assert_eq!(o.lines_written, 5, "3 edited lines + 2 written lines");
+        assert_eq!(o.file_ops, 2);
+    }
+
+    #[test]
+    fn lines_written_counts_subagent_work_too() {
+        // WHY: the whole point of the merge is that subagent work lands in the
+        // headline. A session whose edits happened almost entirely inside
+        // subagents must not report a near-zero volume.
+        use crate::merge::merge_sessions;
+        let main = ingest_str(
+            concat!(
+                r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"tool_use","id":"1","name":"Edit","input":{"file_path":"/a.ts","new_string":"only\nline"}}]}}"#,
+                "\n",
+                r#"{"type":"user","timestamp":"2026-01-01T00:00:01Z","message":{"content":[{"type":"tool_result","tool_use_id":"1","is_error":false}]}}"#,
+            ),
+            Lane::Main,
+        );
+        let sub = ingest_str(
+            concat!(
+                r#"{"type":"assistant","timestamp":"2026-01-01T00:00:02Z","message":{"content":[{"type":"tool_use","id":"2","name":"Write","input":{"file_path":"/big.rs","content":"1\n2\n3\n4\n5\n6\n7\n8"}}]}}"#,
+                "\n",
+                r#"{"type":"user","timestamp":"2026-01-01T00:00:03Z","message":{"content":[{"type":"tool_result","tool_use_id":"2","is_error":false}]}}"#,
+            ),
+            Lane::Sub("helper".into()),
+        );
+        let o = Overview::from_session(&merge_sessions(main, vec![sub], 0));
+        assert_eq!(o.file_ops, 2, "main edit + subagent write");
+        assert_eq!(o.lines_written, 10, "2 from main + 8 from the subagent");
+    }
+
+    #[test]
+    fn failed_edits_are_excluded_from_written_totals() {
+        // WHY: ingest records `write_lines` from the PROPOSED input, before the
+        // tool result is known. An Edit that failed (old_string mismatch, or a
+        // rejected write) changed no file, so counting its lines as "written"
+        // overstates real work. Confirmed failures must land in the
+        // `unconfirmed` bucket instead of the headline.
+        let raw = concat!(
+            // Succeeded: 3 lines, counts.
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"tool_use","id":"ok","name":"Edit","input":{"file_path":"/a.ts","new_string":"a\nb\nc"}}]}}"#,
+            "\n",
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:01Z","message":{"content":[{"type":"tool_result","tool_use_id":"ok","is_error":false}]}}"#,
+            "\n",
+            // Failed: 99 lines proposed, none written.
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:02Z","message":{"content":[{"type":"tool_use","id":"bad","name":"Write","input":{"file_path":"/b.ts","content":"x\ny\nz"}}]}}"#,
+            "\n",
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:03Z","message":{"content":[{"type":"tool_result","tool_use_id":"bad","is_error":true}]}}"#,
+        );
+        let o = Overview::from_session(&ingest_str(raw, Lane::Main));
+        assert_eq!(o.file_ops, 1, "only the confirmed-successful Edit");
+        assert_eq!(o.lines_written, 3, "the failed Write's 3 lines excluded");
+        assert_eq!(o.file_ops_unconfirmed, 1, "the failed Write is disclosed");
+        // The raw per-kind counts stay unfiltered: they describe what the agent
+        // ATTEMPTED, which the failure signals still need.
+        assert_eq!(o.edits, 1);
+        assert_eq!(o.writes, 1);
+    }
+
+    #[test]
+    fn edits_with_no_tool_result_are_unconfirmed_not_written() {
+        // WHY: a truncated or mid-flight session leaves the last Edit with no
+        // tool_result, so `is_error` is None — outcome unknown, not success.
+        // Claiming those lines were "written" would be a guess; they belong in
+        // `unconfirmed` so the gap is visible rather than silently optimistic.
+        let raw = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"tool_use","id":"dangling","name":"Edit","input":{"file_path":"/a.ts","new_string":"a\nb"}}]}}"#;
+        let o = Overview::from_session(&ingest_str(raw, Lane::Main));
+        assert_eq!(o.file_ops, 0, "unknown outcome is not a confirmed write");
+        assert_eq!(o.lines_written, 0);
+        assert_eq!(o.file_ops_unconfirmed, 1, "disclosed, not dropped");
+    }
+
+    #[test]
+    fn text_view_reports_file_ops_and_lines_written() {
+        // WHY: the regression that started this — the rendered headline said
+        // "edits N" and silently excluded writes and all volume. Assert the
+        // rendered string carries both the operation count and the volume.
+        let raw = concat!(
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"tool_use","id":"1","name":"Edit","input":{"file_path":"/a.ts","new_string":"a\nb\nc"}}]}}"#,
+            "\n",
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:01Z","message":{"content":[{"type":"tool_result","tool_use_id":"1","is_error":false}]}}"#,
+            "\n",
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:02Z","message":{"content":[{"type":"tool_use","id":"2","name":"Write","input":{"file_path":"/c.ts","content":"x\ny"}}]}}"#,
+            "\n",
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:03Z","message":{"content":[{"type":"tool_result","tool_use_id":"2","is_error":false}]}}"#,
+        );
+        let text = Overview::from_session(&ingest_str(raw, Lane::Main)).to_text();
+        assert!(
+            text.contains("file ops 2"),
+            "operations must be one honest number, got:\n{text}"
+        );
+        assert!(
+            text.contains("lines written 5"),
+            "volume must appear alongside the op count, got:\n{text}"
+        );
     }
 
     #[test]

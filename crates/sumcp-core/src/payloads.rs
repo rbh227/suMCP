@@ -59,7 +59,13 @@ pub fn session_overview(s: &Session, ranked: &[FileScore], meta: &SessionMeta) -
             "started": started, "duration_min": duration_min
         },
         "totals": {
-            "actions": o.actions, "edits": o.edits, "writes": o.writes,
+            // `file_ops` (edits+writes) and `lines_written` lead: `edits` alone
+            // omits Write, and any tool-call count omits the volume of change.
+            // The edits/writes split is kept for consumers that want it.
+            "actions": o.actions, "file_ops": o.file_ops,
+            "lines_written": o.lines_written,
+            "file_ops_unconfirmed": o.file_ops_unconfirmed,
+            "edits": o.edits, "writes": o.writes,
             "reads": o.reads, "bash": o.bash, "files_touched": o.files_touched,
             "interrupts": s.interrupts
         },
