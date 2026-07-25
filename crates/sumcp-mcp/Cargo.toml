@@ -3,6 +3,7 @@ name = "sumcp-mcp"
 description = "suMCP MCP server over stdio: six read-only session-forensics tools"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 

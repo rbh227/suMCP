@@ -1,12 +1,14 @@
 //! `sumcp` — human CLI over the same Report the MCP server serves.
 //!
-//! `sumcp --file <path>` prints the overview + ranked struggle areas.
-//! `--json` emits the `session_overview` payload (the frozen v0 contract).
+//! Bare `sumcp` analyzes the most recent session of the current project, so
+//! the first run needs no arguments; `--file <path>` overrides that choice.
+//! Either way it prints the overview + ranked struggle areas, or the
+//! `session_overview` payload (the frozen v0 contract) under `--json`.
 
 mod install;
 
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use sumcp_core::payloads::{SessionMeta, session_overview};
 use sumcp_core::score::{Weights, rank};
@@ -15,10 +17,11 @@ use sumcp_core::score::{Weights, rank};
 #[derive(Parser)]
 #[command(name = "sumcp", version, about)]
 struct Args {
-    /// Optional subcommand. When omitted, the legacy `--file` analysis path runs.
+    /// Optional subcommand. When omitted, the analysis path runs.
     #[command(subcommand)]
     command: Option<Command>,
-    /// Path to a transcript `.jsonl` to analyze.
+    /// Path to a transcript `.jsonl` to analyze. Defaults to the most recent
+    /// session of the current directory's project.
     #[arg(long)]
     file: Option<PathBuf>,
     /// Emit the session_overview JSON payload instead of the text view.
@@ -47,6 +50,90 @@ enum Command {
     },
 }
 
+/// The transcript we are going to analyze, plus how we chose it.
+#[derive(Debug)]
+struct Target {
+    /// Path to the main transcript `.jsonl`.
+    path: PathBuf,
+    /// ADR A4 provenance: `"explicit"` when the user named the file,
+    /// `"cli_latest"` when we inferred it from recency.
+    identified_by: &'static str,
+}
+
+/// Why there is nothing to analyze. An enum rather than a string so the
+/// caller (which owns all the printing) cannot mix the two cases up: they
+/// need very different advice.
+#[derive(Debug, PartialEq)]
+enum NoTarget {
+    /// We could not work out where to look at all (no `$HOME`, or the cwd is
+    /// unreadable), so we never got as far as a project directory.
+    NowhereToLook,
+    /// We looked in this project dir and it holds no session transcripts.
+    NoSessions(PathBuf),
+}
+
+/// Decide which transcript to analyze.
+///
+/// An explicit `--file` always wins: the user naming a path is the strongest
+/// signal there is. It is also resolved BEFORE we look at `claude_home`, so
+/// `sumcp --file x.jsonl` keeps working where there is no `~/.claude` and no
+/// `$HOME` at all (a CI container, say) — hence the `Option` arguments.
+/// Without `--file` we fall back to "the session I last worked in here",
+/// which is what a human at a terminal means by a bare `sumcp`.
+///
+/// Pure: no env, no printing, so tests can drive it against a temp tree. The
+/// `NoSessions` case carries the directory we searched, because that path is
+/// the only thing that makes the failure actionable (it usually means the
+/// user is one directory below the root Claude Code was launched from).
+fn resolve_target(
+    file: Option<PathBuf>,
+    claude_home: Option<&Path>,
+    cwd: Option<&Path>,
+) -> Result<Target, NoTarget> {
+    if let Some(path) = file {
+        return Ok(Target {
+            path,
+            identified_by: "explicit",
+        });
+    }
+    // Both are needed to name the project directory; either one missing means
+    // we have no question to ask the filesystem.
+    let (Some(home), Some(cwd)) = (claude_home, cwd) else {
+        return Err(NoTarget::NowhereToLook);
+    };
+    let project_dir = sumcp_core::locate::project_dir(home, cwd);
+    match sumcp_core::locate::newest_transcript(&project_dir) {
+        Some(path) => Ok(Target {
+            path,
+            identified_by: "cli_latest",
+        }),
+        None => Err(NoTarget::NoSessions(project_dir)),
+    }
+}
+
+/// The session id a transcript path carries as its file stem. A `--file` the
+/// user renamed has no uuid stem, so this is a label, never a validated id.
+fn stem_id(path: &Path) -> String {
+    path.file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+/// `~/.claude`, overridable via `SUMCP_CLAUDE_HOME` (tests point this at a
+/// fixture tree; there is no other reason to set it). Mirrors the same
+/// resolution the MCP server does, so both halves read the same transcripts.
+fn claude_home() -> Option<PathBuf> {
+    claude_home_from(
+        std::env::var_os("SUMCP_CLAUDE_HOME").map(PathBuf::from),
+        std::env::var_os("HOME").map(PathBuf::from),
+    )
+}
+
+/// The pure core of [`claude_home`] (env-free, so tests can drive it).
+fn claude_home_from(override_dir: Option<PathBuf>, home: Option<PathBuf>) -> Option<PathBuf> {
+    override_dir.or_else(|| home.map(|h| h.join(".claude")))
+}
+
 fn main() -> ExitCode {
     let args = Args::parse();
 
@@ -73,11 +160,45 @@ fn main() -> ExitCode {
         None => {}
     }
 
-    let Some(path) = args.file else {
-        eprintln!("usage: sumcp --file <transcript.jsonl> [--json|--html]");
-        eprintln!("       sumcp install [--apply]   |   sumcp uninstall [--apply]");
-        return ExitCode::FAILURE;
+    // These two lookups can fail (an environment with no `$HOME`, a deleted
+    // cwd); `resolve_target` decides whether that actually mattered, since
+    // `--file` needs neither.
+    let home = claude_home();
+    let cwd = std::env::current_dir().ok();
+    let target = match resolve_target(args.file, home.as_deref(), cwd.as_deref()) {
+        Ok(t) => t,
+        Err(why) => {
+            match why {
+                NoTarget::NowhereToLook => {
+                    eprintln!("sumcp: cannot tell which project this is (no HOME, or the current");
+                    eprintln!("       directory is unreadable).");
+                }
+                NoTarget::NoSessions(searched) => {
+                    eprintln!("sumcp: no Claude Code sessions found for this project.");
+                    // `expect` is safe: NoSessions is only built once cwd is Some.
+                    let cwd = cwd.expect("cwd was resolved to reach NoSessions");
+                    eprintln!("  cwd:      {}", cwd.display());
+                    eprintln!("  searched: {}", searched.display());
+                    eprintln!("Claude Code stores transcripts per project directory, so run sumcp");
+                    eprintln!("from the directory you launched Claude Code in.");
+                }
+            }
+            eprintln!("To analyze a specific transcript instead:");
+            eprintln!("  sumcp --file <transcript.jsonl> [--json|--html]");
+            eprintln!("  sumcp install [--apply]   |   sumcp uninstall [--apply]");
+            return ExitCode::FAILURE;
+        }
     };
+    let path = target.path;
+    // The user never named this file, so say which session we picked. It goes
+    // to stderr on purpose: `--json`/`--html` stdout must stay pipeable.
+    if target.identified_by == "cli_latest" {
+        eprintln!(
+            "sumcp: analyzing most recent session {} ({})",
+            stem_id(&path),
+            path.display()
+        );
+    }
 
     // `load_session` does more than read one file: it ingests the main
     // transcript AND looks for sibling subagent transcripts next to it,
@@ -97,13 +218,9 @@ fn main() -> ExitCode {
         };
     let session = assembled.session;
     let ranked = rank(&session, &Weights::default());
-    // CLI resolves the session by path, so provenance is "explicit".
     let meta = SessionMeta {
-        id: path
-            .file_stem()
-            .map(|s| s.to_string_lossy().into())
-            .unwrap_or_default(),
-        identified_by: "explicit".into(),
+        id: stem_id(&path),
+        identified_by: target.identified_by.into(),
     };
 
     if args.html {
@@ -144,4 +261,95 @@ fn main() -> ExitCode {
         }
     }
     ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, SystemTime};
+
+    const ID_OLD: &str = "5717aaaa-1111-2222-3333-444455556666";
+    const ID_NEW: &str = "80b9a169-624f-4880-a2c3-24b96e2b4ea2";
+
+    /// Build a fake `~/.claude` holding transcripts for `cwd`'s project, each
+    /// with an explicit mtime so "newest" is deterministic rather than a race
+    /// between two writes in the same filesystem timestamp tick.
+    fn fake_home(claude_home: &Path, cwd: &Path, sessions: &[(&str, u64)]) {
+        let dir = sumcp_core::locate::project_dir(claude_home, cwd);
+        std::fs::create_dir_all(&dir).unwrap();
+        for (id, mtime_secs) in sessions {
+            let path = dir.join(format!("{id}.jsonl"));
+            std::fs::write(&path, "{}").unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(*mtime_secs))
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn bare_invocation_targets_the_newest_session_for_this_cwd() {
+        let td = tempfile::tempdir().unwrap();
+        let (home, cwd) = (td.path().join("claude"), td.path().join("proj"));
+        fake_home(&home, &cwd, &[(ID_OLD, 1_000_000), (ID_NEW, 2_000_000)]);
+
+        let target = resolve_target(None, Some(&home), Some(&cwd)).unwrap();
+        assert!(target.path.ends_with(format!("{ID_NEW}.jsonl")));
+        // ADR A4 provenance: recency is a guess, and the payload must say so.
+        assert_eq!(target.identified_by, "cli_latest");
+    }
+
+    #[test]
+    fn explicit_file_wins_over_recency_and_never_touches_the_project_dir() {
+        let td = tempfile::tempdir().unwrap();
+        let (home, cwd) = (td.path().join("claude"), td.path().join("proj"));
+        fake_home(&home, &cwd, &[(ID_NEW, 2_000_000)]);
+        let chosen = td.path().join("elsewhere.jsonl");
+
+        let target = resolve_target(Some(chosen.clone()), Some(&home), Some(&cwd)).unwrap();
+        assert_eq!(target.path, chosen);
+        assert_eq!(target.identified_by, "explicit");
+    }
+
+    #[test]
+    fn explicit_file_needs_neither_a_home_nor_a_cwd() {
+        // A container with no $HOME must still be able to run `sumcp --file`.
+        let target = resolve_target(Some("t.jsonl".into()), None, None).unwrap();
+        assert_eq!(target.path, PathBuf::from("t.jsonl"));
+    }
+
+    #[test]
+    fn no_sessions_for_this_project_reports_the_dir_it_searched() {
+        let td = tempfile::tempdir().unwrap();
+        let (home, cwd) = (td.path().join("claude"), td.path().join("proj"));
+        // Never opened in Claude Code: the project dir does not even exist.
+        assert_eq!(
+            resolve_target(None, Some(&home), Some(&cwd)).unwrap_err(),
+            NoTarget::NoSessions(sumcp_core::locate::project_dir(&home, &cwd))
+        );
+    }
+
+    #[test]
+    fn recency_without_a_home_has_nowhere_to_look() {
+        let td = tempfile::tempdir().unwrap();
+        assert_eq!(
+            resolve_target(None, None, Some(td.path())).unwrap_err(),
+            NoTarget::NowhereToLook
+        );
+    }
+
+    #[test]
+    fn claude_home_prefers_the_test_override_then_falls_back_to_home() {
+        assert_eq!(
+            claude_home_from(Some("/tmp/fixture".into()), Some("/Users/dev".into())),
+            Some(PathBuf::from("/tmp/fixture"))
+        );
+        assert_eq!(
+            claude_home_from(None, Some("/Users/dev".into())),
+            Some(PathBuf::from("/Users/dev/.claude"))
+        );
+        assert_eq!(claude_home_from(None, None), None);
+    }
 }

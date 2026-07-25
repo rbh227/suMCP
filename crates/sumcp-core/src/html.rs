@@ -894,8 +894,17 @@ fn blind_spots_section(s: &Session, meta: &SessionMeta) -> String {
                 },
             );
         }
-        if arr.len() > 5 {
-            let _ = write!(rows, "<li class=\"run\">… {} more</li>", arr.len() - 5);
+        // `arr` is the payload's list, which `payloads::blind_spots` caps at
+        // `list_cap` to hold its token budget. Deriving "N more" from it would
+        // undercount exactly the noisy sessions this note exists for, so use
+        // the pre-cap count the payload discloses in `totals`. Falling back to
+        // `arr.len()` keeps this correct if `totals` is ever absent.
+        let full = p["totals"][key]
+            .as_u64()
+            .map(|n| n as usize)
+            .unwrap_or(arr.len());
+        if full > 5 {
+            let _ = write!(rows, "<li class=\"run\">… {} more</li>", full - 5);
         }
     }
     let suppression = if p["suppression"]["approval_latency"].as_str() == Some("suppressed") {
@@ -1551,6 +1560,37 @@ mod tests {
         assert!(
             section.contains("<details class=\"ev\""),
             "no evidence collapsible inside the blind spots section: {section}"
+        );
+    }
+
+    #[test]
+    fn blind_spots_more_count_uses_pre_cap_total() {
+        // WHY: `payloads::blind_spots` now caps each family at `list_cap` to
+        // hold the 1000-token budget. The section renders 5 rows and says
+        // "… N more", so computing N from the CAPPED array would silently
+        // undercount exactly the noisy sessions the note exists for. The
+        // pre-cap count lives in the payload's `totals`.
+        //
+        // 12 blind-write attempts: 12 distinct files each Edited before any
+        // Read, each rejected by the harness.
+        let mut lines = Vec::new();
+        for i in 0..12 {
+            lines.push(format!(
+                r#"{{"type":"assistant","timestamp":"2026-01-01T00:00:{i:02}Z","message":{{"content":[{{"type":"tool_use","id":"e{i}","name":"Edit","input":{{"file_path":"/f{i}.ts","new_string":"x"}}}}]}}}}"#
+            ));
+            lines.push(format!(
+                r#"{{"type":"user","timestamp":"2026-01-01T00:00:{i:02}Z","message":{{"content":[{{"type":"tool_result","tool_use_id":"e{i}","is_error":true,"content":"File has not been read yet"}}]}}}}"#
+            ));
+        }
+        let html = render(&lines.join("\n"));
+        assert!(
+            html.contains("… 7 more"),
+            "expected 12 total minus 5 shown = 7, not a count derived from the \
+             capped list. Rendered: {}",
+            html[html.find("Blind spots").unwrap_or(0)..]
+                .chars()
+                .take(600)
+                .collect::<String>()
         );
     }
 

@@ -40,3 +40,17 @@ jobs:
       - name: Package (manifest sanity)
         if: matrix.os == 'ubuntu-latest'
         run: cargo package -p sumcp-core -p sumcp-cli -p sumcp-mcp --no-verify --allow-dirty
+
+  # A declared MSRV that nothing checks is just a comment. `rust-version` is
+  # 1.88 because let-chains (used throughout ingest/signals) stabilized there;
+  # 1.87 fails with E0658. This job builds and tests on exactly that floor, so
+  # using a newer language feature breaks CI instead of silently breaking
+  # users who are pinned to an older toolchain.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Build and test on the declared MSRV
+        run: cargo test --workspace --locked
