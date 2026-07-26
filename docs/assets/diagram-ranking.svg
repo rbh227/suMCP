@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 330" font-family="'Comic Sans MS','Chalkboard SE','Segoe Print',cursive" role="img" aria-labelledby="rankTitle rankDesc">
+  <title id="rankTitle">How suMCP orders files: four keys, no score</title>
+  <desc id="rankDesc">Files are ordered by four keys in sequence. First, edited files before never-edited ones. Second, file class: code and web, then notes, then docs, then config and other. Third, edit count, highest first. Fourth, path, so ties are stable. Every ranked file ships this rule as text.</desc>
+  <style>
+    .box{fill:#fffdf5;stroke:#222;stroke-width:2.5;}
+    .key{font-size:15px;fill:#111;text-anchor:middle;}
+    .txt{font-size:14px;fill:#111;}
+    .sub{font-size:12px;fill:#555;}
+    .arr{stroke:#222;stroke-width:2.5;fill:none;}
+    .tie{font-size:11px;fill:#555;}
+    .foot{font-size:14px;fill:#800000;}
+    .hdr{font-size:16px;fill:#111;}
+  </style>
+
+  <text class="hdr" x="14" y="26">how files are ordered</text>
+  <text class="sub" x="14" y="46">four keys, checked in turn. no weighted score.</text>
+
+  <!-- key 1 -->
+  <path class="box" d="M14 62 q4 -7 128 -5 q7 22 -2 44 q-60 7 -128 2 q-5 -24 2 -41 z"/>
+  <text class="key" x="78" y="90">1  edited?</text>
+  <text class="txt" x="164" y="84">edited files before never-edited ones</text>
+  <text class="sub" x="164" y="102">a file you did not change has nothing to review</text>
+
+  <!-- key 2 -->
+  <path class="box" d="M14 132 q4 -7 128 -5 q7 22 -2 44 q-60 7 -128 2 q-5 -24 2 -41 z"/>
+  <text class="key" x="78" y="160">2  class</text>
+  <text class="txt" x="164" y="154">code · web   ►   notes   ►   docs   ►   config · other</text>
+  <text class="sub" x="164" y="172">docs churn did not predict recurrence. see the next diagram</text>
+
+  <!-- key 3 -->
+  <path class="box" d="M14 202 q4 -7 128 -5 q7 22 -2 44 q-60 7 -128 2 q-5 -24 2 -41 z"/>
+  <text class="key" x="78" y="230">3  edits</text>
+  <text class="txt" x="164" y="224">more edits first</text>
+  <text class="sub" x="164" y="242">counts every Edit and Write attempt, not just the ones that stuck</text>
+
+  <!-- key 4 -->
+  <path class="box" d="M14 272 q4 -7 128 -5 q7 22 -2 44 q-60 7 -128 2 q-5 -24 2 -41 z"/>
+  <text class="key" x="78" y="300">4  path</text>
+  <text class="txt" x="164" y="294">alphabetical, so the order never wobbles between runs</text>
+
+  <!-- "if tied" cascade down the left -->
+  <path class="arr" d="M78 108 q3 10 0 22"/>
+  <path class="arr" d="M78 130 l-5 -9 m5 9 l5 -9"/>
+  <text class="tie" x="86" y="124">if tied</text>
+
+  <path class="arr" d="M78 178 q3 10 0 22"/>
+  <path class="arr" d="M78 200 l-5 -9 m5 9 l5 -9"/>
+  <text class="tie" x="86" y="194">if tied</text>
+
+  <path class="arr" d="M78 248 q3 10 0 22"/>
+  <path class="arr" d="M78 270 l-5 -9 m5 9 l5 -9"/>
+  <text class="tie" x="86" y="264">if tied</text>
+
+  <text class="foot" x="600" y="26">you can check it by hand</text>
+</svg>

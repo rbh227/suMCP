@@ -8,17 +8,26 @@
   <img alt="license: MIT OR Apache-2.0" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue">
   <img alt="Rust" src="https://img.shields.io/badge/Rust-edition%202024-orange">
   <img alt="deterministic, no LLM, no network" src="https://img.shields.io/badge/deterministic-no%20LLM%20%C2%B7%20no%20network-2ea44f">
-  <img alt="status: v0.1 pre-release" src="https://img.shields.io/badge/status-v0.1%20pre--release-lightgrey">
+  <img alt="release: v0.1.0" src="https://img.shields.io/badge/release-v0.1.0-000080">
+  <img alt="platforms: macOS, Linux, Windows" src="https://img.shields.io/badge/platforms-macOS%20%C2%B7%20Linux%20%C2%B7%20Windows-555555">
 </p>
 
 <p align="center">
   <img src="docs/assets/report-hero.png" alt="suMCP HTML report: needs-review directives, session timeline with finding spans, and ranked struggle areas with plain-language signals" width="820">
 </p>
 
-> **v0.1 pre-release.** Validated on the author's own projects across many
-> session types. The ranking is proven to run and generalize; its top-3
-> accuracy has been spot-checked, not yet systematically measured (see
-> [Limitations](#limitations)). Not yet published to crates.io.
+> **v0.1.0 is released.** Prebuilt archives for macOS (Apple Silicon and Intel),
+> Linux (glibc and static musl), and Windows are on the
+> [releases page](https://github.com/rbh227/suMCP/releases/latest), each with a
+> SHA-256 checksum. Not on crates.io: the unit of distribution is an archive
+> carrying both binaries, because `install` needs them side by side.
+>
+> **What is and is not established.** The flags are predictive: on a 43-session
+> corpus, files suMCP flagged recurred at roughly 8 to 9 times the rate of
+> unflagged ones. The ordering is a rule you can verify by hand, not a tuned
+> model, because a tuned model was measured and did not beat counting edits.
+> No external user has validated any of this yet, which is the honest limit on
+> everything below. See [Limitations](#limitations).
 
 ---
 
@@ -68,12 +77,6 @@ registration.
 
 ### From a release archive
 
-> **Before the first tagged release, these links 404.** The archives are built
-> by CI when a `v*` tag is pushed, so until `v0.1.0` exists the
-> [releases page](https://github.com/rbh227/suMCP/releases) is empty and
-> [From source](#from-source) below is the only install path. If a `curl` here
-> returns a 404 page instead of a tarball, that is what happened.
-
 Download for your platform from the
 [latest release](https://github.com/rbh227/suMCP/releases/latest):
 
@@ -89,7 +92,7 @@ shasum -a 256 -c sumcp-$V-$T.tar.gz.sha256   # Linux: sha256sum -c
 
 tar -xzf sumcp-$V-$T.tar.gz && cd sumcp-$V-$T
 ./sumcp install          # dry-run: prints exactly what it will write
-./sumcp install --apply  # register the MCP server, debrief skill, and Stop hook
+./sumcp install --apply  # register the MCP server, debrief skill, and Stop hook (Unix)
 ```
 
 **macOS signing.** The binaries carry only the ad-hoc signature Rust applies at
@@ -135,7 +138,7 @@ no published archive.
 git clone https://github.com/rbh227/suMCP && cd suMCP
 cargo build --release
 ./target/release/sumcp install          # dry-run: prints exactly what it will write
-./target/release/sumcp install --apply  # register the MCP server, debrief skill, and Stop hook
+./target/release/sumcp install --apply  # register the MCP server, debrief skill, and Stop hook (Unix)
 ```
 
 `install` writes only under `$HOME` (everything self-contained in
@@ -174,7 +177,9 @@ sumcp --file <path/to/session.jsonl> --html   # a self-contained HTML report
 ```
 
 Once installed, at the end of a session the Stop hook nudges you to run the
-**debrief skill**, which calls the tools below and narrates the result.
+**debrief skill**, which calls the tools below and narrates the result. On
+Windows there is no hook, so run the debrief yourself; see
+[Install](#install).
 
 ---
 
@@ -209,42 +214,62 @@ they do not vote on a score. See
 [docs/metrics.md](docs/metrics.md) for the reader-facing catalog, or
 [docs/metrics-spec.md](docs/metrics-spec.md) for the authoritative spec.
 
+### How it ranks
+
+<p align="center">
+  <img src="docs/assets/diagram-ranking.svg" alt="Four ordering keys checked in turn: edited files before never-edited ones, then file class with code and web ahead of notes, docs, and config, then edit count highest first, then path alphabetically so ties are stable." width="760">
+</p>
+
+There is no score. Every ranked entry carries `class`, `edits`, the per-category
+breakdown of findings about it, and `ranking_rule`: that sentence, shipped
+alongside the order it produced. You can check any report by hand.
+
+The reason there is no score is the next section.
+
 ---
 
 ## The numbers
 
-**Do the flags mean anything?** Yes, but not because of the weighting.
+**Do the flags mean anything?** Yes. **Did the clever weighting produce that?**
+No, and the weighting is gone because of it.
 
-In a frozen-weights retrospective study on the author's own corpus (43
-sessions, 552 file-session pairs, held-out project excluded), files suMCP
-flagged for review were **8.9x more likely** to show renewed struggle signals
-(failure loops, user corrections, reverts, or re-qualifying for review) in the
-next 3 sessions than unflagged edited files.
+On the author's own corpus (43 sessions, 552 file-sessions, one project held
+out), files suMCP flagged for review were **8.9x more likely** to show renewed
+struggle (failure loops, user corrections, reverts, or re-qualifying for review)
+in the next 3 sessions than unflagged edited files.
 
-**But the same study tested the weighted ranking against trivial baselines,
-and it did not beat them.** Simply sorting files by edit count and taking the
-top 3 scores at least as well on relative risk, precision, and miss rate
-simultaneously. The product's flags turn out to be a strict subset of "edited
-at least twice": the weighted score was a refinement of edit count, not an
-independent signal.
+**The same study put that ranking against one-line baselines, and it lost.**
+Sorting files by edit count and taking the top 3 did at least as well on
+relative risk, precision, and miss rate at once. The reason is structural: the
+product's flags fired on zero files edited fewer than twice, so the weighted
+score was a refinement of edit count rather than an independent signal.
 
-**So the weighted score was removed rather than retuned.** Ranking is now four
-keys you can check by hand against any report: edited files before never-edited
-ones, then code before documentation and config, then edit count, then path.
-Every ranked entry ships the rule that produced it, so there is no number to
-take on trust. What the old score did instead is documented in
-[docs/validation/2026-07-26-file-class-measurement.md](docs/validation/2026-07-26-file-class-measurement.md):
-on the same 552 file-sessions, documentation was 192 of them and carried 1 of 39
-outcomes, config was 37 and carried none, and code was 285 and carried 34.
-Restricting the queue to code cut flagged files from 65 to 52 for an identical
-hit count, a 20% reduction in false alarms at no cost to recall.
+So the obvious next move was to tune the weights. That was tried, and the result
+is why this section is short. Weights were fitted to maximize hits **with the
+outcomes already in hand**, which is cheating and therefore an upper bound on
+any honest rule. Cheating bought at most **4 more hits out of 39**, and the fit
+put maximum weight on edit count anyway. There was nothing to tune into, so the
+score was deleted rather than adjusted.
+
+What did survive the measurement was file class:
+
+<p align="center">
+  <img src="docs/assets/diagram-file-class.svg" alt="Recurrence rate by file class on 552 file-sessions: code 34 outcomes of 285, a rate of 0.119; docs 1 of 192, a rate of 0.005; config 0 of 37. Notes and web omitted as too thin at 19 and 7 file-sessions." width="620">
+</p>
+
+Documentation was 35% of the population and carried 1 of 39 outcomes. Config
+carried none. Ranking code ahead of both cut flagged files from 65 to 52 for an
+**identical hit count**: a fifth fewer false alarms at no cost to recall. That is
+the whole basis for the class key, and the only tier boundary the data actually
+supports. Full breakdown, thin cells and all, in
+[the measurement note](docs/validation/2026-07-26-file-class-measurement.md).
 
 So the honest claim is narrow: **suMCP surfaces a genuinely predictive signal,
-orders it by a rule you can verify, and attaches evidence to every entry.** That
-is a usability claim, not an accuracy claim. Single-author corpus, 39 positive
-outcomes total, so it is also underpowered to claim the baseline is better.
-Method, full comparison tables, confidence intervals, and caveats in
-[docs/validation/2026-07-22-predictive-validity.md](docs/validation/2026-07-22-predictive-validity.md).
+orders it by a rule you can verify by hand, and attaches citable evidence to
+every entry.** That is a usability claim, not an accuracy claim. Single author,
+39 outcomes total, so it is equally underpowered to claim the baseline is
+*better*. Method, comparison tables, confidence intervals and caveats in
+[the predictive-validity study](docs/validation/2026-07-22-predictive-validity.md).
 
 <p align="center">
   <img src="docs/assets/diagram-tokens.svg" alt="A full transcript of tens of thousands to about one million tokens versus a suMCP payload of about 150 to 290 tokens: a median 800x reduction." width="520">
@@ -265,29 +290,36 @@ magnitude smaller than re-reading the transcript.
 
 ## Limitations
 
-Read these before trusting a ranking:
+Read these before trusting a ranking.
 
-- **Validated retrospectively, on one author.** Flagged files predicted future
-  struggle at ~6x relative risk on the author's own 42-session corpus (see
-  [the study](docs/validation/2026-07-22-predictive-validity.md)), but
-  precision is moderate (about a quarter of flags struggle again) and the
-  corpus is one person's working style. Treat the ranking as a strong,
-  measured hint, not ground truth.
-- **Heuristic signals.** Several signals (e.g. approval latency, instant-accept)
-  infer intent from edit shape and timing; they're labeled heuristic and are
-  suppressed when the session ran under auto-accept.
-- **Single-session only.** No cross-session/project memory yet (a planned v0.2
-  direction).
-- **The ranking is a stated rule, not a model.** It orders by file class and
-  edit count, so it inherits their blind spots: a file changed once, carefully
-  and wrongly, ranks low. The weighted score that used to sit here was removed
-  because it did not beat counting edits (see
-  [the measurement note](docs/validation/2026-07-26-file-class-measurement.md)).
+- **Nobody but the author has run this.** Zero external users. Every number
+  below is internal consistency, not usefulness. This is the honest limit on
+  everything else here, and the top post-v0.1 item.
+- **One author, one machine, 39 outcomes.** The 8.9x figure comes from a
+  43-session corpus of a single person's working style, and precision is moderate:
+  roughly a third of flags recur. Treat the ranking as a measured hint, not
+  ground truth. The same small sample means it is equally underpowered to claim
+  the edit-count baseline is *better*.
+- **The ranking is a stated rule, not a model**, so it inherits the blind spots
+  of its keys. A file changed exactly once, carefully and wrongly, ranks low. It
+  has no idea what your code means.
 - **File class is a fixed extension table.** A project whose layout it misreads
-  gets ranked accordingly. It is the first thing to check if an ordering looks
-  wrong.
-- **Single-user validation.** v0.1 is validated on the author's own projects,
-  not by external users. External validation is the top post-v0.1 item.
+  is ranked accordingly, and that is the first thing to check when an ordering
+  looks wrong. Only the code-versus-docs-and-config boundary rests on adequate
+  data; the other tiers are declared judgments on thin cells.
+- **Heuristic signals are labeled as such.** A few (approval latency,
+  instant-accept) infer intent from edit shape and timing, and are suppressed
+  entirely when the session ran under auto-accept rather than reported as
+  meaningless numbers.
+- **The secrets blind spot is a policy signal, not a measured one.** It did not
+  exist when the corpus was measured, so it has no predictive validation. Its
+  table is deliberately narrow, because a false positive there teaches you to
+  ignore it.
+- **Single-session only.** No cross-session or cross-project memory yet, which
+  is the planned v0.2 direction.
+- **Two things differ on Windows**, both by design and both detailed under
+  [Install](#install): no end-of-session nudge, and installed files are not
+  permission-restricted.
 
 ---
 

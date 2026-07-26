@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 620 300" font-family="'Comic Sans MS','Chalkboard SE','Segoe Print',cursive" role="img" aria-labelledby="fcTitle fcDesc">
+  <title id="fcTitle">Recurrence rate by file class, 552 file-sessions</title>
+  <desc id="fcDesc">Share of edited files that showed renewed struggle within the next three sessions, by file class, on 552 file-sessions with 39 outcomes. Code: 34 outcomes of 285 file-sessions, a rate of 0.119. Docs: 1 of 192, a rate of 0.005. Config: 0 of 37, a rate of zero. Notes and web are omitted as too thin to read at 19 and 7 file-sessions.</desc>
+  <style>
+    .bar{fill:#800000;stroke:#222;stroke-width:2;}
+    .cls{font-size:15px;fill:#111;text-anchor:end;}
+    .val{font-size:14px;fill:#111;}
+    .cnt{font-size:12px;fill:#555;}
+    .hdr{font-size:16px;fill:#111;}
+    .sub{font-size:12px;fill:#555;}
+    .axis{stroke:#222;stroke-width:2;fill:none;}
+    .foot{font-size:12px;fill:#800000;}
+  </style>
+
+  <text class="hdr" x="14" y="26">does churn in this kind of file mean anything?</text>
+  <text class="sub" x="14" y="46">share of edited files that struggled again within 3 sessions · 552 file-sessions, 39 outcomes</text>
+
+  <!-- baseline: every bar is anchored here -->
+  <path class="axis" d="M148 72 q2 90 0 168"/>
+
+  <!-- code: 34/285 = 0.119 -> 298px at 2500 px per unit rate -->
+  <text class="cls" x="140" y="106">code</text>
+  <rect class="bar" x="148" y="88" width="298" height="26" rx="4"/>
+  <text class="val" x="456" y="100">0.119</text>
+  <text class="cnt" x="456" y="116">34 of 285</text>
+
+  <!-- docs: 1/192 = 0.005 -> 13px -->
+  <text class="cls" x="140" y="166">docs</text>
+  <rect class="bar" x="148" y="148" width="13" height="26" rx="4"/>
+  <text class="val" x="176" y="160">0.005</text>
+  <text class="cnt" x="176" y="176">1 of 192</text>
+
+  <!-- config: 0/37. No bar is drawn: a sliver would imply a value there is none of. -->
+  <text class="cls" x="140" y="226">config</text>
+  <text class="val" x="176" y="220">none</text>
+  <text class="cnt" x="176" y="236">0 of 37</text>
+
+  <text class="sub" x="14" y="272">notes (19) and web (7) are left out: too few file-sessions to read as a rate.</text>
+  <text class="foot" x="14" y="290">single author, one machine. descriptive, not a causal claim.</text>
+</svg>
