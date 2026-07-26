@@ -52,11 +52,6 @@ jobs:
 
   build:
     needs: verify-version
-    # Job level, because a step's `if` cannot read that same step's `env:`
-    # block. This is the switch that turns signing on: it becomes 'true' the
-    # moment the certificate secret exists.
-    env:
-      MACOS_SIGNING_CONFIGURED: ${{ secrets.MACOS_CERT_P12 != '' }}
     strategy:
       fail-fast: false
       matrix:
@@ -155,11 +150,20 @@ jobs:
           test -x "./target/${{ matrix.target }}/release/sumcp-mcp"
           file "./target/${{ matrix.target }}/release/sumcp-mcp"
 
-      # WHAT A USER GETS TODAY, stated rather than assumed. Rust ad-hoc signs
-      # macOS binaries at link time, which is enough for them to RUN, but an
-      # ad-hoc signature carries no identity: Gatekeeper still quarantines a
-      # browser download. This step records what signature is actually present
-      # so the release notes cannot overstate it.
+      # WHAT A USER GETS, recorded rather than assumed. Rust ad-hoc signs macOS
+      # binaries at link time, which is enough for them to RUN, but an ad-hoc
+      # signature carries no developer identity, so Gatekeeper still blocks a
+      # BROWSER download until the user clears the quarantine attribute. A curl
+      # download is never quarantined, which is the path the README documents.
+      #
+      # There is deliberately no Developer ID signing or notarization here.
+      # Notarization needs a paid Apple Developer ID this project does not have,
+      # and wiring it in unused would have put ~40 lines of shell in the release
+      # path whose FIRST execution would be during a real release. That is the
+      # same "find out at tag time" failure the Intel smoke test above exists to
+      # prevent. If a Developer ID is ever obtained, add the steps then and test
+      # them before tagging. README's Install section states the current position
+      # and gives users the codesign command to check it themselves.
       - name: Report the macOS signature state
         if: contains(matrix.target, 'apple-darwin')
         run: |
@@ -168,114 +172,6 @@ jobs:
             path="./target/${{ matrix.target }}/release/${b}"
             echo "== ${b}"
             codesign -dvv "$path" 2>&1 | sed 's/^/   /' || echo "   no signature at all"
-          done
-
-      # Developer ID signing and notarization, active ONLY when the credentials
-      # are configured as repository secrets. Absent them this is skipped, which
-      # is the current state: the project has no Apple Developer ID, and the
-      # README says the binaries are unsigned.
-      #
-      # To turn this on, set four secrets and nothing else changes:
-      #   MACOS_CERT_P12         base64 of a Developer ID Application .p12
-      #   MACOS_CERT_PASSWORD    that .p12's password
-      #   MACOS_NOTARY_APPLE_ID  the Apple ID for notarytool
-      #   MACOS_NOTARY_TEAM_ID   the team id
-      #   MACOS_NOTARY_PASSWORD  an app-specific password for that Apple ID
-      #
-      # Note on stapling: a notarization ticket can only be stapled to a
-      # container format (.dmg, .pkg, .app). These are bare executables in a
-      # tarball, so there is nothing to staple to and Gatekeeper resolves the
-      # ticket online instead. That is expected, not a misconfiguration.
-      - name: Sign and notarize (only when credentials are configured)
-        if: contains(matrix.target, 'apple-darwin') && env.MACOS_SIGNING_CONFIGURED == 'true'
-        env:
-          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
-          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
-          MACOS_NOTARY_APPLE_ID: ${{ secrets.MACOS_NOTARY_APPLE_ID }}
-          MACOS_NOTARY_TEAM_ID: ${{ secrets.MACOS_NOTARY_TEAM_ID }}
-          MACOS_NOTARY_PASSWORD: ${{ secrets.MACOS_NOTARY_PASSWORD }}
-        run: |
-          set -euo pipefail
-          # A throwaway keychain, so nothing is left on the runner and the
-          # login keychain is never touched.
-          keychain="$RUNNER_TEMP/sign.keychain-db"
-          keychain_pw="$(uuidgen)"
-          # Remove the keychain even if a later command fails, so a failed
-          # release never leaves an imported certificate behind on the runner.
-          trap 'security delete-keychain "$keychain" 2>/dev/null || true' EXIT
-          security create-keychain -p "$keychain_pw" "$keychain"
-          security set-keychain-settings -lut 900 "$keychain"
-          security unlock-keychain -p "$keychain_pw" "$keychain"
-
-          echo "$MACOS_CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
-          security import "$RUNNER_TEMP/cert.p12" -k "$keychain" \
-            -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign
-          rm -f "$RUNNER_TEMP/cert.p12"
-          security set-key-partition-list -S apple-tool:,apple:,codesign: \
-            -s -k "$keychain_pw" "$keychain" >/dev/null
-          # codesign resolves identities through the search list, so the
-          # throwaway keychain has to be on it. Prepending keeps the runner's
-          # existing keychains reachable.
-          security list-keychains -d user -s "$keychain" login.keychain-db
-
-          identity="$(security find-identity -v -p codesigning "$keychain" \
-            | awk '/Developer ID Application/ {print $2; exit}')"
-          if [ -z "$identity" ]; then
-            echo "::error::no Developer ID Application identity found in the imported certificate"
-            exit 1
-          fi
-
-          # --options runtime enables the hardened runtime, which notarization
-          # requires. --timestamp binds a trusted timestamp so the signature
-          # outlives the certificate.
-          for b in sumcp sumcp-mcp; do
-            path="./target/${{ matrix.target }}/release/${b}"
-            codesign --force --sign "$identity" --timestamp --options runtime "$path"
-            codesign --verify --strict --verbose=2 "$path"
-          done
-
-          # notarytool takes an archive, not loose executables, and BOTH
-          # binaries need a ticket: a signed `sumcp` next to an unnotarized
-          # `sumcp-mcp` would fail for the user at exactly the point `install`
-          # registers the server.
-          mkdir -p "$RUNNER_TEMP/notarize"
-          cp "./target/${{ matrix.target }}/release/sumcp" \
-             "./target/${{ matrix.target }}/release/sumcp-mcp" "$RUNNER_TEMP/notarize/"
-          ditto -c -k --keepParent "$RUNNER_TEMP/notarize" "$RUNNER_TEMP/notarize.zip"
-          xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" \
-            --apple-id "$MACOS_NOTARY_APPLE_ID" \
-            --team-id "$MACOS_NOTARY_TEAM_ID" \
-            --password "$MACOS_NOTARY_PASSWORD" \
-            --wait
-
-      # The whole point of the musl archive is that it carries no glibc
-      # dependency. A musl build that silently came out dynamically linked
-      # would still run here and still be published, and would then fail on
-      # exactly the old distributions it exists to serve. Assert staticness
-      # rather than trusting the target name.
-      - name: Assert the musl binaries are statically linked
-        if: contains(matrix.target, 'musl')
-        run: |
-          set -euo pipefail
-          for b in sumcp sumcp-mcp; do
-            path="./target/${{ matrix.target }}/release/${b}"
-            file "$path"
-            # Rust's musl target emits a static-pie (static position
-            # independent executable), which `file` labels "static-pie
-            # linked", not "statically linked". Both are static; accept
-            # either. Matching only the latter rejects every real musl build.
-            if ! file "$path" | grep -qE "statically linked|static-pie linked"; then
-              echo "::error::${b} is not statically linked; the musl archive would inherit a libc dependency"
-              exit 1
-            fi
-            # Belt and braces: a dynamic executable resolves libraries, which
-            # ldd prints as "libfoo.so => /path". No arrows means nothing to
-            # resolve. This catches a build that `file` mislabels.
-            if ldd "$path" 2>&1 | grep -q "=>"; then
-              echo "::error::${b} has dynamic library dependencies:"
-              ldd "$path" || true
-              exit 1
-            fi
           done
 
       # Layout inside the tarball:

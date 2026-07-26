@@ -91,9 +91,9 @@ Verify what you got, rather than taking the above on trust:
 codesign -dvv ./sumcp   # expect "Signature=adhoc" until a Developer ID is set up
 ```
 
-The release workflow already contains the signing and notarization steps; they
-activate the moment the five `MACOS_*` secrets are configured and are skipped
-until then, so no workflow change is needed to turn this on.
+Notarization needs a paid Apple Developer ID, which this project does not have,
+so it is not planned. In practice this matters only if you download through a
+browser: the `curl` commands above are never quarantined.
 
 **Both platforms are exercised before publishing.** Every archive's `sumcp` is
 executed in CI and made to analyze a real fixture, including the Intel macOS
