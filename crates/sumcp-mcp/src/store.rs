@@ -365,10 +365,15 @@ mod tests {
         assert!(err.to_string().contains("size ceiling"), "{err}");
     }
 
+    // Unix only because it needs a real non-regular file to point at, and
+    // /dev/null does not exist on Windows. The production guard is
+    // platform-independent (it asks whether the metadata says regular file), so
+    // Windows is still protected; only this test's fixture is Unix specific.
+    #[cfg(unix)]
     #[test]
     fn non_regular_file_is_refused() {
-        // /dev/null stats as a char device, not a regular file — exactly the
-        // class of target a symlink attack points at (/dev/zero would hang).
+        // /dev/null stats as a char device, not a regular file, which is exactly
+        // the class of target a symlink attack points at (/dev/zero would hang).
         let store = SessionStore::new();
         let err = store.load(Path::new("/dev/null")).unwrap_err();
         assert!(err.to_string().contains("not a regular file"), "{err}");

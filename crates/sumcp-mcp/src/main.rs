@@ -112,10 +112,23 @@ mod tests {
             config_path_from(Some(PathBuf::from("rel/dir")), home.clone()),
             Some(expect)
         );
-        // Absolute XDG wins.
+        // Absolute XDG wins. What counts as absolute is platform specific:
+        // "/xdg" is absolute on Unix but NOT on Windows, which needs a drive or
+        // UNC prefix, so a hardcoded "/xdg" made this assertion test the
+        // fallback instead of the case it names. Build the base per platform and
+        // the expectation with join(), so separator differences cannot matter
+        // either.
+        #[cfg(unix)]
+        let xdg_base = PathBuf::from("/xdg");
+        #[cfg(not(unix))]
+        let xdg_base = PathBuf::from(r"C:\xdg");
+        assert!(
+            xdg_base.is_absolute(),
+            "this test's premise is that the base is absolute on this platform"
+        );
         assert_eq!(
-            config_path_from(Some(PathBuf::from("/xdg")), home),
-            Some(PathBuf::from("/xdg/sumcp/config.toml"))
+            config_path_from(Some(xdg_base.clone()), home),
+            Some(xdg_base.join("sumcp").join("config.toml"))
         );
         // No XDG, no HOME → no path at all.
         assert_eq!(config_path_from(None, None), None);
