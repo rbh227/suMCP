@@ -40,6 +40,18 @@ ranking ever read them. The payload contract goes from `v: 0` to `v: 1` because
   `#![warn(missing_docs)]` at `crates/sumcp-core/src/lib.rs:1`.
 - The corpus lives at `~/sumcp-corpus-archive/projects-2026-07-26/`. Never read
   `~/.claude/projects` for analysis; a 30-day cleanup is emptying it.
+- **The corpus is pinned to the published 43-session population.** The archive
+  was captured on 2026-07-26 and holds three sessions later than the 2026-07-22
+  study's population, all of them sessions in which this analysis was being
+  performed. `CORPUS_CUTOFF` in `scripts/validity_sweep.py` excludes sessions
+  starting at or after `2026-07-25T00:00:00+00:00`. Three reasons, all binding:
+  the study's numbers are published in the README and must stay reproducible;
+  Task 3's gate is preregistered in ABSOLUTE hits against a known positive
+  count, so moving the data decalibrates it; and a corpus should not contain
+  sessions about itself. Any run must report exactly **43 sessions, 5
+  projects**, a date range ending `2026-07-24T14:24:07.238000+00:00`, and must
+  leave `docs/validation/2026-07-22-predictive-validity.md` byte-identical.
+  Never tune the cutoff to make a number look better.
 
 ---
 
