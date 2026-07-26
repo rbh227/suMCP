@@ -140,13 +140,19 @@ jobs:
           for b in sumcp sumcp-mcp; do
             path="./target/${{ matrix.target }}/release/${b}"
             file "$path"
-            if ! file "$path" | grep -q "statically linked"; then
+            # Rust's musl target emits a static-pie (static position
+            # independent executable), which `file` labels "static-pie
+            # linked", not "statically linked". Both are static; accept
+            # either. Matching only the latter rejects every real musl build.
+            if ! file "$path" | grep -qE "statically linked|static-pie linked"; then
               echo "::error::${b} is not statically linked; the musl archive would inherit a libc dependency"
               exit 1
             fi
-            # ldd on a truly static binary reports no dynamic dependencies.
-            if ldd "$path" 2>&1 | grep -qv "not a dynamic executable"; then
-              echo "::error::${b} reports dynamic dependencies:"
+            # Belt and braces: a dynamic executable resolves libraries, which
+            # ldd prints as "libfoo.so => /path". No arrows means nothing to
+            # resolve. This catches a build that `file` mislabels.
+            if ldd "$path" 2>&1 | grep -q "=>"; then
+              echo "::error::${b} has dynamic library dependencies:"
               ldd "$path" || true
               exit 1
             fi
