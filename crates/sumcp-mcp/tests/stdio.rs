@@ -129,14 +129,34 @@ impl Drop for Rpc {
     }
 }
 
+/// The cwd form the SERVER will see, which is what the project directory name
+/// must be derived from.
+///
+/// Canonicalizing matters on macOS, where a tempdir lives behind a
+/// `/var` to `/private/var` symlink and the child reports the canonical form.
+/// On Windows canonicalize additionally returns an extended-length path
+/// prefixed with `\\?\`, which `std::env::current_dir()` never reports, so
+/// deriving the name from it produced a different directory than the server
+/// looked in and every stdio test failed with `session_not_found`. Strip that
+/// prefix, and hand the SAME value to `current_dir()` so the two cannot
+/// disagree.
+fn server_visible_cwd(p: &Path) -> PathBuf {
+    let c = p.canonicalize().unwrap();
+    #[cfg(windows)]
+    {
+        let s = c.to_string_lossy();
+        return PathBuf::from(s.strip_prefix(r"\\?\").unwrap_or(&s).to_string());
+    }
+    #[cfg(not(windows))]
+    c
+}
+
 /// Build a fake `~/.claude` containing the real donor fixture as one session
 /// of a fake project, and return (claude_home, project_cwd).
 fn fixture_home(root: &Path) -> (PathBuf, PathBuf) {
     let project_cwd = root.join("proj");
     std::fs::create_dir_all(&project_cwd).unwrap();
-    // macOS tempdirs live behind a /var → /private/var symlink; the server
-    // sees the canonical form via current_dir(), so derive names from it too.
-    let project_cwd = project_cwd.canonicalize().unwrap();
+    let project_cwd = server_visible_cwd(&project_cwd);
     let claude_home = root.join("claude-home");
     let project_dir = sumcp_core::locate::project_dir(&claude_home, &project_cwd);
     std::fs::create_dir_all(&project_dir).unwrap();
@@ -159,7 +179,7 @@ fn fixture_home(root: &Path) -> (PathBuf, PathBuf) {
 fn fixture_home_subagents(root: &Path) -> (PathBuf, PathBuf) {
     let project_cwd = root.join("proj");
     std::fs::create_dir_all(&project_cwd).unwrap();
-    let project_cwd = project_cwd.canonicalize().unwrap();
+    let project_cwd = server_visible_cwd(&project_cwd);
     let claude_home = root.join("claude-home");
     let project_dir = sumcp_core::locate::project_dir(&claude_home, &project_cwd);
     std::fs::create_dir_all(&project_dir).unwrap();
