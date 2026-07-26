@@ -2,10 +2,10 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Confirm that no weighting over observable features beats counting
-edits, then replace the weighted score with a stated ordering rule (edited
-files first, code before docs and config, then edit count, ties by path),
-keeping every detector and all evidence untouched.
+**Goal:** Replace the weighted score with a stated ordering rule (edited files
+first, code before docs and config, then edit count, ties by path), keeping
+every detector and all evidence untouched, and surface a secrets-file touch as
+a blind spot.
 
 **Architecture:** `score::rank` stops computing a weighted sum and starts
 sorting on four declared keys. A new pure `file_class` module supplies the class
@@ -38,21 +38,6 @@ ranking ever read them. The payload contract goes from `v: 0` to `v: 1` because
   is pushed.
 - Public items in `sumcp-core` need rustdoc: the crate has
   `#![warn(missing_docs)]` at `crates/sumcp-core/src/lib.rs:1`.
-- The corpus lives at `~/sumcp-corpus-archive/projects-2026-07-26/`. Never read
-  `~/.claude/projects` for analysis; a 30-day cleanup is emptying it.
-- **The corpus is pinned to the published 43-session population.** The archive
-  was captured on 2026-07-26 and holds three sessions later than the 2026-07-22
-  study's population, all of them sessions in which this analysis was being
-  performed. `CORPUS_CUTOFF` in `scripts/validity_sweep.py` excludes sessions
-  starting at or after `2026-07-25T00:00:00+00:00`. Three reasons, all binding:
-  the study's numbers are published in the README and must stay reproducible;
-  Task 3's gate is preregistered in ABSOLUTE hits against a known positive
-  count, so moving the data decalibrates it; and a corpus should not contain
-  sessions about itself. Any run must report exactly **43 sessions, 5
-  projects**, a date range ending `2026-07-24T14:24:07.238000+00:00`, and must
-  leave `docs/validation/2026-07-22-predictive-validity.md` byte-identical.
-  Never tune the cutoff to make a number look better.
-
 ---
 
 ## File Structure
@@ -60,15 +45,12 @@ ranking ever read them. The payload contract goes from `v: 0` to `v: 1` because
 **Created:**
 - `crates/sumcp-core/src/file_class.rs`: path to `FileClass` classification and
   ranking tier. Pure, no I/O, one responsibility.
-- `scripts/ceiling_analysis.py`: the feasibility measurement. Imports
-  `validity_sweep.py` for corpus assembly and holdout resolution rather than
-  reimplementing either.
-- `docs/validation/2026-07-26-ceiling-analysis.md`: the published negative
-  result.
+- `docs/validation/2026-07-26-file-class-measurement.md`: the descriptive
+  breakdown that justifies ranking code above documentation.
 
 **Modified:**
-- `crates/sumcp-core/examples/validity_dump.rs`: emit `score` and `breakdown`.
-- `scripts/validity_sweep.py`: `CACHE_SCHEMA` 2 to 3, corpus directory override.
+- `crates/sumcp-core/examples/validity_dump.rs`: follow the `rank` signature
+  change. No new fields.
 - `crates/sumcp-core/src/lib.rs`: register `file_class`.
 - `crates/sumcp-core/src/score.rs`: new ordering, `FileScore` shape, delete
   `Weights`.
@@ -341,623 +323,7 @@ judgments on thin cells (notes at 19 pairs, web at 7)."
 
 ---
 
-### Task 2: Dump the missing features and stop reading the decaying corpus
-
-**Files:**
-- Modify: `crates/sumcp-core/examples/validity_dump.rs:106-114`
-- Modify: `scripts/validity_sweep.py:66` (`PROJECTS_DIR`), `:84` (`CACHE_SCHEMA`)
-
-**Interfaces:**
-- Consumes: nothing from earlier tasks.
-- Consumes: `file_class::classify` from Task 1.
-- Produces: each entry in the dump's `files` array gains `"score"` (float,
-  1 decimal, `null` for an unranked file), `"breakdown"` (object mapping
-  category name to integer), and `"class"` (one of `code`, `web`, `notes`,
-  `docs`, `config`, `other`).
-  `scripts/ceiling_analysis.py` in Task 3 reads all three. `validity_sweep.py`
-  exposes `PROJECTS_DIR` resolved from `SUMCP_CORPUS_DIR`.
-
-- [ ] **Step 1: Add the two fields to the dump**
-
-In `crates/sumcp-core/examples/validity_dump.rs`, replace the `json!` block at
-lines 106-114 with:
-
-```rust
-            json!({
-                "file": file,
-                "edits": edits,
-                "changed_lines": changed_lines.get(file).copied().unwrap_or(0),
-                "kinds": kinds,
-                "flagged_nr": nr_files.contains(file),
-                "flagged_top3": top3_files.contains(file),
-                "last_edit_verified": verified,
-                // Ranking inputs, so the ceiling analysis can ask whether any
-                // weighting over per-category MAGNITUDES (not just kind
-                // presence) beats counting edits. Study-only: nothing in the
-                // product reads these back.
-                "score": ranked
-                    .iter()
-                    .find(|r| r.file.as_str() == *file)
-                    .map(|r| (r.score * 10.0).round() / 10.0),
-                "breakdown": ranked
-                    .iter()
-                    .find(|r| r.file.as_str() == *file)
-                    .map(|r| r.breakdown.clone())
-                    .unwrap_or_default(),
-                // Emitted from the SHIPPED classifier (Task 1), not
-                // reclassified in Python. One table, so the published
-                // analysis and the product cannot drift apart.
-                "class": sumcp_core::file_class::classify(file),
-            })
-```
-
-`score` is `null` for a file that carries no ranking finding, which is correct:
-`rank` never ranked it. `breakdown` is `{}` in that case.
-
-- [ ] **Step 2: Build the dump and confirm both fields appear**
-
-```bash
-cargo build --release --example validity_dump -p sumcp-core
-./target/release/examples/validity_dump fixtures/session-2_1_210-subagents.jsonl \
-  | python3 -c "
-import json,sys
-d=json.load(sys.stdin)
-f=d['files']
-assert f, 'no files in dump'
-assert all({'score','breakdown','class'} <= e.keys() for e in f), 'fields missing'
-classes = sorted({e['class'] for e in f})
-assert classes, 'no classes emitted'
-print('classes seen:', classes)
-scored=[e for e in f if e['score'] is not None]
-print(f'files={len(f)} with_score={len(scored)}')
-print('sample:', json.dumps(scored[0], sort_keys=True)[:200] if scored else 'none scored')
-"
-```
-
-Expected: a non-zero `with_score` count and a sample entry showing both
-`breakdown` and `score`.
-
-- [ ] **Step 3: Bump the cache schema**
-
-In `scripts/validity_sweep.py`, change line 84 from `CACHE_SCHEMA = 2` to:
-
-```python
-# v3: added per-file `score`, `breakdown` (ranking magnitudes), and `class`
-# for scripts/ceiling_analysis.py.
-CACHE_SCHEMA = 3
-```
-
-This is mandatory, not cosmetic. The freshness check compares cache and
-transcript mtimes and cannot see that the dump binary changed, so without the
-bump every cached dump would keep its old shape and the reader's defaults would
-render the missing fields as a plausible column of zeros.
-
-- [ ] **Step 4: Point the corpus at the archive**
-
-In `scripts/validity_sweep.py`, replace line 66:
-
-```python
-PROJECTS_DIR = Path.home() / ".claude" / "projects"
-```
-
-with:
-
-```python
-# The corpus is the ARCHIVE, not the live directory. Claude Code's
-# `cleanupPeriodDays` defaults to 30, so `~/.claude/projects` deletes sessions
-# out from under a longitudinal study: on 2026-07-26 the oldest surviving
-# transcript was 31 days old and one frozen holdout project had already
-# vanished. Refreshing the archive is a deliberate manual step so a run can
-# never quietly pick up sessions that arrived mid-analysis.
-DEFAULT_CORPUS_DIR = Path.home() / "sumcp-corpus-archive" / "projects-2026-07-26"
-PROJECTS_DIR = Path(os.environ.get("SUMCP_CORPUS_DIR") or DEFAULT_CORPUS_DIR)
-```
-
-Add `import os` to the import block at lines 57-64, keeping alphabetical order
-(before `import subprocess`).
-
-- [ ] **Step 5: Print the resolved corpus so no number is ever unattributed**
-
-In `scripts/validity_sweep.py`, find the `main()` print that reports the corpus
-(the line printing `sessions` and `projects` counts, near line 1330) and add
-immediately before it:
-
-```python
-    print(f"corpus: {PROJECTS_DIR}")
-```
-
-- [ ] **Step 6: Verify the sweep still runs on the archive**
-
-```bash
-python3 scripts/validity_sweep.py 2>&1 | head -20
-```
-
-Expected: a `corpus:` line naming the archive path, then the usual session and
-project counts, then the comparison table. The holdout line must still resolve
-`proj-04` and must not fail closed. If it prints `fail closed: NO frozen
-held-out project is present`, the archive is wrong; stop and fix the path before
-continuing.
-
-Note the run regenerates the dump cache from scratch because of the schema
-bump, so it takes longer than usual.
-
-- [ ] **Step 7: Confirm the report did not change**
-
-```bash
-git diff --stat docs/validation/2026-07-22-predictive-validity.md
-```
-
-Expected: no output. The sweep rewrites that draft, and adding dump fields must
-not move any published number. If it does, something about the corpus changed
-and that must be understood before proceeding.
-
-- [ ] **Step 8: Commit**
-
-```bash
-git add crates/sumcp-core/examples/validity_dump.rs scripts/validity_sweep.py
-git commit -m "validity: dump ranking magnitudes, read the archived corpus
-
-The study corpus was being deleted underneath the analysis: cleanupPeriodDays
-is unset, so the 30-day default had already removed one frozen holdout project
-and the oldest surviving transcript was 31 days old. The sweep now reads
-~/sumcp-corpus-archive/projects-2026-07-26 (SUMCP_CORPUS_DIR overrides) and
-prints which corpus produced its numbers.
-
-The dump also emits per-file score and breakdown, so the ceiling analysis can
-test weightings over per-category magnitudes rather than kind presence alone.
-CACHE_SCHEMA 2 to 3 so every cached dump regenerates."
-```
-
----
-
-### Task 3: Measure the ceiling and run the gate
-
-**Files:**
-- Create: `scripts/ceiling_analysis.py`
-
-**Interfaces:**
-- Consumes: the Task 2 dump fields (`score`, `breakdown`, `class`);
-  `validity_sweep.py`'s `build_corpus`,
-  `group_by_project`, `anonymize_projects`, `held_out_project_ids`,
-  `window_sessions`, `outcome_in_window`.
-- Produces: a printed report. No repo file is written by the script; its numbers
-  are transcribed into `docs/validation/2026-07-26-ceiling-analysis.md` in
-  Task 7.
-
-- [ ] **Step 1: Write the script**
-
-Create `scripts/ceiling_analysis.py`:
-
-```python
-#!/usr/bin/env python3
-"""How good could ANY weighting over observable features be, at a fixed flag
-budget? (spec 2026-07-26, Part 1b.)
-
-The product ranks files by a weighted sum of finding magnitudes. The
-2026-07-22 study showed that ranking does not beat sorting files by edit
-count. This script asks the stronger question: could ANY weighting?
-
-Method. Fit weights to maximize hits at a fixed flag budget ON THE VERY PAIRS
-BEING SCORED. That is maximally overfit on purpose, so the result upper-bounds
-what any honest rule could achieve. Two independent fitters, because a single
-search could report a low number simply by failing to search hard enough,
-which would bias the verdict toward "no headroom":
-
-  1. Coordinate ascent on hits@budget, with fixed-seed restarts. Directly
-     optimizes the target metric; non-convex, so it finds a local maximum and
-     therefore a LOWER bound on the in-sample maximum.
-  2. In-sample logistic regression, ranked by predicted probability. Convex,
-     so no local-optimum risk, but it optimizes likelihood rather than
-     hits@budget.
-
-The verdict uses the better of the two. Agreement between them is the evidence
-that the search was adequate.
-
-Also reports leave-one-project-out, which estimates what would generalize.
-With only three tune projects those folds are coarse; read it as a direction,
-not a measurement.
-
-File classes come from the dump, which calls the shipped
-`sumcp_core::file_class::classify`. This script never reclassifies a path, so
-the published analysis and the product's own classifier cannot drift apart.
-
-Read-only. Tune split only. Primary outcome (strong recurrence, next 3
-sessions) throughout, matching the preregistered outcome in the 2026-07-22
-study. python3 stdlib only.
-
-Runtime is a couple of minutes: the fitters are pure Python by design, to keep
-this repo's dev scripts dependency-free.
-"""
-
-from __future__ import annotations
-
-import importlib.util
-import math
-import random
-from collections import defaultdict
-from pathlib import Path
-
-REPO = Path(__file__).resolve().parent.parent
-
-_spec = importlib.util.spec_from_file_location("vs", REPO / "scripts" / "validity_sweep.py")
-vs = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(vs)
-
-# Flag budgets to report. 65 is what `top-3 by edit count` fires on over the
-# tune split, 52 is what `top-3 by edit count, code files only` fires on, and
-# 40 is roughly what the product's own `needs_review` fires on among code
-# files. Fixed here, above any result.
-BUDGETS = (40, 52, 65)
-
-# Coordinate-ascent search budget. Restart seeds are a fixed list so two runs
-# are byte-identical.
-RESTART_SEEDS = tuple(range(12))
-SWEEPS = 6
-WEIGHT_GRID = (-4.0, -2.0, -1.0, -0.5, -0.25, 0.0, 0.25, 0.5, 1.0, 2.0, 4.0)
-
-# Logistic-regression fit.
-LOGIT_STEPS = 3000
-LOGIT_LR = 0.5
-
-FEATURES = (
-    "edits", "log_edits", "changed_lines", "log_lines",
-    "churn_mag", "rework_mag", "re_read_mag", "fumble_mag", "failure_mag",
-    "n_kinds", "is_code", "is_docs", "is_config", "is_notes", "verified",
-    "product_score",
-)
-
-
-def featurize(p: dict) -> list[float]:
-    b = p["breakdown"]
-    c = p["class"]
-    return [
-        float(p["edits"]),
-        math.log1p(p["edits"]),
-        float(p["changed_lines"]),
-        math.log1p(p["changed_lines"]),
-        float(b.get("churn", 0)),
-        float(b.get("rework", 0)),
-        float(b.get("re_read", 0)),
-        float(b.get("fumbles", 0)),
-        float(b.get("failure_loops", 0)),
-        float(len(p["kinds"])),
-        1.0 if c == "code" else 0.0,
-        1.0 if c == "docs" else 0.0,
-        1.0 if c == "config" else 0.0,
-        1.0 if c == "notes" else 0.0,
-        1.0 if p["verified"] else 0.0,
-        float(p["score"] or 0.0),
-    ]
-
-
-def build_pairs(groups, anon) -> list[dict]:
-    """Every (session N, edited file) pair, retaining the fields
-    `validity_sweep.build_pairs` drops (`file`, `kinds`, `breakdown`,
-    `score`). Same last-session exclusion and same window logic, taken from
-    the imported module so the two cannot drift."""
-    pairs = []
-    for real_proj in sorted(groups):
-        ordered = groups[real_proj]
-        for i, s in enumerate(ordered):
-            if i == len(ordered) - 1:
-                continue  # no window successor exists
-            next3, _ = vs.window_sessions(ordered, i)
-            for entry in sorted(s["dump"]["files"], key=lambda e: e["file"]):
-                file = entry["file"]
-                pairs.append({
-                    "project": anon[real_proj],
-                    "session_index": i,
-                    "file": file,
-                    # From the dump, i.e. from the SHIPPED classifier. Never
-                    # reclassified here: one table, no drift.
-                    "class": entry["class"],
-                    "edits": entry["edits"],
-                    "changed_lines": entry.get("changed_lines", 0),
-                    "kinds": sorted(entry.get("kinds", [])),
-                    "breakdown": entry.get("breakdown", {}),
-                    "score": entry.get("score"),
-                    "verified": entry.get("last_edit_verified", False),
-                    "session_failed_commands": s["dump"].get("failed_commands", 0),
-                    "flagged_nr": entry["flagged_nr"],
-                    "y": 1 if vs.outcome_in_window(next3, file, strong=True) else 0,
-                })
-    return pairs
-
-
-def hits_at(scores: list[float], y: list[int], budget: int) -> int:
-    """Hits among the top `budget` by score. Index breaks ties, so ordering
-    luck cannot leak in."""
-    order = sorted(range(len(scores)), key=lambda i: (-scores[i], i))
-    return sum(y[i] for i in order[:budget])
-
-
-def dot_columns(cols: list[list[float]], w: list[float]) -> list[float]:
-    n = len(cols[0])
-    out = [0.0] * n
-    for j, wj in enumerate(w):
-        if wj == 0.0:
-            continue
-        col = cols[j]
-        for i in range(n):
-            out[i] += wj * col[i]
-    return out
-
-
-def coordinate_ascent(cols, y, budget):
-    """Maximize hits@budget over linear weights. Returns (best_hits, best_w).
-    Scores are updated incrementally when one coordinate moves, which is what
-    makes a pure-Python search affordable."""
-    d = len(cols)
-    best_h, best_w = -1, [0.0] * d
-    for seed in RESTART_SEEDS:
-        rng = random.Random(seed)
-        w = [0.0] * d if seed == 0 else [rng.choice(WEIGHT_GRID) for _ in range(d)]
-        scores = dot_columns(cols, w)
-        h = hits_at(scores, y, budget)
-        for _ in range(SWEEPS):
-            improved = False
-            for j in range(d):
-                cur, best_g, best_gh = w[j], w[j], h
-                for g in WEIGHT_GRID:
-                    if g == cur:
-                        continue
-                    delta = g - cur
-                    trial = [scores[i] + delta * cols[j][i] for i in range(len(y))]
-                    gh = hits_at(trial, y, budget)
-                    if gh > best_gh:
-                        best_g, best_gh = g, gh
-                if best_g != cur:
-                    delta = best_g - cur
-                    scores = [scores[i] + delta * cols[j][i] for i in range(len(y))]
-                    w[j], h, improved = best_g, best_gh, True
-            if not improved:
-                break
-        if h > best_h:
-            best_h, best_w = h, list(w)
-    return best_h, best_w
-
-
-def logistic_fit(cols, y):
-    """Plain gradient ascent on the log-likelihood. Convex, so the fixed
-    starting point at zero is sufficient and no restarts are needed."""
-    d, n = len(cols), len(y)
-    w, b = [0.0] * d, 0.0
-    for _ in range(LOGIT_STEPS):
-        z = dot_columns(cols, w)
-        gb, gw = 0.0, [0.0] * d
-        for i in range(n):
-            zi = z[i] + b
-            zi = 30.0 if zi > 30.0 else (-30.0 if zi < -30.0 else zi)
-            err = y[i] - 1.0 / (1.0 + math.exp(-zi))
-            gb += err
-            for j in range(d):
-                gw[j] += err * cols[j][i]
-        b += LOGIT_LR * gb / n
-        for j in range(d):
-            w[j] += LOGIT_LR * gw[j] / n
-    return w
-
-
-def standardize(rows):
-    d = len(rows[0])
-    cols = [[r[j] for r in rows] for j in range(d)]
-    for j in range(d):
-        col = cols[j]
-        mu = sum(col) / len(col)
-        var = sum((v - mu) ** 2 for v in col) / len(col)
-        sd = math.sqrt(var) or 1.0
-        cols[j] = [(v - mu) / sd for v in col]
-    return cols
-
-
-def per_session_top3(pairs, eligible=None):
-    by_session = defaultdict(list)
-    for p in pairs:
-        by_session[(p["project"], p["session_index"])].append(p)
-    picked = []
-    for _k, fs in sorted(by_session.items()):
-        cand = [f for f in fs if eligible is None or eligible(f)]
-        cand.sort(key=lambda e: (-e["edits"], e["file"]))
-        picked.extend(cand[:3])
-    return picked
-
-
-def main() -> int:
-    sessions, counters = vs.build_corpus()
-    groups = vs.group_by_project(sessions)
-    anon = vs.anonymize_projects(groups)
-    held_out, absent = vs.held_out_project_ids(groups, anon)
-
-    every = build_pairs(groups, anon)
-    # THE SPLIT, before any metric. Matches docs/validation/holdout.md.
-    tune = [p for p in every if p["project"] not in held_out]
-    withheld = len(every) - len(tune)
-
-    print("=" * 78)
-    print("CEILING ANALYSIS: can ANY weighting beat counting edits?")
-    print("=" * 78)
-    print(f"corpus:    {vs.PROJECTS_DIR}")
-    print(f"sessions:  {counters['sessions']}   projects: {len(groups)}")
-    print(f"held out:  {sorted(held_out)}  ({withheld} pairs withheld)")
-    if absent:
-        print(f"           absent frozen fingerprints: {absent}")
-    y = [p["y"] for p in tune]
-    print(f"tune:      {len(tune)} pairs, {sum(y)} positives, "
-          f"base rate {sum(y) / len(tune):.3f}")
-    print(f"outcome:   strong recurrence, next 3 sessions (preregistered)")
-    print(f"features:  {len(FEATURES)} -> {', '.join(FEATURES)}")
-    print()
-
-    base = per_session_top3(tune)
-    code = per_session_top3(tune, eligible=lambda p: p["class"] == "code")
-    print("REFERENCE RULES")
-    for label, flags in (("top-3 by edits", base),
-                         ("top-3 by edits, code only", code),
-                         ("PRODUCT needs_review", [p for p in tune if p["flagged_nr"]])):
-        h = sum(p["y"] for p in flags)
-        print(f"  {label:<32} flags={len(flags):>3}  hits={h:>3}  "
-              f"precision={h / len(flags) if flags else 0:.3f}")
-    print()
-
-    # Distributions that docs/metrics.md publishes. Printed by this script so
-    # every number in that file has a committed, rerunnable source.
-    print("DISTRIBUTION BY FILE CLASS (all tune pairs)")
-    by_class = defaultdict(lambda: [0, 0])
-    for pr in tune:
-        by_class[pr["class"]][0] += 1
-        by_class[pr["class"]][1] += pr["y"]
-    for cls, (n, h) in sorted(by_class.items(), key=lambda kv: -kv[1][0]):
-        print(f"  {cls:<8} pairs={n:>4}  outcomes={h:>3}  rate={h / n if n else 0:.3f}")
-    print()
-
-    print("DISTRIBUTION BY FINDING KIND (all tune pairs)")
-    by_kind = defaultdict(lambda: [0, 0])
-    for pr in tune:
-        for k in pr["kinds"]:
-            by_kind[k][0] += 1
-            by_kind[k][1] += pr["y"]
-    for kind, (n, h) in sorted(by_kind.items(), key=lambda kv: -kv[1][0]):
-        print(f"  {kind:<22} pairs={n:>4}  outcomes={h:>3}  rate={h / n if n else 0:.3f}")
-    print()
-
-    print("DISTRIBUTION BY EDIT COUNT (all tune pairs)")
-    by_stratum = defaultdict(lambda: [0, 0])
-    for pr in tune:
-        st = vs.edit_stratum(pr["edits"])
-        by_stratum[st][0] += 1
-        by_stratum[st][1] += pr["y"]
-    for st in ("1", "2-3", "4+"):
-        n, h = by_stratum[st]
-        print(f"  edits {st:<4} pairs={n:>4}  outcomes={h:>3}  rate={h / n if n else 0:.3f}")
-    print()
-
-    # Failure scarcity, which docs/metrics.md cites to explain why the
-    # failure-based signals cannot be characterised on this corpus.
-    per_session = {}
-    for pr in tune:
-        per_session[(pr["project"], pr["session_index"])] = pr["session_failed_commands"]
-    fails = sorted(per_session.values())
-    median = fails[len(fails) // 2] if fails else 0
-    print(f"FAILED COMMANDS: {sum(fails)} across {len(fails)} tune sessions, "
-          f"median {median} per session, "
-          f"{sum(1 for v in fails if v >= 1)} sessions with at least one")
-    print()
-
-    cols = standardize([featurize(p) for p in tune])
-    edits_col = [float(p["edits"]) for p in tune]
-    projects = [p["project"] for p in tune]
-
-    verdict_ok = True
-    for budget in BUDGETS:
-        eb = hits_at(edits_col, y, budget)
-        ca_h, ca_w = coordinate_ascent(cols, y, budget)
-        lg_w = logistic_fit(cols, y)
-        lg_h = hits_at(dot_columns(cols, lg_w), y, budget)
-        best = max(ca_h, lg_h)
-        margin = best - eb
-
-        pooled_h = pooled_n = 0
-        for proj in sorted(set(projects)):
-            tr = [i for i, p in enumerate(projects) if p != proj]
-            te = [i for i, p in enumerate(projects) if p == proj]
-            fold_budget = max(1, round(budget * len(te) / len(tune)))
-            tr_cols = [[cols[j][i] for i in tr] for j in range(len(cols))]
-            tr_y = [y[i] for i in tr]
-            _h, w_tr = coordinate_ascent(tr_cols, tr_y,
-                                         max(1, budget - fold_budget))
-            te_cols = [[cols[j][i] for i in te] for j in range(len(cols))]
-            te_y = [y[i] for i in te]
-            pooled_h += hits_at(dot_columns(te_cols, w_tr), te_y, fold_budget)
-            pooled_n += fold_budget
-
-        print(f"BUDGET {budget} FLAGS")
-        print(f"  edit count alone            hits {eb:>3}  precision {eb / budget:.3f}")
-        print(f"  in-sample, coord ascent     hits {ca_h:>3}  precision {ca_h / budget:.3f}")
-        print(f"  in-sample, logistic         hits {lg_h:>3}  precision {lg_h / budget:.3f}")
-        print(f"  IN-SAMPLE BEST (bound)      hits {best:>3}  precision {best / budget:.3f}"
-              f"   margin over edits: {margin:+d}")
-        print(f"  leave-one-project-out       hits {pooled_h:>3}  "
-              f"precision {pooled_h / pooled_n:.3f}  (n={pooled_n})")
-        ranked_feats = sorted(range(len(FEATURES)), key=lambda j: -abs(ca_w[j]))[:5]
-        print("  coord-ascent winner leaned on: "
-              + ", ".join(f"{FEATURES[j]}={ca_w[j]:+.2f}" for j in ranked_feats))
-        if margin > 4:
-            verdict_ok = False
-        print()
-
-    print("=" * 78)
-    print("GATE (spec 2026-07-26 Part 1d, fixed before this ran):")
-    print("  CONFIRMED if the in-sample bound exceeds edit count by at most")
-    print("  +4 hits at EVERY budget. An in-sample maximum is optimistic, so a")
-    print("  rule that cannot reach +5 while fitting to the answers cannot")
-    print("  generalize a win.")
-    print()
-    print("  RESULT: " + ("CONFIRMED, no headroom. Proceed to Part 2."
-                          if verdict_ok else
-                          "OVERTURNED. Do NOT proceed to Part 2; run the full "
-                          "preregistered leave-one-project-out pass instead."))
-    print()
-    print("CAVEAT to carry into the report: leave-one-project-out has only")
-    print("three coarse folds here, and its numbers are non-monotonic across")
-    print("budgets. Read it as a direction, not a measurement. The verdict")
-    print("rests on the in-sample bound.")
-    print("=" * 78)
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
-```
-
-- [ ] **Step 2: Run it and capture the output**
-
-```bash
-python3 scripts/ceiling_analysis.py 2>&1 | tee /tmp/ceiling-run-1.txt
-```
-
-Expected: a `RESULT:` line. The brainstorm's preliminary run, on kind presence
-without magnitudes, produced margins of +3, +2, +4 at budgets 40, 52, 65, so
-`CONFIRMED` is the expected outcome. Runtime is a couple of minutes.
-
-- [ ] **Step 3: Verify determinism**
-
-```bash
-python3 scripts/ceiling_analysis.py > /tmp/ceiling-run-2.txt 2>&1
-diff /tmp/ceiling-run-1.txt /tmp/ceiling-run-2.txt && echo "DETERMINISTIC"
-```
-
-Expected: `DETERMINISTIC` with no diff output. If the two runs differ, an RNG
-or an unsorted collection escaped; fix it before continuing, because a
-non-reproducible verdict is not a verdict.
-
-- [ ] **Step 4: Obey the gate**
-
-If `RESULT` says `OVERTURNED`, **stop this plan here**. Report the margins to
-the user. Part 2 is predicated on the verdict, and the spec's branch is to run
-the full preregistered pass instead. Do not proceed to Task 4.
-
-If `RESULT` says `CONFIRMED`, continue.
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add scripts/ceiling_analysis.py
-git commit -m "validity: ceiling analysis, can any weighting beat edit count
-
-Fits weights to maximize hits at a fixed flag budget on the same pairs it
-scores. Maximally overfit on purpose, so the result upper-bounds any honest
-rule. Two independent fitters (coordinate ascent on the target metric,
-logistic regression for convexity) so a low number cannot be an artifact of
-under-searching, which would bias the verdict toward finding no headroom.
-
-Reuses validity_sweep's corpus assembly and holdout resolution by import, so
-the split and the outcome logic cannot drift from the published study. Tune
-split only, split before any metric, preregistered outcome throughout."
-```
-
----
-
-### Task 4: The new ordering
+### Task 2: The new ordering
 
 **Files:**
 - Modify: `crates/sumcp-core/src/score.rs:78-89` (`FileScore`), `:143-186`
@@ -1226,7 +592,7 @@ against the report."
 
 ---
 
-### Task 5: Remove the score and the weights, land payload contract v1
+### Task 3: Remove the score and the weights, land payload contract v1
 
 **Files:**
 - Modify: `crates/sumcp-core/src/score.rs` (delete `Weights`,
@@ -1748,7 +1114,7 @@ configuration to diverge on. A user with a stale config gets a notice."
 
 ---
 
-### Task 6: Surface a secrets-file touch as a blind spot
+### Task 4: Surface a secrets-file touch as a blind spot
 
 **Files:**
 - Modify: `crates/sumcp-core/src/file_class.rs` (add `is_secrets`)
@@ -2138,122 +1504,7 @@ measured. It is a policy signal, not a measured one, and metrics.md says so."
 
 ---
 
-### Task 7: Documentation claims
-
-**Files:**
-- Modify: `docs/metrics.md`, `SPEC.md`, `README.md`, `tasks/todo.md`
-
-**Interfaces:**
-- Consumes: `RANKING_RULE` and the Task 3 script output.
-- Produces: no code interface.
-
-- [ ] **Step 1: Rewrite the weight column in `docs/metrics.md`**
-
-Remove the weight column from the signal table, since no weights exist. For
-each previously-ranked signal, add what the 2026-07-26 tune split showed.
-
-**Take every figure from the Task 3 script's `DISTRIBUTION BY FINDING KIND`,
-`DISTRIBUTION BY FILE CLASS`, and `FAILED COMMANDS` blocks.** Do not retype
-numbers from this plan: the preliminary figures quoted during the brainstorm
-predate the magnitude features, and every published number must trace to a
-committed, rerunnable script. Re-run it if you no longer have the output:
-
-```bash
-python3 scripts/ceiling_analysis.py | sed -n '/DISTRIBUTION/,/^BUDGET/p'
-```
-
-State these three things in prose, using the figures from that output, and no
-more than these:
-
-- `blind_write_attempt` was weighted joint-highest on IDE-Bench's 63% figure
-  and fired on relatively few pairs with zero outcomes here (use the script's
-  count). Zero outcomes over that many pairs rules out a large
-  positive effect. It does not establish the signal is harmful, and it does not
-  refute IDE-Bench, whose population is autonomous benchmark trajectories
-  rather than interactive sessions.
-- `failure_loop` and `true_revert` are too rare here to characterise, and the
-  reason is that failures themselves are rare: quote the `FAILED COMMANDS`
-  line from the script output (total, session count, and median). That is a
-  property of this corpus, not of the detector.
-- `re_read` had the best rate of the frequent kinds while being weighted below
-  both `rework` and `fumble`. The literature-derived ordering did not reproduce
-  on the only corpus it has been measured against.
-
-Add a `class` row documenting `file_class`, and reproduce the honesty note from
-that module's rustdoc verbatim: only the code-versus-docs-and-config boundary
-rests on adequate data.
-
-- [ ] **Step 2: Amend `SPEC.md`**
-
-Following the file's existing amendment style, amend decision 6 (transparent
-weighted ranking) and ADR A6 (TOML-optional weights). Decision 6 becomes the
-four-key rule with `RANKING_RULE` quoted. ADR A6 is marked retired with the
-date, the reason, and a pointer to the ceiling analysis. Do not delete the
-original text; amend it, so the record of what was decided and why it changed
-both survive.
-
-- [ ] **Step 3: Rewrite "The numbers" in `README.md`**
-
-Replace the section with a claim that is exactly what the evidence supports.
-It must say all of:
-
-- Flagged files really do recur more than unflagged ones. Every product row in
-  the 2026-07-22 study had a relative risk well above 1 with an interval
-  excluding 1.
-- The ranking is a four-key rule a reader can verify by hand, not a score. No
-  weighting over the observable signals beat counting edits, and the ceiling
-  analysis measured that rather than assuming it.
-- Restricting the queue to code cut flagged files from 65 to 52 for an
-  identical hit count on the tune split, which is a 20% reduction in false
-  alarms at no cost to recall.
-- Every entry carries deterministic evidence: the exact actions, cited.
-
-It must NOT claim the ranking is more accurate than any alternative. Keep the
-existing token-reduction paragraph and the `Limitations` section, and add the
-single-author-corpus and 30-day-cleanup caveats to `Limitations`.
-
-- [ ] **Step 4: Close the decision in `tasks/todo.md`**
-
-Tick "Decide what v0.1 claims" and record: option (b) was chosen, a feasibility
-pass measured that the goal is unreachable on this corpus, the score was
-demoted rather than retuned, and the evidence is in
-`docs/validation/2026-07-26-ceiling-analysis.md`. Add a new unticked item for
-refreshing the corpus archive before any future validation run, and note that
-`cleanupPeriodDays` is still unset.
-
-- [ ] **Step 5: Check the prose gates**
-
-```bash
-for f in docs/metrics.md SPEC.md README.md tasks/todo.md; do
-  echo "$f em-dashes: $(grep -c '—' $f)"
-done
-grep -rn "/Users/" README.md docs/metrics.md SPEC.md | head
-```
-
-Expected: zero em dashes in every file, and no output from the path grep.
-
-- [ ] **Step 6: Commit**
-
-```bash
-git add docs/metrics.md SPEC.md README.md tasks/todo.md
-git commit -m "docs: signal evidence instead of weight tiers, close the v0.1 claim
-
-metrics.md drops the weight column, which describes a mechanism that no
-longer exists, and records what each signal actually did on the 2026-07-26
-tune split. The blind-write row states the limit of its own evidence: zero
-outcomes in 24 pairs rules out a large positive effect and does not refute
-IDE-Bench, whose population is autonomous trajectories rather than
-interactive sessions.
-
-SPEC decision 6 amended to the four-key rule; ADR A6 marked retired. README
-'The numbers' now claims what is supported: the flags are predictive, the
-order is a rule you can check by hand, restricting to code cut flags 65 to 52
-for the same hits, and every entry is cited. No accuracy claim."
-```
-
----
-
-### Task 8: Publish the negative result and run the release gate
+### Task 5: Publish the measurement note
 
 **Files:**
 - Create: `docs/validation/2026-07-26-ceiling-analysis.md`
@@ -2263,28 +1514,53 @@ for the same hits, and every entry is cited. No accuracy claim."
 **Interfaces:**
 - Consumes: the Task 3 output.
 
-- [ ] **Step 1: Write the validation report**
+- [ ] **Step 1: Write the measurement note**
 
-Create `docs/validation/2026-07-26-ceiling-analysis.md` containing, in this
-order: status and scope line matching the other validation docs; the question;
-the method including why the fit is deliberately overfit and why there are two
-fitters; the corpus line (sessions, projects, tune pairs, positives, held-out
-project id, pairs withheld); the reference-rule table; one table per budget with
-edit count, both fitters, the in-sample bound, the margin, and
-leave-one-project-out; the gate as it was written before the run and the result;
-then the caveats.
+Create `docs/validation/2026-07-26-file-class-measurement.md`. This is a short
+note, not a study: it records the one measurement that justifies the ranking
+change, so the change is not asserted from taste.
 
-Caveats must include all five: single-author single-machine corpus;
-leave-one-project-out has three coarse folds and non-monotonic numbers so it is
-a direction not a measurement; an in-sample bound is optimistic by construction
-which is what makes it usable as a bound; failure signals are scarce because
-failures are scarce (58 across 24 sessions, median 1); and the corpus is a
-30-day rolling window that was actively losing sessions until it was archived,
-with one frozen holdout project already lost.
+State up front what it is and is not: a descriptive breakdown of the SAME tune
+split the 2026-07-22 study reports (552 (session, file) pairs, 39 strong
+recurrence outcomes, held-out project excluded, outcome and window definitions
+unchanged), computed on 2026-07-26. No model is fitted and no threshold is
+swept, so there is nothing here to overfit. It is not a second predictive study
+and makes no accuracy claim.
 
-Copy the numbers from the Task 3 run output. Do not retype them from this plan:
-Task 3 adds magnitude features that the brainstorm's preliminary run did not
-have, so its numbers will differ.
+The figures, by file class, over all 552 tune pairs:
+
+| class | pairs | outcomes | rate |
+|---|---|---|---|
+| code | 285 | 34 | 0.119 |
+| docs | 192 | 1 | 0.005 |
+| config | 37 | 0 | 0.000 |
+| notes | 19 | 3 | 0.158 |
+| other | 12 | 0 | 0.000 |
+| web | 7 | 1 | 0.143 |
+
+And the two observations that follow, stated no more strongly than the cells
+support:
+
+- Documentation is 35% of the pair population and carries 1 of 39 outcomes.
+  Config is 37 pairs and carries none. Ranking these below code is supported.
+- `notes` shows a HIGHER rate than code on 19 pairs and 3 outcomes, and `web`
+  on 7 pairs and 1. Both are far too thin to order confidently, which is why
+  `notes` sits directly below code rather than beside documentation and `web`
+  is grouped with code. Say plainly that only the code-versus-docs-and-config
+  boundary rests on adequate data.
+
+Add one paragraph recording the concrete defect this fixes: on the demo fixture
+the previous weighted ranking placed two markdown files and a never-edited
+image above a `.py` file that had a failure loop, the image scoring purely on
+re-reads.
+
+Add a caveats section: single-author single-machine corpus; descriptive only;
+thin cells in every class except code; and that the corpus is a rolling window
+under a 30-day cleanup, so this exact population cannot be recomputed from the
+live transcript directory.
+
+Do NOT invent numbers. Every figure above is given; if you believe one is
+wrong, stop and report rather than substituting your own.
 
 - [ ] **Step 2: Add the forward pointer**
 
@@ -2292,10 +1568,10 @@ At the top of `docs/validation/2026-07-22-predictive-validity.md`, under the
 existing `Status:` block, add:
 
 ```markdown
-Superseded in part by `docs/validation/2026-07-26-ceiling-analysis.md`, which
-answers the question this study raised: no weighting over the observable
-features beats counting edits, so the weighted score was removed rather than
-retuned. The numbers below stand as recorded.
+See also `docs/validation/2026-07-26-file-class-measurement.md`, a descriptive
+breakdown of this same tune split by file class. It is what motivated replacing
+the weighted score with a stated ordering rule. The numbers below stand as
+recorded and were not recomputed.
 ```
 
 - [ ] **Step 3: Regenerate the hero screenshot**
@@ -2344,22 +1620,7 @@ Hero screenshot regenerated: the old one showed two markdown files and a
 never-edited JPEG above a .py file whose commands were failing."
 ```
 
-- [ ] **Step 6: Run the held-out gate, once**
-
-This is the last step, and it runs exactly once. Never during development.
-
-```bash
-python3 scripts/validity_sweep.py --release-eval
-cat .superpowers/sdd/validity-heldout-eval.json
-```
-
-Per the spec's pre-commitment: the configuration ships regardless of what this
-says, and the number is published whatever it says. Because Part 1 forecloses
-any accuracy claim, no claim attaches to it. Add the held-out precision and
-flag count to the ceiling analysis report as a short closing section, labelled
-as a single-project observation, and commit that.
-
-- [ ] **Step 7: Final full verification**
+- [ ] **Step 6: Final full verification**
 
 ```bash
 cargo fmt --all -- --check
@@ -2378,31 +1639,25 @@ visible.
 
 ## Self-Review
 
-**Spec coverage.** Every numbered spec section maps to a task: 1a to Task 2
-steps 1-3; 1b to Task 3; 1c to Task 2 steps 5-7; 1d to Task 3 steps 3-5; 2a to
-Task 1; 2b to Tasks 4 and 5; 2c to Task 7 step 1; 2d to Task 5 steps 4, 8, 9,
-10; 2e to Task 5 steps 5-6; 2f to Task 5 step 6; Part 3 to Tasks 7 and 8. The
-spec's testing section is distributed across each task's own verification
-steps, and its "docs-only session must not produce an empty report" requirement
-is covered by `code_outranks_docs_even_with_fewer_edits` in Task 4 plus the
-`FileClass::Docs` tier being a sort key rather than a filter, which is why no
-file is ever excluded.
+**Spec coverage, after the 2026-07-26 descoping.** Spec sections 2a to Task 1;
+2b to Tasks 2 and 3; 2c to Task 6; 2d to Task 3; 2e to Task 3; 2f to Task 3;
+Part 3 to Tasks 5 and 6. Task 4 is additional scope the user requested during
+execution and is not in the original spec.
 
-**Known gap, deliberate.** The spec asks for a regression test pinning the demo
-fixture's new order. Task 4 step 7 eyeballs it and Task 8 step 3 checks the
-screenshot, but there is no automated assertion, because the fixture path
-depends on which demo fixture survives and a brittle pin on a large fixture
-would fail for unrelated reasons. If the implementer wants one, add it to
-`crates/sumcp-cli/tests/html_report.rs`, asserting only that the first ranked
-row's class is `code`.
+**Dropped from the spec, deliberately.** Part 1 in full (the dump-field
+additions, `scripts/ceiling_analysis.py`, the corpus archive plumbing and pin,
+and the confirmation gate) and Part 3's held-out release-eval run. Reason: they
+were insurance on a decision the already-published 2026-07-22 study plus the
+Task 5 measurement note already support, and the corpus pinning had twice
+blocked execution on questions that do not change what ships. No accuracy
+claim is being made, so there is no claim for a held-out gate to gate.
 
 **Type consistency.** `FileClass`, `classify`, and `tier` are named identically
 in Tasks 1, 4, and 5. `RANKING_RULE` is defined in Task 5 step 3 and consumed in
 steps 4, 5, and 6 and in the Task 5 step 1 test. `rank(s: &Session)` and
 `struggle_areas(ranked, meta, n)` are used consistently after Task 5. There is exactly ONE
-file-class table, in Rust: the dump emits `class` per file and
-`ceiling_analysis.py` reads it rather than reclassifying, so the published
-analysis and the shipped classifier cannot drift.
+file-class table, in Rust, in `file_class.rs`. Nothing outside that module
+classifies a path.
 
 **Ordering hazard.** Task 4 keeps `score` and `Weights` alive so that task
 compiles on its own. Task 5 removes them. Do not merge the two tasks: the point
@@ -2415,3 +1670,114 @@ contract break attached to it.
 
 Plan complete and saved to
 `docs/superpowers/plans/2026-07-26-ceiling-verdict-and-simple-ranking.md`.
+### Task 6: Documentation claims
+
+**Files:**
+- Modify: `docs/metrics.md`, `SPEC.md`, `README.md`, `tasks/todo.md`
+
+**Interfaces:**
+- Consumes: `RANKING_RULE` and the Task 3 script output.
+- Produces: no code interface.
+
+- [ ] **Step 1: Rewrite the weight column in `docs/metrics.md`**
+
+Remove the weight column from the signal table, since no weights exist.
+
+Cite `docs/validation/2026-07-26-file-class-measurement.md` (written in Task 5)
+for the file-class figures, and add a `class` row documenting `file_class`
+reproducing the honesty note from that module's rustdoc: only the
+code-versus-docs-and-config boundary rests on adequate data.
+
+Then state these three things in prose about the signals whose weights are
+gone, and no more than these. The figures are from the same tune split as the
+measurement note and are given here; do not invent others:
+
+- `blind_write_attempt` was weighted joint-highest on the strength of
+  IDE-Bench's 63% figure, and on this corpus it fired on 24 pairs with **zero**
+  outcomes. State the limit precisely: zero in 24 rules out a large positive
+  effect, it does not establish the signal is harmful, and it does not refute
+  IDE-Bench, whose population is autonomous benchmark trajectories rather than
+  interactive sessions.
+- `failure_loop` (4 pairs) and `true_revert` (2 pairs) are too rare here to
+  characterise, because failures themselves are rare: 58 confirmed failed
+  commands across the tune sessions, a median of 1 per session. That is a
+  property of this corpus, not of the detector.
+- `re_read` had the best rate of the frequent kinds (97 pairs, 21 outcomes,
+  0.216) while being weighted BELOW both `rework` (94 pairs, 19, 0.202) and
+  `fumble`. `churn` was 242 pairs, 33 outcomes, 0.136. So the
+  literature-derived weight ordering did not reproduce on the only corpus it
+  has been measured against.
+
+Add one sentence stating that no weighting was retuned, because the weights
+were removed rather than adjusted, and that no accuracy claim is made anywhere.
+
+- [ ] **Step 2: Amend `SPEC.md`**
+
+Following the file's existing amendment style, amend decision 6 (transparent
+weighted ranking) and ADR A6 (TOML-optional weights). Decision 6 becomes the
+four-key rule with `RANKING_RULE` quoted. ADR A6 is marked retired with the
+date, the reason, and a pointer to the ceiling analysis. Do not delete the
+original text; amend it, so the record of what was decided and why it changed
+both survive.
+
+- [ ] **Step 3: Rewrite "The numbers" in `README.md`**
+
+Replace the section with a claim that is exactly what the evidence supports.
+It must say all of:
+
+- Flagged files really do recur more than unflagged ones. Every product row in
+  the 2026-07-22 study had a relative risk well above 1 with an interval
+  excluding 1.
+- The ranking is a four-key rule a reader can verify by hand, not a score. The
+  2026-07-22 study found the weighted ranking did not beat sorting by edit
+  count, so the score was removed rather than retuned.
+- Documentation was 35% of the measured file-sessions and carried 1 of 39
+  outcomes; restricting the queue to code cut flagged files from 65 to 52 for
+  an identical hit count, a 20% reduction in false alarms at no cost to recall.
+- Every entry carries deterministic evidence: the exact actions, cited.
+
+It must NOT claim the ranking is more accurate than any alternative. Keep the
+existing token-reduction paragraph and the `Limitations` section, and add the
+single-author-corpus and 30-day-cleanup caveats to `Limitations`.
+
+- [ ] **Step 4: Close the decision in `tasks/todo.md`**
+
+Tick "Decide what v0.1 claims" and record: option (b) was chosen, a feasibility
+pass measured that the goal is unreachable on this corpus, the score was
+demoted rather than retuned, and the evidence is in
+`docs/validation/2026-07-26-ceiling-analysis.md`. Add a new unticked item for
+refreshing the corpus archive before any future validation run, and note that
+`cleanupPeriodDays` is still unset.
+
+- [ ] **Step 5: Check the prose gates**
+
+```bash
+for f in docs/metrics.md SPEC.md README.md tasks/todo.md; do
+  echo "$f em-dashes: $(grep -c '—' $f)"
+done
+grep -rn "/Users/" README.md docs/metrics.md SPEC.md | head
+```
+
+Expected: zero em dashes in every file, and no output from the path grep.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add docs/metrics.md SPEC.md README.md tasks/todo.md
+git commit -m "docs: signal evidence instead of weight tiers, close the v0.1 claim
+
+metrics.md drops the weight column, which describes a mechanism that no
+longer exists, and records what each signal actually did on the 2026-07-26
+tune split. The blind-write row states the limit of its own evidence: zero
+outcomes in 24 pairs rules out a large positive effect and does not refute
+IDE-Bench, whose population is autonomous trajectories rather than
+interactive sessions.
+
+SPEC decision 6 amended to the four-key rule; ADR A6 marked retired. README
+'The numbers' now claims what is supported: the flags are predictive, the
+order is a rule you can check by hand, restricting to code cut flags 65 to 52
+for the same hits, and every entry is cited. No accuracy claim."
+```
+
+---
+
