@@ -158,8 +158,8 @@ jobs:
           run_bin "$bin" --version
           # Exercise the real analysis path, not just the version string, so a
           # binary that starts but cannot parse a transcript fails here.
-          run_bin "$bin" --file fixtures/demo/demo-session.jsonl --json > /tmp/smoke.json
-          python3 -c 'import json; d=json.load(open("/tmp/smoke.json")); assert d["v"]==1, d["v"]; assert d["top_struggles"], "no ranked files"; print("analyzed the fixture:", d["top_struggles"][0]["file"])'
+          run_bin "$bin" --file fixtures/demo/demo-session.jsonl --json > smoke.json
+          python3 -c 'import json; d=json.load(open("smoke.json")); assert d["v"]==1, d["v"]; assert d["top_struggles"], "no ranked files"; print("analyzed the fixture:", d["top_struggles"][0]["file"])'
           # sumcp-mcp is a stdio server with no --version flag, so running it
           # would block on stdin. Prove it exists and is a real executable.
           test -x "./target/${{ matrix.target }}/release/sumcp-mcp${exe}"

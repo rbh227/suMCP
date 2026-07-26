@@ -137,8 +137,8 @@ jobs:
           # And run something that touches the real analysis path, not just
           # the version string, on a committed fixture.
           run_bin() { if [ "$(uname -m)" = "arm64" ]; then arch -x86_64 "$@"; else "$@"; fi; }
-          run_bin "$bin" --file fixtures/demo/demo-session.jsonl --json > /tmp/out.json
-          python3 -c 'import json; d=json.load(open("/tmp/out.json")); assert d["v"]==1, d["v"]; assert d["top_struggles"], "no ranked files"; print("Intel binary analyzed the fixture:", d["top_struggles"][0]["file"])'
+          run_bin "$bin" --file fixtures/demo/demo-session.jsonl --json > out.json
+          python3 -c 'import json; d=json.load(open("out.json")); assert d["v"]==1, d["v"]; assert d["top_struggles"], "no ranked files"; print("Intel binary analyzed the fixture:", d["top_struggles"][0]["file"])'
           test -x "./target/x86_64-apple-darwin/release/sumcp-mcp"
 
   # The release workflow's `publish` job depends on ALL build targets, so a
