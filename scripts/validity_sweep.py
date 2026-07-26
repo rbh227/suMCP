@@ -20,6 +20,9 @@ Pipeline:
   5. Compute relative risk, precision, miss rate, false-alarm share, and
      edit-count-stratified relative risk for both flag definitions
      (flagged_nr, flagged_top3).
+  6. Run the SAME contingency/RR/precision machinery over a fixed set of
+     trivial baseline predictors (see RULES below) so the weighted ranking
+     has to beat "count the edits" rather than merely beat chance.
 
 Holdout discipline (two rules, both enforced here rather than by convention):
   - Membership is FROZEN BY FINGERPRINT in docs/validation/holdout-snapshot.json,
@@ -52,6 +55,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import subprocess
 import sys
 import time
@@ -70,6 +74,10 @@ RELEASE_EVAL_OUT = REPO / ".superpowers" / "sdd" / "validity-heldout-eval.json"
 DRAFT_OUT = REPO / "docs" / "validation" / "2026-07-22-predictive-validity.md"
 DUMP_BIN = REPO / "target" / "release" / "examples" / "validity_dump"
 
+# Bump whenever validity_dump.rs changes its output shape (see cache_path).
+# v2: added per-file `changed_lines` and session-level `failed_commands`.
+CACHE_SCHEMA = 2
+
 MIN_ACTIONS = 20
 RECENT_SECONDS = 10 * 60
 WINDOW_COUNT = 3
@@ -79,6 +87,105 @@ STRONG_KINDS = {"failure_loop", "user_corrected", "true_revert", "flip"}
 FLAG_DEFS = ("flagged_nr", "flagged_top3")
 WINDOWS = ("next3", "within14d")
 OUTCOMES = ("weak", "strong")
+
+# ---- baseline predictors (T5.4-followup, 2026-07-25) ----------------------
+#
+# The question these answer: does the WEIGHTED ranking earn its complexity, or
+# would a file's raw edit count predict rework just as well? Every rule below
+# is run through the identical contingency/RR/precision machinery as the two
+# product flags, over the identical pair population.
+#
+# THRESHOLD DISCIPLINE. Every threshold here is either (a) zero-parameter, or
+# (b) a constant that already existed in the repo for an unrelated reason
+# BEFORE this comparison was written. No threshold was chosen by looking at
+# an outcome, and no threshold is swept. Where a natural quantity has two
+# pre-existing boundaries (edit count; the review band), BOTH are reported and
+# neither is picked as "the" baseline, because picking the better-looking one
+# after the fact is exactly the tuning this study forbids. Provenance for each
+# is recorded in RULE_BASIS and printed into the report, so a reader can check
+# the claim rather than take it on trust.
+#
+# NOTE ON TOP-N RULES: N = 3 everywhere, matching the product's flagged_top3
+# (`ranked.iter().take(3)` in validity_dump.rs) so the comparison is
+# like-for-like on flag count as well as on definition. Ties are broken by
+# file path, which is deterministic and independent of the outcome.
+PRODUCT_RULES = ("flagged_nr", "flagged_top3")
+BASELINE_RULES = (
+    "base_edits_ge2",
+    "base_edits_ge4",
+    "base_top3_edits",
+    "base_lines_ge200",
+    "base_lines_ge400",
+    "base_top3_lines",
+    "base_failed_ge1",
+    "base_all",
+)
+RULES = PRODUCT_RULES + BASELINE_RULES
+
+RULE_LABEL = {
+    "flagged_nr": "PRODUCT flagged_nr (review::needs_review)",
+    "flagged_top3": "PRODUCT flagged_top3 (weighted score::rank top-3)",
+    "base_edits_ge2": "baseline edits >= 2",
+    "base_edits_ge4": "baseline edits >= 4",
+    "base_top3_edits": "baseline top-3 by edit count",
+    "base_lines_ge200": "baseline changed lines >= 200",
+    "base_lines_ge400": "baseline changed lines >= 400",
+    "base_top3_lines": "baseline top-3 by changed lines",
+    "base_failed_ge1": "baseline session has >= 1 failed command",
+    "base_all": "reference: flag every edited file",
+}
+
+RULE_BASIS = {
+    "flagged_nr": "product rule, frozen Weights::default()",
+    "flagged_top3": "product rule, frozen Weights::default()",
+    "base_edits_ge2": (
+        "lower boundary of this script's pre-existing edit_stratum() buckets "
+        "('1' vs '2-3'), which predate this comparison; also equals the "
+        "product's own CHURN_MIN_EDITS = 2 in signals/edit_shape.rs"
+    ),
+    "base_edits_ge4": (
+        "upper boundary of this script's pre-existing edit_stratum() buckets "
+        "('2-3' vs '4+'), which predate this comparison"
+    ),
+    "base_top3_edits": (
+        "zero-parameter; N = 3 fixed by the product flag it is compared "
+        "against (flagged_top3)"
+    ),
+    "base_lines_ge200": (
+        "lower edge of the human code-review band cited in "
+        "signals/comprehension.rs (SmartBear/Cisco: 'under 200, not to exceed "
+        "400'); predates this comparison"
+    ),
+    "base_lines_ge400": (
+        "REVIEW_BAND_HI = 400 in signals/comprehension.rs, the product's own "
+        "review-burden threshold; predates this comparison"
+    ),
+    "base_top3_lines": (
+        "zero-parameter; N = 3 fixed by the product flag it is compared "
+        "against (flagged_top3)"
+    ),
+    "base_failed_ge1": (
+        "zero-parameter: 'any confirmed failed command at all' is the only "
+        "threshold on this quantity that requires choosing no magnitude. "
+        "SESSION-level, so it is constant across every file in a session and "
+        "has no within-session discriminative power by construction"
+    ),
+    "base_all": (
+        "degenerate reference, not a candidate: flags everything, so recall is "
+        "perfect and miss rate is 0 by definition. Its precision IS the base "
+        "rate, which is the number every other rule's precision must beat"
+    ),
+}
+
+# The pre-registered headline comparison. Declared here, above any result, and
+# reported alongside all three other (window, outcome) combinations regardless
+# of how it comes out.
+PRIMARY_WINDOW = "next3"
+PRIMARY_OUTCOME = "strong"
+
+# Contingency cells below this are reported but explicitly marked as too thin
+# to carry a conclusion (see thin_cells()).
+MIN_CELL = 5
 
 
 # ---- discovery + per-transcript dump (with cache) --------------------------
@@ -103,8 +210,16 @@ def discover_transcripts() -> list[Path]:
 def cache_path(transcript: Path) -> Path:
     # UUID transcript stems are unique in practice; the path hash is a cheap
     # belt-and-suspenders guard against any theoretical collision.
+    #
+    # CACHE_SCHEMA is in the filename because the freshness check compares
+    # mtimes of the CACHE and the TRANSCRIPT: it cannot see that the dump
+    # binary changed. Adding a field to validity_dump.rs without bumping this
+    # would leave every cached dump missing that field, and the reader's
+    # `.get(field, 0)` defaults would turn the omission into a plausible-looking
+    # column of zeros rather than an error. Bump on any change to the dump's
+    # output shape.
     h = hashlib.sha1(str(transcript).encode()).hexdigest()[:8]
-    return CACHE_DIR / f"{h}-{transcript.stem}.json"
+    return CACHE_DIR / f"v{CACHE_SCHEMA}-{h}-{transcript.stem}.json"
 
 
 def run_dump(transcript: Path) -> dict | None:
@@ -328,6 +443,19 @@ def edit_stratum(edits: int) -> str:
     return "4+"
 
 
+def top_n_files(files: list[dict], key: str, n: int = 3) -> set[str]:
+    """The n files with the largest `key`, ties broken by file path.
+
+    Path order is the tiebreak because it is deterministic and, unlike any
+    outcome-aware ordering, cannot smuggle knowledge of the future into a
+    baseline. Exactly n files are returned (fewer only if the session edited
+    fewer), matching the product's `ranked.iter().take(3)` rather than
+    expanding to include everyone tied at the boundary.
+    """
+    ordered = sorted(files, key=lambda e: (-e.get(key, 0), e["file"]))
+    return {e["file"] for e in ordered[:n]}
+
+
 def build_pairs(groups: dict[str, list[dict]], anon: dict[str, str]) -> tuple[list[dict], int]:
     """Every (session N, edited file F) pair with both outcome definitions
     precomputed for both windows. Returns (pairs, excluded_last_session_pairs).
@@ -345,16 +473,34 @@ def build_pairs(groups: dict[str, list[dict]], anon: dict[str, str]) -> tuple[li
                 excluded += len(files)
                 continue
             next3, within14d = window_sessions(ordered, i)
+            # Baseline top-3 sets are per-session, so they are computed once
+            # per session rather than once per file.
+            top3_edits = top_n_files(files, "edits")
+            top3_lines = top_n_files(files, "changed_lines")
+            failed_commands = s["dump"].get("failed_commands", 0)
             for entry in sorted(files, key=lambda e: e["file"]):
                 file = entry["file"]
+                changed_lines = entry.get("changed_lines", 0)
                 pairs.append(
                     {
                         "project": proj_id,
                         "session_index": i,
                         "edits": entry["edits"],
+                        "changed_lines": changed_lines,
+                        "session_failed_commands": failed_commands,
                         "stratum": edit_stratum(entry["edits"]),
                         "flagged_nr": entry["flagged_nr"],
                         "flagged_top3": entry["flagged_top3"],
+                        # Trivial baselines. Thresholds are fixed in RULES /
+                        # RULE_BASIS above and never swept.
+                        "base_edits_ge2": entry["edits"] >= 2,
+                        "base_edits_ge4": entry["edits"] >= 4,
+                        "base_top3_edits": file in top3_edits,
+                        "base_lines_ge200": changed_lines >= 200,
+                        "base_lines_ge400": changed_lines >= 400,
+                        "base_top3_lines": file in top3_lines,
+                        "base_failed_ge1": failed_commands >= 1,
+                        "base_all": True,
                         # Study heuristic (T5.4-followup, 2026-07-22), not a
                         # product signal: see validity_dump.rs's
                         # `last_edit_verified` doc comment for the exact
@@ -408,6 +554,111 @@ def precision(a: int, b: int) -> float | None:
 
 def miss_rate(a: int, c: int) -> float | None:
     return c / (a + c) if (a + c) else None
+
+
+def rr_confidence_interval(a: int, b: int, c: int, d: int) -> tuple[float, float] | None:
+    """95% CI for the relative risk, by Katz's log method.
+
+    The point estimate alone is what makes a 19-vs-3 contingency table look
+    like a finding. `log(RR)` is approximately normal with
+    `SE = sqrt(1/a - 1/(a+b) + 1/c - 1/(c+d))`, so the interval widens on its
+    own exactly when the cells are thin, and an interval spanning 1.0 says
+    "this table cannot distinguish this rule from a coin flip" without anyone
+    having to eyeball the counts.
+
+    `None` when RR itself is undefined, or when a or c is 0 (the SE has 1/a
+    and 1/c terms, so a zero cell makes the interval infinite; reporting no
+    interval is more honest than reporting an unbounded one). The
+    normal approximation is itself shaky for small cells, which is why
+    thin_cells() flags them separately rather than relying on the CI.
+    """
+    if relative_risk(a, b, c, d) is None or a == 0 or c == 0:
+        return None
+    rr = a / (a + b) / (c / (c + d))
+    se = math.sqrt(1 / a - 1 / (a + b) + 1 / c - 1 / (c + d))
+    return (math.exp(math.log(rr) - 1.96 * se), math.exp(math.log(rr) + 1.96 * se))
+
+
+def thin_cells(a: int, b: int, c: int, d: int) -> list[str]:
+    """Names of the contingency cells below MIN_CELL, sorted.
+
+    Reported per row so "too small to conclude from" is a printed fact rather
+    than something the reader has to derive.
+    """
+    return sorted(name for name, v in (("a", a), ("b", b), ("c", c), ("d", d)) if v < MIN_CELL)
+
+
+def rule_comparison(pairs: list[dict]) -> dict:
+    """Every rule in RULES scored on every (window, outcome), with flag counts.
+
+    Flag count is a first-class output, not a footnote: a rule that flags
+    everything wins recall trivially and must be visible as doing so. Raw a/b/
+    c/d accompany every ratio for the same reason.
+    """
+    n = len(pairs)
+    out: dict[str, dict] = {}
+    for rule in RULES:
+        n_flagged = sum(1 for p in pairs if p[rule])
+        entry = {
+            "label": RULE_LABEL[rule],
+            "basis": RULE_BASIS[rule],
+            "n_flagged": n_flagged,
+            "flag_share": (n_flagged / n) if n else None,
+            "windows": {},
+        }
+        for window in WINDOWS:
+            entry["windows"][window] = {}
+            for outcome in OUTCOMES:
+                out_key = outcome_key(window, outcome)
+                a, b, c, d = contingency(pairs, rule, out_key)
+                entry["windows"][window][outcome] = {
+                    "counts": {"a": a, "b": b, "c": c, "d": d},
+                    "relative_risk": relative_risk(a, b, c, d),
+                    "rr_ci95": rr_confidence_interval(a, b, c, d),
+                    "precision": precision(a, b),
+                    "miss_rate": miss_rate(a, c),
+                    "thin_cells": thin_cells(a, b, c, d),
+                }
+        out[rule] = entry
+    return {"n_pairs": n, "rules": out}
+
+
+def rule_agreement(pairs: list[dict]) -> dict:
+    """Discordant-pair analysis: where a product flag and a baseline DISAGREE,
+    which one is right?
+
+    Marginal RR and precision can be identical for two rules that fire on
+    completely different files, so matching a baseline on those numbers does
+    not establish that the weighted score is merely recomputing edit count.
+    This looks only at the pairs the two rules split on, and asks what share of
+    each disagreement bucket actually showed the outcome. If the
+    product-only bucket has a visibly higher rate than the baseline-only
+    bucket, the weighting is adding something; if the two rates are the same,
+    the disagreements are noise and the weighting is not.
+
+    Fixed to the primary (window, outcome) throughout, and reported with raw
+    counts because these buckets are the thinnest cells in the whole study.
+    """
+    key = outcome_key(PRIMARY_WINDOW, PRIMARY_OUTCOME)
+    out: dict[str, dict] = {}
+    for product in PRODUCT_RULES:
+        for baseline in BASELINE_RULES:
+            buckets = {}
+            for name, pred in (
+                ("both", lambda p: p[product] and p[baseline]),
+                ("product_only", lambda p: p[product] and not p[baseline]),
+                ("baseline_only", lambda p: not p[product] and p[baseline]),
+                ("neither", lambda p: not p[product] and not p[baseline]),
+            ):
+                sub = [p for p in pairs if pred(p)]
+                pos = sum(1 for p in sub if p[key])
+                buckets[name] = {
+                    "n": len(sub),
+                    "positive": pos,
+                    "rate": (pos / len(sub)) if sub else None,
+                }
+            out[f"{product}|{baseline}"] = buckets
+    return {"window": PRIMARY_WINDOW, "outcome": PRIMARY_OUTCOME, "buckets": out}
 
 
 def false_alarm_share(pairs: list[dict], flag_key: str) -> dict:
@@ -509,6 +760,19 @@ def hypothesis_table(tune: list[dict]) -> dict:
     }
 
 
+def render_comparison_stdout(cmp: dict) -> str:
+    """Plain-text rendering of the primary baseline comparison for stdout.
+    The full four-combination version lives in the draft report."""
+    lines = [
+        f"Baseline comparison (tune-split only, {PRIMARY_OUTCOME} outcome, "
+        f"{PRIMARY_WINDOW} window, {cmp['n_pairs']} pairs):",
+        "  " + COMPARISON_HEADER,
+        "  " + COMPARISON_DIVIDER,
+    ]
+    lines.extend("  " + r for r in comparison_rows(cmp, PRIMARY_WINDOW, PRIMARY_OUTCOME))
+    return "\n".join(lines)
+
+
 def render_hypothesis_table(h: dict) -> str:
     """Plain-text rendering for stdout / the autopsy draft (this table is
     NOT part of render_draft()/DRAFT_OUT -- it lives in the autopsy draft
@@ -547,8 +811,272 @@ def fmt(x: float | None, digits: int = 2) -> str:
     return "n/a" if x is None else f"{x:.{digits}f}"
 
 
+def fmt_ci(ci: tuple[float, float] | None) -> str:
+    return "n/a" if ci is None else f"{ci[0]:.2f}-{ci[1]:.2f}"
+
+
+def comparison_rows(cmp: dict, window: str, outcome: str) -> list[str]:
+    """One markdown table body: every rule, for one (window, outcome)."""
+    rows = []
+    for rule in RULES:
+        e = cmp["rules"][rule]
+        m = e["windows"][window][outcome]
+        c = m["counts"]
+        thin = ",".join(m["thin_cells"]) or "-"
+        rows.append(
+            f"| {e['label']} | {e['n_flagged']} | {fmt(e['flag_share'])} | "
+            f"{fmt(m['relative_risk'])} | {fmt_ci(m['rr_ci95'])} | "
+            f"{fmt(m['precision'])} | {fmt(m['miss_rate'])} | "
+            f"{c['a']} | {c['b']} | {c['c']} | {c['d']} | {thin} |"
+        )
+    return rows
+
+
+def verdict(cmp: dict) -> dict:
+    """The verdict, computed from the table rather than written by hand.
+
+    A verdict typed as prose goes stale the moment the corpus changes, and a
+    stale verdict in a validation report is worse than none. This derives it
+    mechanically at the primary (window, outcome), so the sentence in the
+    report and the numbers above it cannot disagree.
+
+    `base_all` is excluded from candidacy: it is a reference row, not a rule
+    anyone would ship, and it has no RR at all.
+
+    "Dominates" is deliberately strict: a baseline dominates a product flag
+    only if it is at least as good on ALL THREE of RR, precision, and miss
+    rate. That makes domination hard to achieve by accident, so a domination
+    result is the strong form of a negative finding, not a coin flip. Ties on
+    all three count as domination because the point of the comparison is
+    whether the extra machinery BUYS anything; matching a one-line rule buys
+    nothing.
+    """
+    w, o = PRIMARY_WINDOW, PRIMARY_OUTCOME
+
+    def cell(rule):
+        return cmp["rules"][rule]["windows"][w][o]
+
+    candidates = [r for r in BASELINE_RULES if r != "base_all"]
+    scored = [(cell(r)["relative_risk"] or 0.0, r) for r in candidates]
+    best_rr, best_rule = max(scored, key=lambda t: (t[0], t[1]))
+
+    out = {"window": w, "outcome": o, "best_baseline": best_rule, "best_baseline_rr": best_rr}
+    per_product = {}
+    for product in PRODUCT_RULES:
+        pm = cell(product)
+        dominators = []
+        for r in candidates:
+            bm = cell(r)
+            if (
+                (bm["relative_risk"] or 0.0) >= (pm["relative_risk"] or 0.0)
+                and (bm["precision"] or 0.0) >= (pm["precision"] or 0.0)
+                and (bm["miss_rate"] if bm["miss_rate"] is not None else 1.0)
+                <= (pm["miss_rate"] if pm["miss_rate"] is not None else 1.0)
+            ):
+                dominators.append(r)
+        # CI overlap against the strongest baseline: non-overlap is the only
+        # evidence here that would separate two rules rather than merely
+        # rank their point estimates.
+        p_ci, b_ci = pm["rr_ci95"], cell(best_rule)["rr_ci95"]
+        overlaps = None
+        if p_ci and b_ci:
+            overlaps = p_ci[0] <= b_ci[1] and b_ci[0] <= p_ci[1]
+        per_product[product] = {
+            "relative_risk": pm["relative_risk"],
+            "beats_best_baseline_on_rr": (pm["relative_risk"] or 0.0) > best_rr,
+            "ci_overlaps_best_baseline": overlaps,
+            "dominated_by": dominators,
+        }
+    out["per_product"] = per_product
+    out["any_product_beats_every_baseline"] = all(
+        v["beats_best_baseline_on_rr"] and not v["dominated_by"]
+        for v in per_product.values()
+    )
+    return out
+
+
+def render_verdict(v: dict, window_label: dict, outcome_label: dict) -> list[str]:
+    lines = []
+    lines.append("### Verdict")
+    lines.append("")
+    lines.append("Computed from the headline table, not written by hand, so it cannot")
+    lines.append("drift out of step with the numbers above it. Judged at")
+    lines.append(
+        f"{outcome_label[v['outcome']]}, {window_label[v['window']]}. A baseline"
+    )
+    lines.append("`dominates` a product flag when it is at least as good on ALL THREE of")
+    lines.append("RR, precision, and miss rate. Ties count as domination: the question is")
+    lines.append("whether the weighting BUYS anything over a one-line rule, and matching a")
+    lines.append("one-line rule buys nothing.")
+    lines.append("")
+    lines.append(
+        f"Strongest baseline by RR: {RULE_LABEL[v['best_baseline']]} "
+        f"(RR {fmt(v['best_baseline_rr'])})."
+    )
+    lines.append("")
+    for product in PRODUCT_RULES:
+        p = v["per_product"][product]
+        doms = ", ".join(RULE_LABEL[d] for d in p["dominated_by"]) or "none"
+        overlap = {True: "yes", False: "no", None: "not computable"}[
+            p["ci_overlaps_best_baseline"]
+        ]
+        lines.append(
+            f"- **{product}** (RR {fmt(p['relative_risk'])}): beats the strongest "
+            f"baseline on RR: {'yes' if p['beats_best_baseline_on_rr'] else 'NO'}. "
+            f"RR 95% CI overlaps that baseline: {overlap}. Dominated by: {doms}."
+        )
+    lines.append("")
+    if v["any_product_beats_every_baseline"]:
+        lines.append("**Verdict: the weighted ranking beats every trivial baseline tested.**")
+        lines.append("")
+        lines.append("What may be claimed: that the ranking outperforms raw edit count on")
+        lines.append("this corpus, with the corpus caveats below still attached.")
+    else:
+        lines.append(
+            "**Verdict: the weighted ranking does NOT beat the trivial baselines. At "
+            "least one one-line rule matches or dominates a product flag on RR, "
+            "precision and miss rate simultaneously, and the RR confidence intervals "
+            "overlap, so this corpus cannot distinguish the weighted score from "
+            "counting edits.**"
+        )
+        lines.append("")
+        lines.append("What this does and does not license as a claim:")
+        lines.append("")
+        lines.append("- STILL SUPPORTED: the flags are far better than chance. Every")
+        lines.append("  product row above has an RR well over 1 with a CI excluding 1.")
+        lines.append("  Flagged files really do recur more than unflagged ones.")
+        lines.append("- NOT SUPPORTED: any claim that the weighting, the score, or the")
+        lines.append("  multi-signal model is what produces that lift. A rule that sorts")
+        lines.append("  files by how many times they were edited and takes the top 3 does")
+        lines.append("  the same job, on this corpus, within noise.")
+        lines.append("- NOT SUPPORTED: any comparative or superiority claim over simpler")
+        lines.append("  tools, since the simplest possible tool was not beaten here.")
+        lines.append("- The honest framing is that the product currently packages a")
+        lines.append("  known-useful signal (repeated edits) with explanation and evidence")
+        lines.append("  attached. That is a real product, but it is a usability claim, not")
+        lines.append("  a predictive-accuracy claim, and the README must not imply the")
+        lines.append("  latter until a corpus large enough to separate the two exists.")
+    lines.append("")
+    return lines
+
+
+COMPARISON_HEADER = (
+    "| rule | flagged | flag share | RR | RR 95% CI | precision | miss rate | "
+    "a | b | c | d | thin cells |"
+)
+COMPARISON_DIVIDER = "|---|---|---|---|---|---|---|---|---|---|---|---|"
+
+
+def render_comparison(
+    cmp: dict, agreement: dict, window_label: dict, outcome_label: dict
+) -> list[str]:
+    """The baseline-comparison section of the draft report."""
+    lines = []
+    lines.append("## Baseline comparison: does the weighted ranking earn its complexity?")
+    lines.append("")
+    lines.append("The tables above establish that the product's flags beat *chance*. That")
+    lines.append("is a low bar. The question that decides whether the weighting is worth")
+    lines.append("anything is whether it beats a rule a reader could implement in one")
+    lines.append("line, so every trivial predictor below is pushed through the identical")
+    lines.append("contingency / RR / precision machinery, over the identical tune-split")
+    lines.append("pair population, as the two product flags.")
+    lines.append("")
+    lines.append("### Threshold provenance")
+    lines.append("")
+    lines.append("Every threshold is either zero-parameter or a constant that already")
+    lines.append("existed in this repo, for an unrelated reason, before this comparison")
+    lines.append("was written. Nothing here was swept, and where a quantity has two")
+    lines.append("pre-existing boundaries both are reported rather than the better-looking")
+    lines.append("one being selected after the fact.")
+    lines.append("")
+    lines.append("| rule | how the threshold was fixed |")
+    lines.append("|---|---|")
+    for rule in RULES:
+        lines.append(f"| {RULE_LABEL[rule]} | {RULE_BASIS[rule]} |")
+    lines.append("")
+    lines.append("Top-N baselines use N = 3, the same N as the product flag they are")
+    lines.append("compared against, so the comparison is like-for-like on flag count and")
+    lines.append("not just on definition. Ties are broken by file path: deterministic, and")
+    lines.append("independent of the outcome being predicted.")
+    lines.append("")
+    lines.append("`changed_lines` counts only Edit/Write actions whose tool result")
+    lines.append("confirmed success, matching `report.rs`'s `lines_written`. `edits`")
+    lines.append("counts every attempted Edit/Write, so a file can have edits > 0 and")
+    lines.append("changed_lines == 0.")
+    lines.append("")
+    lines.append("`flagged` is the count of tune-split pairs the rule fires on, out of")
+    lines.append(f"{cmp['n_pairs']}. It is reported first on purpose: a rule that flags")
+    lines.append("everything achieves perfect recall and zero miss rate for free, and must")
+    lines.append("be readable as doing so. The `flag every edited file` row is that")
+    lines.append("degenerate reference; its precision is the base rate every other rule has")
+    lines.append("to beat.")
+    lines.append("")
+    lines.append("`thin cells` lists the contingency cells with fewer than "
+                 f"{MIN_CELL} observations. Any")
+    lines.append("row with a thin cell has an RR that cannot support a conclusion, no")
+    lines.append("matter how large the point estimate looks.")
+    lines.append("")
+    lines.append(
+        f"### Headline: {outcome_label[PRIMARY_OUTCOME]}, {window_label[PRIMARY_WINDOW]}"
+    )
+    lines.append("")
+    lines.append("This (window, outcome) pair was declared the primary comparison in the")
+    lines.append("script before any result was computed. The other three combinations")
+    lines.append("follow, in full, regardless of how this one came out.")
+    lines.append("")
+    lines.append(COMPARISON_HEADER)
+    lines.append(COMPARISON_DIVIDER)
+    lines.extend(comparison_rows(cmp, PRIMARY_WINDOW, PRIMARY_OUTCOME))
+    lines.append("")
+    lines.extend(render_verdict(verdict(cmp), window_label, outcome_label))
+    for window in WINDOWS:
+        for outcome in OUTCOMES:
+            if window == PRIMARY_WINDOW and outcome == PRIMARY_OUTCOME:
+                continue
+            lines.append(f"### {outcome_label[outcome]}, {window_label[window]}")
+            lines.append("")
+            lines.append(COMPARISON_HEADER)
+            lines.append(COMPARISON_DIVIDER)
+            lines.extend(comparison_rows(cmp, window, outcome))
+            lines.append("")
+
+    lines.append("### Where they disagree, who is right?")
+    lines.append("")
+    lines.append("Two rules can post identical RR and precision while firing on completely")
+    lines.append("different files, so matching a baseline on the marginals does not by")
+    lines.append("itself show the weighted score is just recomputing edit count. This")
+    lines.append("restricts attention to the pairs where a product flag and a baseline")
+    lines.append("disagree, and reports the outcome rate inside each disagreement bucket")
+    lines.append(
+        f"({outcome_label[PRIMARY_OUTCOME]}, {window_label[PRIMARY_WINDOW]})."
+    )
+    lines.append("A product-only rate clearly above the baseline-only rate would mean the")
+    lines.append("weighting adds something the count does not see. Equal rates mean the")
+    lines.append("disagreements are noise.")
+    lines.append("")
+    lines.append("These are the thinnest cells in the study. Read the raw counts.")
+    lines.append("")
+    lines.append(
+        "| product rule | baseline | both n/pos/rate | product only n/pos/rate | "
+        "baseline only n/pos/rate | neither n/pos/rate |"
+    )
+    lines.append("|---|---|---|---|---|---|")
+    for product in PRODUCT_RULES:
+        for baseline in BASELINE_RULES:
+            b = agreement["buckets"][f"{product}|{baseline}"]
+            cells = " | ".join(
+                f"{b[k]['n']}/{b[k]['positive']}/{fmt(b[k]['rate'])}"
+                for k in ("both", "product_only", "baseline_only", "neither")
+            )
+            lines.append(f"| {product} | {RULE_LABEL[baseline]} | {cells} |")
+    lines.append("")
+    return lines
+
+
 def render_draft(
     metrics: dict,
+    cmp: dict,
+    agreement: dict,
     pairs: list[dict],
     excluded_pairs: int,
     n_projects: int,
@@ -662,6 +1190,8 @@ def render_draft(
                 )
         lines.append("")
 
+    lines.extend(render_comparison(cmp, agreement, window_label, outcome_label))
+
     lines.append("## Caveats")
     lines.append("")
     lines.append("- Single-machine, single-author corpus: not generalizable beyond this")
@@ -678,6 +1208,10 @@ def render_draft(
     lines.append("- This is a frozen-weights, no-tuning pass. It measures whether the")
     lines.append("  existing default weighting is doing anything predictive at all, not")
     lines.append("  whether it is the best possible weighting.")
+    lines.append("- The baseline comparison is descriptive. No rule is fitted, so nothing")
+    lines.append("  here is corrected for multiple comparisons; the RR intervals are")
+    lines.append("  marginal 95% intervals for each row read on its own, and the rows are")
+    lines.append("  not independent of each other (they score the same pairs).")
     lines.append("")
     return "\n".join(lines)
 
@@ -730,6 +1264,8 @@ def main() -> int:
                     "held_out_project_ids": sorted(held_out),
                     "n_held_out_pairs": len(held_out_pairs),
                     "metrics": compute_metrics(held_out_pairs),
+                    "baseline_comparison": rule_comparison(held_out_pairs),
+                    "baseline_agreement": rule_agreement(held_out_pairs),
                     "hypothesis_unverified_ending": hypothesis_table(held_out_pairs),
                 },
                 indent=2,
@@ -742,6 +1278,8 @@ def main() -> int:
 
     # ---- development run: tune split only, from here down --------------
     metrics = compute_metrics(tune_pairs)
+    comparison = rule_comparison(tune_pairs)
+    agreement = rule_agreement(tune_pairs)
     hypothesis = hypothesis_table(tune_pairs)
 
     raw = {
@@ -756,6 +1294,9 @@ def main() -> int:
         "n_pairs": len(tune_pairs),
         "pairs": tune_pairs,
         "metrics": metrics,
+        "baseline_comparison": comparison,
+        "baseline_agreement": agreement,
+        "baseline_verdict": verdict(comparison),
         "held_out_project_ids": sorted(held_out),
         # Frozen roster entries with no project in this corpus. Recorded so a
         # partially-satisfiable freeze is visible, never inferred.
@@ -771,6 +1312,8 @@ def main() -> int:
     DRAFT_OUT.parent.mkdir(parents=True, exist_ok=True)
     draft = render_draft(
         metrics,
+        comparison,
+        agreement,
         tune_pairs,
         excluded_pairs,
         len(groups),
@@ -796,6 +1339,8 @@ def main() -> int:
             f"  NOTE: {len(held_out_absent)} frozen held-out project(s) are not in "
             f"this corpus and contribute nothing: {held_out_absent}"
         )
+    print()
+    print(render_comparison_stdout(comparison))
     print()
     print(render_hypothesis_table(hypothesis))
     print()

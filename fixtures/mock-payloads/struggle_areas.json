@@ -18,5 +18,7 @@
   "breakdown":{"churn":10,"rework":4,"failure_loops":1,"re_read":0,"fumbles":1},
   "findings":[
    {"kind":"fumble","tier":"T1","exact":true,"confidence":"high","idxs":[301],"note":"Edit rejected: File has not been read yet"}]}],
+"files_total":3,
+"n_max":20,
 "findings_per_file_cap":4,
 "truncated":true}

@@ -1,0 +1,228 @@
+# Release: build prebuilt archives for a pushed `v*` tag and attach them to a
+# GitHub Release.
+#
+# Why archives and not crates.io: `sumcp install` copies a SIBLING `sumcp-mcp`
+# binary from the directory of the running `sumcp` executable. A crates.io
+# install of `sumcp-cli` alone would leave that sibling missing and the install
+# broken, so the unit of distribution is an archive that carries BOTH binaries
+# next to each other.
+#
+# This workflow only ever reacts to a tag that a human already pushed. It never
+# creates or pushes a tag itself.
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+# Read-only by default. Only the publish job is granted `contents: write`, and
+# only so it can create the Release and upload assets.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+# One release run per tag. A re-pushed tag cancels nothing already published,
+# it just avoids two runs racing to create the same Release.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # Cheap gate: a tag that disagrees with the workspace version would ship
+  # binaries whose `sumcp --version` contradicts the release name. Fail before
+  # spending three build jobs on it.
+  verify-version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tag must match the workspace version
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          manifest="$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"
+          echo "tag=${tag} workspace version=${manifest}"
+          if [ "${tag}" != "v${manifest}" ]; then
+            echo "::error::tag ${tag} does not match workspace version ${manifest} in Cargo.toml"
+            exit 1
+          fi
+
+  build:
+    needs: verify-version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Apple Silicon, built natively on the arm64 macOS runner.
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            native: true
+          # Intel macOS. GitHub's Intel macOS runners are gone, so this is
+          # cross-compiled from the same arm64 runner. Apple's clang and the
+          # macOS SDK are multi-arch, so `rustup target add` plus `--target` is
+          # all that is needed. It cannot be smoke tested there, hence
+          # `native: false`.
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            native: false
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            native: true
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # CI uses dtolnay/rust-toolchain@stable, but `stable` there is a moving
+      # branch ref, and release builds should not depend on a floating
+      # third-party ref. rustup ships preinstalled on every GitHub-hosted
+      # runner, so drive it directly. Same toolchain channel as CI, no extra
+      # third-party action. No build cache either: a release artifact should
+      # come from a clean build tree.
+      - name: Install the stable toolchain and the target
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustup target add "${{ matrix.target }}"
+          rustc -vV
+          cargo -vV
+
+      # --locked honours the committed Cargo.lock, so the published binaries
+      # are built from exactly the dependency versions CI tested.
+      - name: Build both binaries
+        run: cargo build --locked --release --target "${{ matrix.target }}" -p sumcp-cli -p sumcp-mcp
+
+      - name: Smoke test the CLI (native targets only)
+        if: matrix.native
+        run: |
+          set -euo pipefail
+          "./target/${{ matrix.target }}/release/sumcp" --version
+          # sumcp-mcp is a stdio server with no --version flag, so running it
+          # would block on stdin. Prove it exists and is a real executable.
+          test -x "./target/${{ matrix.target }}/release/sumcp-mcp"
+          file "./target/${{ matrix.target }}/release/sumcp-mcp"
+
+      # Layout inside the tarball:
+      #   sumcp-<tag>-<target>/{sumcp,sumcp-mcp,README.md,LICENSE-MIT,LICENSE-APACHE}
+      # The single top-level directory keeps the extract from spraying files
+      # into the user's cwd, and keeps the two binaries siblings, which is the
+      # exact shape `sumcp install` requires.
+      - name: Stage the archive
+        run: |
+          set -euo pipefail
+          stage="sumcp-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir -p "dist/${stage}"
+          cp "target/${{ matrix.target }}/release/sumcp" "dist/${stage}/sumcp"
+          cp "target/${{ matrix.target }}/release/sumcp-mcp" "dist/${stage}/sumcp-mcp"
+          cp README.md LICENSE-MIT LICENSE-APACHE "dist/${stage}/"
+          chmod +x "dist/${stage}/sumcp" "dist/${stage}/sumcp-mcp"
+          tar -czf "dist/${stage}.tar.gz" -C dist "${stage}"
+          rm -rf "dist/${stage}"
+          ls -l dist
+
+      # Checksums are computed next to the archive with a bare filename, so
+      # `shasum -a 256 -c <file>.sha256` works verbatim after download.
+      # sha256sum exists on Linux, shasum on macOS; the output format is the
+      # same for both.
+      - name: Checksum
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          archive="sumcp-${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${archive}" > "${archive}.sha256"
+          else
+            shasum -a 256 "${archive}" > "${archive}.sha256"
+          fi
+          cat "${archive}.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      # Only the built archives are needed here, not the source tree.
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
+
+      # One combined manifest alongside the per-archive files, then verify it
+      # end to end so a corrupted upload fails here and not on a user's machine.
+      - name: Combine and verify checksums
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          cat ./*.tar.gz.sha256 | sort -k 2 > SHA256SUMS
+          sha256sum -c SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Write the release notes
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          cat > notes.md <<EOF
+          Prebuilt archives for macOS (Apple Silicon and Intel) and x86_64 Linux.
+          Every archive contains both binaries, \`sumcp\` and \`sumcp-mcp\`.
+          \`sumcp install\` needs them side by side, so keep them in the same
+          directory.
+
+          ### Install (macOS, Apple Silicon)
+
+          \`\`\`bash
+          curl -LO https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}/sumcp-${tag}-aarch64-apple-darwin.tar.gz
+          curl -LO https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}/sumcp-${tag}-aarch64-apple-darwin.tar.gz.sha256
+          shasum -a 256 -c sumcp-${tag}-aarch64-apple-darwin.tar.gz.sha256
+          tar -xzf sumcp-${tag}-aarch64-apple-darwin.tar.gz
+          cd sumcp-${tag}-aarch64-apple-darwin
+          ./sumcp install          # dry-run: prints exactly what it will write
+          ./sumcp install --apply  # register the MCP server, debrief skill, and Stop hook
+          \`\`\`
+
+          Swap \`aarch64-apple-darwin\` for \`x86_64-apple-darwin\` (Intel Mac) or
+          \`x86_64-unknown-linux-gnu\` (Linux). Then restart Claude Code so it
+          picks up the new user-scope server.
+
+          The binaries are not notarized. If macOS Gatekeeper blocks them after a
+          browser download, clear the quarantine flag:
+          \`xattr -dr com.apple.quarantine sumcp sumcp-mcp\`.
+          EOF
+          cat notes.md
+
+      # gh is preinstalled on GitHub-hosted runners, so publishing needs no
+      # third-party action at all. --verify-tag refuses to invent a tag: the
+      # release can only attach to the tag a human already pushed.
+      - name: Create the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          # A tag like v0.1.0-rc.1 is a prerelease; v0.1.0 is not.
+          prerelease=""
+          case "${tag}" in
+            *-*) prerelease="--prerelease" ;;
+            *)   prerelease="--latest" ;;
+          esac
+          gh release create "${tag}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "suMCP ${tag}" \
+            --notes-file notes.md \
+            --generate-notes \
+            --verify-tag \
+            ${prerelease} \
+            dist/*.tar.gz dist/*.sha256 dist/SHA256SUMS

@@ -41,7 +41,47 @@ risk is.
 
 ## Install
 
-Requires a stable Rust toolchain (`rustup`).
+**Supported platforms:** macOS (Apple Silicon and Intel) and Linux (x86-64),
+both tested on every push. Windows is not supported and not tested.
+
+Every archive contains **both** binaries, `sumcp` and `sumcp-mcp`. `install`
+registers the MCP server by looking for `sumcp-mcp` as a sibling of `sumcp`, so
+keep the two together. Installing one without the other leaves a broken
+registration.
+
+### From a release archive
+
+Download for your platform from the
+[latest release](https://github.com/rbh227/suMCP/releases/latest):
+
+```bash
+# macOS, Apple Silicon. Swap the target for x86_64-apple-darwin (Intel Mac)
+# or x86_64-unknown-linux-gnu (Linux).
+V=v0.1.0; T=aarch64-apple-darwin
+curl -LO https://github.com/rbh227/suMCP/releases/download/$V/sumcp-$V-$T.tar.gz
+curl -LO https://github.com/rbh227/suMCP/releases/download/$V/sumcp-$V-$T.tar.gz.sha256
+
+# Verify before running it. Expect "sumcp-...tar.gz: OK".
+shasum -a 256 -c sumcp-$V-$T.tar.gz.sha256   # Linux: sha256sum -c
+
+tar -xzf sumcp-$V-$T.tar.gz && cd sumcp-$V-$T
+./sumcp install          # dry-run: prints exactly what it will write
+./sumcp install --apply  # register the MCP server, debrief skill, and Stop hook
+```
+
+The macOS binaries are not signed or notarized. `curl` downloads are not
+quarantined, but if you download through a browser and Gatekeeper blocks them,
+run `xattr -dr com.apple.quarantine sumcp sumcp-mcp`.
+
+The Linux archive is built on the current Ubuntu runner, so it needs a
+reasonably recent glibc. On older distributions, build from source.
+
+### From source
+
+**Minimum Rust version:** 1.88. This is enforced by a CI job, not just
+declared: the code uses let-chains, which stabilized in 1.88, so 1.87 fails to
+compile. Building from source is also the path for `aarch64` Linux, which has
+no published archive.
 
 ```bash
 git clone https://github.com/rbh227/suMCP && cd suMCP
@@ -64,9 +104,22 @@ Restart Claude Code so it picks up the new user-scope server. See
 
 ## Quickstart
 
-Instant debrief on any transcript, no server needed:
+Run it with no arguments in a project you have worked in. It finds that
+project's most recent session and debriefs it:
 
 ```bash
+cd ~/code/your-project
+sumcp
+```
+
+It prints which session it picked to stderr, so `--json` and `--html` stay
+pipeable. Add a flag to change the format, or `--file` to pick a session
+yourself:
+
+```bash
+sumcp --json                                  # the session_overview payload
+sumcp --html > report.html                    # a self-contained HTML report
+
 sumcp --file <path/to/session.jsonl>          # ranked struggle areas, human-readable
 sumcp --file <path/to/session.jsonl> --json   # the session_overview payload
 sumcp --file <path/to/session.jsonl> --html   # a self-contained HTML report
@@ -111,14 +164,27 @@ signals. Every finding carries a **tier**, an **exact-vs-heuristic** flag, a
 
 ## The numbers
 
-**Do the flags mean anything?** In a frozen-weights retrospective study on the
-author's own corpus (42 substantial sessions across 6 projects), files suMCP
-flagged for review were **6.2x more likely** to show renewed struggle signals
+**Do the flags mean anything?** Yes, but not because of the weighting.
+
+In a frozen-weights retrospective study on the author's own corpus (43
+sessions, 552 file-session pairs, held-out project excluded), files suMCP
+flagged for review were **8.9x more likely** to show renewed struggle signals
 (failure loops, user corrections, reverts, or re-qualifying for review) in the
-next 3 sessions than unflagged edited files, and the effect survives
-stratifying by how heavily the file was edited. Precision is honest, not
-magic: about half of flagged files get re-edited soon, about a quarter
-struggle again. Single-author corpus; method, full tables, and caveats in
+next 3 sessions than unflagged edited files.
+
+**But the same study tested the weighted ranking against trivial baselines,
+and it did not beat them.** Simply sorting files by edit count and taking the
+top 3 scores at least as well on relative risk, precision, and miss rate
+simultaneously. The product's flags turn out to be a strict subset of "edited
+at least twice": `flagged_nr` fires on zero files below that threshold, so the
+weighted score is a refinement of edit count, not an independent signal.
+
+So the honest claim is narrow: **suMCP surfaces a genuinely predictive signal
+and attaches evidence, an explanation, and a token-cheap payload to it.** That
+is a usability claim, not an accuracy claim, and there is no evidence the
+multi-signal weighting beats counting edits. Single-author corpus, 39 positive
+outcomes total, so it is also underpowered to claim the baseline is better.
+Method, full comparison tables, confidence intervals, and caveats in
 [docs/validation/2026-07-22-predictive-validity.md](docs/validation/2026-07-22-predictive-validity.md).
 
 <p align="center">

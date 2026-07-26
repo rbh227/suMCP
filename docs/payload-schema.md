@@ -54,6 +54,9 @@ Every finding-like object (anything with a `kind`) carries:
 All ranking output shows the per-category `breakdown` and the `weights` used
 (`source: defaults` or the config path) — never an opaque score.
 
+These caps are enforced by construction as of 2026-07-25; see the dated
+section at the bottom for the exact shrink order and disclosure fields.
+
 ## Error payload (fail-closed, ADR A4)
 
 ```json
@@ -114,6 +117,72 @@ development corpus, 57 of 2,237 Edit/Write actions (2.5%) failed, carrying
 "lines written" would overstate real work, so `file_ops`/`lines_written`
 require a confirmed-successful result and the remainder is disclosed in
 `file_ops_unconfirmed`.
+
+## 2026-07-25 cap enforcement (by construction, non-breaking, `v` stays 0)
+
+Until now only `evidence()` actually measured its own output. The other five
+built a payload and hoped it fit, so an adversarial or merely large session
+blew the advertised budget. Measured before the fix on a **plain, non-hostile**
+300-edit / 12-file synthetic session (ordinary paths, real detector output):
+`blind_spots` came out at ~3166 tokens against its 1000 budget, and
+`struggle_areas` at ~2827 against 1500 merely because the caller asked for
+`n=99`. Under adversarial input it was far worse: a single 4 KB path (legal
+under POSIX) put `file_story` over 1500 on its own, 500 distinct event types
+put `session_overview` at ~6450 against 1000, and 200 ranked files put
+`struggle_areas` at ~1.6M tokens against 1500.
+
+Every builder now **shrinks its own output until it fits**, using the same
+loop `evidence()` always used. Two invariants make the guarantee total rather
+than probable:
+
+1. Every caller-controlled string is capped before the loop runs: file paths
+   (`160` chars), the session id (`120`), timestamps (`40`). Over-long strings
+   are elided **middle-out with an inline marker** stating the loss, e.g.
+   `/work/pro…[3901 chars elided]…/deep/file.rs`. The marker makes the value
+   unmistakably not a real path, so it is never silently mistaken for one.
+   An elided path cannot be passed back to `file_story`.
+2. Every list has a `k = 0` floor, so shrinking always terminates with a
+   payload made only of scalars and capped strings.
+
+Whenever anything is dropped, `truncated` is `true` **and** the payload still
+carries the full count, following the `subagent_files_missing` /
+`elided:{count}` precedent.
+
+| payload | knob shrunk, in the documented order | disclosure added |
+|---|---|---|
+| `session_overview` | `flags.unknown_event_types` **sampled**: the `k` most frequent unmodeled types, ties by name (deterministic), `k` walking 8 → 0 | `flags.unknown_event_types_total` (distinct types seen), `top_struggles_total` (files that ranked). `truncated` is now `true` when more than 3 files ranked, when the type map was sampled, or when a string was elided |
+| `struggle_areas(n)` | `n` **clamped to 20** (`n_max`); then **tail-first**: lowest-ranked files dropped one at a time, and only once a single file remains do its findings start going | `files_total`, `n_max`, per-file `findings_omitted`, and `findings_per_file_cap` now reports the cap ACTUALLY applied (may be below 4) |
+| `file_story(path)` | unchanged **middle-out**; the head/tail edge shrinks 8 → 0 if the capped path still leaves no room | `elided.count` as before |
+| `blind_spots` | all three lists **tail-truncated to the same `k`**, walking 8 → 0 | `totals` (full count of each list, always present) and `list_cap` (the `k` in force) |
+| `context_health` | fixed shape; the only droppable item is the prose `note` | `truncated` is now computed, not hard-coded `false` |
+| `evidence(idxs)` | unchanged: ≤10 actions, excerpts ≤600 chars, tail-first drop | as before |
+
+Findings echoed in any payload also cap their proving `idxs` at **10** (all
+`evidence()` will dereference anyway) and add `idxs_total` when they do. This
+is the single biggest real-world overrun: one churn finding on a file edited
+800 times carries 800 indices, and a `review_burden` finding's `idxs` span
+every edit in its segment.
+
+### Which findings survive the per-file cap
+
+`struggle_areas` used to keep the first 4 findings a file had, which was
+**detector order**: `edit_shape` → `failures` → `dynamics` → `comprehension`.
+A file scored on rework *and* failure loops *and* blind writes showed four
+rework findings and no failure evidence, contradicting its own `breakdown`.
+
+The rule is now **round-robin over the scoring categories, most alarming
+first** (the fixed `SEVERITY_ORDER`: failure_loops, fumbles, rework, churn,
+re_read, action_loops). Every category that contributed to the score gets one
+finding before any category gets a second. Within a category the detectors'
+own (chronological) order is preserved and the tail is what drops. So the
+retained set is representative of the `breakdown` the same payload prints.
+
+### Not addressed here
+
+`context_health`'s advertised `read_never_referenced` sampling describes a
+list the shipped builder does not emit: `read_unreferenced` and
+`write_no_reread` are mock-only finding kinds with no detector behind them
+yet. When they land they must arrive with their own cap and total.
 
 ## Versioning
 

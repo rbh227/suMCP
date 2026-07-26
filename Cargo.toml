@@ -5,6 +5,12 @@ members = ["crates/sumcp-core", "crates/sumcp-cli", "crates/sumcp-mcp"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+# Minimum supported Rust version, verified in both directions rather than
+# guessed: 1.88.0 checks the whole workspace clean, and 1.87.0 fails in
+# sumcp-core with E0658 because let-chains (`if let ... && let ...`, used
+# throughout ingest/signals) only stabilized in 1.88. CI enforces this so the
+# declaration cannot quietly drift.
+rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/rbh227/suMCP"
 

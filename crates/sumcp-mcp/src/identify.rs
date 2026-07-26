@@ -19,7 +19,11 @@ use serde::Serialize;
 use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
-use sumcp_core::locate::{SessionId, is_within};
+// The newest-first listing lives in core so the CLI's recency mode and this
+// module share one implementation. We use it here only to *enumerate* files;
+// picking the newest one as "the caller" would be exactly the guess ADR A4
+// forbids.
+use sumcp_core::locate::{SessionId, is_within, transcripts_newest_first};
 
 /// Only this much of each file's end is searched for the marker. The caller's
 /// `tool_use` was appended moments ago, so it lives in the tail; bounding the
@@ -90,30 +94,6 @@ pub fn stem_id(path: &Path) -> String {
     path.file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default()
-}
-
-/// All `<uuid>.jsonl` transcripts in the project dir, newest mtime first.
-fn transcripts_newest_first(project_dir: &Path) -> Vec<(PathBuf, SystemTime)> {
-    let Ok(entries) = std::fs::read_dir(project_dir) else {
-        return Vec::new();
-    };
-    let mut files: Vec<(PathBuf, SystemTime)> = entries
-        .flatten()
-        .filter_map(|e| {
-            let path = e.path();
-            // Stem must be a valid session id — anything else in the dir
-            // (agent sidechains, stray files) is not a session we can name.
-            let stem = path.file_stem()?.to_str()?;
-            if path.extension()?.to_str()? != "jsonl" || SessionId::parse(stem).is_none() {
-                return None;
-            }
-            let mtime = e.metadata().ok()?.modified().ok()?;
-            Some((path, mtime))
-        })
-        .collect();
-    // Newest first; `sort_by_key` + `Reverse` is the idiom for descending.
-    files.sort_by_key(|(_, m)| std::cmp::Reverse(*m));
-    files
 }
 
 /// Scan transcript tails for `marker` (the forwarded tool_use id). Returns

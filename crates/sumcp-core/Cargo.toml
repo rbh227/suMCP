@@ -3,6 +3,7 @@ name = "sumcp-core"
 description = "Deterministic session-forensics core: parse Claude Code transcripts into evidence-backed findings"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 

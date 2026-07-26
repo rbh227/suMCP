@@ -6,6 +6,7 @@
 //! the filesystem, so `../../etc/passwd` can never become a path.
 
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use crate::model::Spawn;
 
@@ -49,6 +50,55 @@ pub fn project_dir_name(cwd: &Path) -> String {
 /// Resolve the projects directory for a cwd under a given `~/.claude` root.
 pub fn project_dir(claude_home: &Path, cwd: &Path) -> PathBuf {
     claude_home.join("projects").join(project_dir_name(cwd))
+}
+
+/// Every `<uuid>.jsonl` transcript in a project dir, newest mtime first.
+///
+/// Returns the mtime alongside each path because callers that report
+/// candidates need to show it, and re-`stat`ing the file later could observe a
+/// different value than the one we sorted on. An unreadable directory (never
+/// opened in Claude Code, no permission) is an empty list, not an error: "no
+/// sessions here" is a normal answer, and the mtime of a file we cannot stat
+/// is unknowable, so those entries drop out too.
+pub fn transcripts_newest_first(project_dir: &Path) -> Vec<(PathBuf, SystemTime)> {
+    let Ok(entries) = std::fs::read_dir(project_dir) else {
+        return Vec::new();
+    };
+    let mut files: Vec<(PathBuf, SystemTime)> = entries
+        .flatten()
+        .filter_map(|e| {
+            let path = e.path();
+            // Stem must be a valid session id — anything else in the dir
+            // (agent sidechains, stray files) is not a session we can name.
+            let stem = path.file_stem()?.to_str()?;
+            if path.extension()?.to_str()? != "jsonl" || SessionId::parse(stem).is_none() {
+                return None;
+            }
+            let mtime = e.metadata().ok()?.modified().ok()?;
+            Some((path, mtime))
+        })
+        .collect();
+    // Newest first; `sort_by_key` + `Reverse` is the idiom for descending.
+    files.sort_by_key(|(_, m)| std::cmp::Reverse(*m));
+    files
+}
+
+/// The most recently modified transcript in a project dir, if any.
+///
+/// This is recency *inference*: it answers "the session I was last working in
+/// here", which is exactly what a human at a terminal means by a bare `sumcp`.
+/// The MCP server must never use it (ADR A4: a plausible-but-wrong debrief is
+/// fatal), which is why nothing here claims verification — the caller is
+/// expected to label the result as recency-derived provenance.
+pub fn newest_transcript(project_dir: &Path) -> Option<PathBuf> {
+    transcripts_newest_first(project_dir)
+        .into_iter()
+        // ADR A9(1): the uuid-shaped name blocks traversal, but reading still
+        // follows symlinks — a planted `<uuid>.jsonl → ~/.ssh/id_rsa` with a
+        // fresh mtime would otherwise be "the newest session". Resolve, then
+        // prefix-check, and fall through to the next-newest real transcript.
+        .find(|(path, _)| is_within(project_dir, path))
+        .map(|(path, _)| path)
 }
 
 /// Assert `candidate` resolves inside `root` after canonicalization (ADR A9:
@@ -140,6 +190,78 @@ fn is_agent_jsonl(p: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Write a `<id>.jsonl` with an EXPLICIT mtime. Recency tests must not
+    /// depend on how fast the test ran: two files written back-to-back can
+    /// share an mtime on a coarse-grained filesystem, which would make the
+    /// ordering assertion flaky. Stamping the time makes it deterministic.
+    fn write_session(dir: &Path, id: &str, mtime_secs: u64) -> PathBuf {
+        let path = dir.join(format!("{id}.jsonl"));
+        std::fs::write(&path, "{}").unwrap();
+        let f = std::fs::File::options().write(true).open(&path).unwrap();
+        f.set_modified(
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(mtime_secs),
+        )
+        .unwrap();
+        path
+    }
+
+    #[test]
+    fn newest_transcript_picks_the_latest_mtime() {
+        let td = tempfile::tempdir().unwrap();
+        write_session(td.path(), "5717aaaa-1111-2222-3333-444455556666", 1_000_000);
+        let newest = write_session(td.path(), "80b9a169-624f-4880-a2c3-24b96e2b4ea2", 3_000_000);
+        write_session(td.path(), "aaaabbbb-cccc-dddd-eeee-ffff00001111", 2_000_000);
+
+        assert_eq!(newest_transcript(td.path()), Some(newest));
+    }
+
+    #[test]
+    fn newest_transcript_ignores_non_session_files() {
+        let td = tempfile::tempdir().unwrap();
+        // Neither of these names a session: the first has no uuid stem, the
+        // second is not a transcript. A wrong pick here would analyze garbage.
+        std::fs::write(td.path().join("notes.jsonl"), "{}").unwrap();
+        std::fs::write(
+            td.path().join("5717aaaa-1111-2222-3333-444455556666.txt"),
+            "{}",
+        )
+        .unwrap();
+
+        assert_eq!(newest_transcript(td.path()), None);
+    }
+
+    #[test]
+    fn newest_transcript_of_a_missing_dir_is_none() {
+        let td = tempfile::tempdir().unwrap();
+        // A project that has never been opened in Claude Code has no dir at
+        // all; that must be an ordinary "nothing found", not a panic.
+        assert_eq!(newest_transcript(&td.path().join("never-used")), None);
+    }
+
+    #[test]
+    fn newest_transcript_skips_a_symlink_escaping_the_project_dir() {
+        // ADR A9(1): a planted `<uuid>.jsonl → ~/.ssh/id_rsa` symlink must not
+        // become "the newest session", even though its mtime wins.
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let real = write_session(&project, "5717aaaa-1111-2222-3333-444455556666", 1_000_000);
+        let secret = root.path().join("id_rsa");
+        std::fs::write(&secret, "private bits").unwrap();
+        let planted = project.join("80b9a169-624f-4880-a2c3-24b96e2b4ea2.jsonl");
+        std::os::unix::fs::symlink(&secret, &planted).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&planted)
+            .unwrap()
+            .set_modified(
+                std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(9_000_000),
+            )
+            .unwrap();
+
+        assert_eq!(newest_transcript(&project), Some(real));
+    }
 
     #[test]
     fn valid_uuid_parses_traversal_rejected() {

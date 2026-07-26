@@ -57,6 +57,12 @@ fn main() -> std::process::ExitCode {
         }
     }
 
+    // Baseline inputs for the trivial-predictor comparison (study-only, not a
+    // product signal): per-file confirmed changed lines, and the session's
+    // failed-command count.
+    let changed_lines = changed_lines_by_file(&session.actions);
+    let failed_commands = failed_command_count(&session.actions);
+
     // File-scoped finding kinds, deduped, per file: serialized to the same
     // snake_case strings the payload contract uses (e.g. "churn",
     // "user_corrected"). Sorted for determinism.
@@ -100,6 +106,7 @@ fn main() -> std::process::ExitCode {
             json!({
                 "file": file,
                 "edits": edits,
+                "changed_lines": changed_lines.get(file).copied().unwrap_or(0),
                 "kinds": kinds,
                 "flagged_nr": nr_files.contains(file),
                 "flagged_top3": top3_files.contains(file),
@@ -120,6 +127,7 @@ fn main() -> std::process::ExitCode {
         "project": project,
         "start_ts": start_ts,
         "actions": session.actions.len(),
+        "failed_commands": failed_commands,
         "files": files,
     });
 
@@ -143,6 +151,52 @@ fn first_effective_ts(actions: &[Action]) -> String {
         .first()
         .map(|a| a.effective_ts.clone())
         .unwrap_or_default()
+}
+
+/// Confirmed changed lines per file: the sum of `Action::write_lines` over
+/// every Edit/Write on that file whose result CONFIRMED success
+/// (`is_error == Some(false)`).
+///
+/// This is the same accounting `report.rs` uses for its `lines_written`
+/// headline, deliberately: `write_lines` is captured from the PROPOSED input
+/// before the tool result is known, so an errored action (`Some(true)`) or a
+/// result-less one (`None`, a truncated or mid-flight session) would otherwise
+/// contribute lines that never reached the file. `unwrap_or(0)` because an
+/// Edit whose input carried no `new_string` contributes no known volume rather
+/// than breaking the total.
+///
+/// Study input only (the trivial-baseline comparison in
+/// `scripts/validity_sweep.py`), not a product signal. Note that it can be 0
+/// for a file with a nonzero `edits` count: `edits` counts every attempted
+/// Edit/Write regardless of outcome, this counts only confirmed ones.
+fn changed_lines_by_file(actions: &[Action]) -> BTreeMap<&str, usize> {
+    let mut out: BTreeMap<&str, usize> = BTreeMap::new();
+    for a in actions {
+        if matches!(a.kind, ActionKind::Edit | ActionKind::Write)
+            && a.is_error == Some(false)
+            && let Some(f) = a.file_path.as_deref()
+        {
+            *out.entry(f).or_insert(0) += a.write_lines.unwrap_or(0);
+        }
+    }
+    out
+}
+
+/// Session-level count of failed shell commands: Bash actions whose result
+/// CONFIRMED failure (`is_error == Some(true)`). Mirrors the product's own
+/// `is_failed_bash` predicate in `signals/failures.rs`.
+///
+/// `None` (no tool result) is NOT counted: an unknown outcome is not a
+/// failure, the same way it is not a success elsewhere in this file.
+///
+/// Study input only. It is a SESSION-level quantity, so as a per-file
+/// predictor it takes the same value for every file in a session and has, by
+/// construction, no within-session discriminative power at all.
+fn failed_command_count(actions: &[Action]) -> usize {
+    actions
+        .iter()
+        .filter(|a| matches!(a.kind, ActionKind::Bash) && a.is_error == Some(true))
+        .count()
 }
 
 /// Study heuristic, NOT a product signal: `scripts/validity_sweep.py`'s
@@ -306,6 +360,101 @@ mod tests {
             r#"{"type":"user","timestamp":"2026-01-01T00:00:03Z","message":{"content":[{"type":"tool_result","tool_use_id":"b1","is_error":false}]}}"#,
         );
         assert!(verified(&raw, "/a.rs"));
+    }
+
+    /// A Write of `lines` lines to `file`, with an explicit result outcome.
+    /// `is_error` of `None` emits no tool_result line at all.
+    fn write_of(id: &str, file: &str, lines: usize, is_error: Option<bool>) -> String {
+        let body = "x\n".repeat(lines);
+        let mut s = format!(
+            r#"{{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{{"content":[{{"type":"tool_use","id":"{id}","name":"Write","input":{{"file_path":"{file}","content":{}}}}}]}}}}"#,
+            serde_json::to_string(&body).unwrap()
+        );
+        if let Some(e) = is_error {
+            s.push('\n');
+            s.push_str(&format!(
+                r#"{{"type":"user","timestamp":"2026-01-01T00:00:01Z","message":{{"content":[{{"type":"tool_result","tool_use_id":"{id}","is_error":{e}}}]}}}}"#
+            ));
+        }
+        s
+    }
+
+    /// A Bash call with an explicit result outcome (`None` = no result line).
+    fn bash_of(id: &str, cmd: &str, is_error: Option<bool>) -> String {
+        let mut s = format!(
+            r#"{{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{{"content":[{{"type":"tool_use","id":"{id}","name":"Bash","input":{{"command":"{cmd}"}}}}]}}}}"#
+        );
+        if let Some(e) = is_error {
+            s.push('\n');
+            s.push_str(&format!(
+                r#"{{"type":"user","timestamp":"2026-01-01T00:00:01Z","message":{{"content":[{{"type":"tool_result","tool_use_id":"{id}","is_error":{e}}}]}}}}"#
+            ));
+        }
+        s
+    }
+
+    #[test]
+    fn changed_lines_sums_only_confirmed_writes() {
+        // WHY: `write_lines` is captured from the proposed input, before the
+        // result is known. A failed or result-less write proposed lines that
+        // never reached the file, so counting them would inflate the baseline
+        // for exactly the files the agent struggled hardest with.
+        let raw = [
+            write_of("w1", "/a.rs", 10, Some(false)),
+            write_of("w2", "/a.rs", 5, Some(false)),
+            write_of("w3", "/a.rs", 100, Some(true)),
+            write_of("w4", "/a.rs", 200, None),
+        ]
+        .join("\n");
+        let s = ingest_str(&raw, Lane::Main);
+        let by_file = changed_lines_by_file(&s.actions);
+        assert_eq!(by_file.get("/a.rs").copied(), Some(15));
+    }
+
+    #[test]
+    fn changed_lines_is_absent_for_a_file_with_no_confirmed_write() {
+        // The file still has a nonzero `edits` count in the dump; the caller
+        // turns this absence into 0, which is the intended asymmetry.
+        let raw = write_of("w1", "/b.rs", 40, Some(true));
+        let s = ingest_str(&raw, Lane::Main);
+        assert_eq!(changed_lines_by_file(&s.actions).get("/b.rs"), None);
+    }
+
+    #[test]
+    fn changed_lines_are_kept_per_file() {
+        let raw = [
+            write_of("w1", "/a.rs", 3, Some(false)),
+            write_of("w2", "/b.rs", 7, Some(false)),
+        ]
+        .join("\n");
+        let s = ingest_str(&raw, Lane::Main);
+        let by_file = changed_lines_by_file(&s.actions);
+        assert_eq!(by_file.get("/a.rs").copied(), Some(3));
+        assert_eq!(by_file.get("/b.rs").copied(), Some(7));
+    }
+
+    #[test]
+    fn failed_commands_count_only_confirmed_bash_failures() {
+        // WHY: `None` means no tool result at all, so the command's outcome is
+        // unknown. Unknown is not failure, just as it is not success in
+        // `last_edit_verified`.
+        let raw = [
+            bash_of("b1", "cargo test", Some(true)),
+            bash_of("b2", "cargo build", Some(true)),
+            bash_of("b3", "ls", Some(false)),
+            bash_of("b4", "pwd", None),
+            // A failed non-Bash action must not count as a failed command.
+            write_of("w1", "/a.rs", 1, Some(true)),
+        ]
+        .join("\n");
+        let s = ingest_str(&raw, Lane::Main);
+        assert_eq!(failed_command_count(&s.actions), 2);
+    }
+
+    #[test]
+    fn failed_commands_is_zero_for_a_clean_session() {
+        let s = ingest_str(EDIT, Lane::Main);
+        assert_eq!(failed_command_count(&s.actions), 0);
     }
 
     #[test]
