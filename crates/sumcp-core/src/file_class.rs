@@ -76,10 +76,14 @@ const CONFIG_EXT: &[&str] = &[
 
 /// Classify a path. Precedence matters and is tested:
 ///
-/// 1. A basename starting with `.env` is [`FileClass::Config`], so
-///    `.env.local` and `.env.production` are caught alongside `.env`.
-/// 2. A memory or notes path is [`FileClass::Notes`], checked BEFORE
-///    extensions so `memory/plan.md` is notes rather than documentation.
+/// 1. A basename that is exactly `.env` or starts with `.env.` is
+///    [`FileClass::Config`], so `.env.local` and `.env.production` are
+///    caught alongside `.env`, but `.environment.rs` is not: the boundary
+///    stops at the dot, so the extension table still gets a look.
+/// 2. A memory or notes DIRECTORY (a path segment, not merely a prefix of
+///    one) is [`FileClass::Notes`], checked BEFORE extensions so
+///    `memory/plan.md` is notes rather than documentation, while
+///    `notesctl/main.rs` is still code.
 /// 3. Extension tables, in the order code, docs, config, web.
 /// 4. Everything else is [`FileClass::Other`].
 pub fn classify(path: &str) -> FileClass {
@@ -88,10 +92,10 @@ pub fn classify(path: &str) -> FileClass {
     // no directory component still lands here.
     let name = lower.rsplit('/').next().unwrap_or(lower.as_str());
 
-    if name.starts_with(".env") {
+    if name == ".env" || name.starts_with(".env.") {
         return FileClass::Config;
     }
-    if lower.contains("/memory/") || name.starts_with("memory.") || lower.contains("/notes") {
+    if lower.contains("/memory/") || name.starts_with("memory.") || lower.contains("/notes/") {
         return FileClass::Notes;
     }
 
@@ -149,6 +153,26 @@ mod tests {
         assert_eq!(classify("/repo/.env"), FileClass::Config);
         assert_eq!(classify("/repo/.env.local"), FileClass::Config);
         assert_eq!(classify("/repo/.env.production"), FileClass::Config);
+    }
+
+    #[test]
+    fn a_notes_prefixed_directory_is_not_a_notes_file() {
+        // "/notes" without a trailing slash also matches "notesctl", which
+        // would demote real source below documentation.
+        assert_eq!(classify("/repo/notesctl/src/main.rs"), FileClass::Code);
+        assert_eq!(classify("/repo/notesapp/index.ts"), FileClass::Code);
+        // A file merely NAMED notes is still source if it has a code extension.
+        assert_eq!(classify("/repo/notes.rs"), FileClass::Code);
+        // A real notes directory still classifies as notes.
+        assert_eq!(classify("/repo/notes/scratch.md"), FileClass::Notes);
+    }
+
+    #[test]
+    fn dotenv_matching_stops_at_the_documented_boundary() {
+        assert_eq!(classify("/repo/.env"), FileClass::Config);
+        assert_eq!(classify("/repo/.env.local"), FileClass::Config);
+        // Not a dotenv file: the extension table must still get a look.
+        assert_eq!(classify("/repo/.environment.rs"), FileClass::Code);
     }
 
     #[test]
