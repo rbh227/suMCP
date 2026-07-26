@@ -1574,6 +1574,65 @@ the weighted score with a stated ordering rule. The numbers below stand as
 recorded and were not recomputed.
 ```
 
+- [ ] **Step 2b: Give the demo fixture readable paths**
+
+The hero screenshot is the README's main image and currently shows paths like
+`/work/proj/f_d5e05a18.py`, an artifact of sanitizing the fixture from a real
+session. A reader cannot tell what they are looking at, which the Codex product
+review named directly: the screenshot "reads more as instrumentation than
+insight" and "sanitized hashed filenames make the value difficult to understand
+immediately."
+
+Nothing in the repo references these names. Verify that yourself before editing,
+since it is the whole basis for this step being safe:
+
+```bash
+grep -rln "f_d5e05a18\|f_04877e9f\|f_ea8148c7" --include='*.rs' --include='*.py' \
+  --include='*.json' --include='*.md' . | grep -v '^./target'
+```
+
+Expected: no output. If anything IS listed, stop and report rather than
+renaming.
+
+Then rewrite the paths in `fixtures/demo/demo-session.jsonl` to plausible
+INVENTED ones. They must stay entirely synthetic: no real project name, no real
+directory from this machine. Keep the same file extensions, because the classes
+drive the ranking and the point of the image is that code outranks docs. A
+mapping that preserves the current ranking shape:
+
+| current | replace with |
+|---|---|
+| the 8-edit `.py` | `src/store/data_store.py` |
+| the 2-edit `.py` with failure loops | `src/api/routes.py` |
+| the 4-edit `.md` | `docs/architecture.md` |
+| the 3-edit `.md` | `docs/api-notes.md` |
+| the 2-edit `.md` | `README.md` |
+| the never-edited `.jpg` | `assets/diagram.jpg` |
+
+Replace every occurrence of each old path, including inside tool inputs, tool
+results, and any `structuredPatch` content, so the transcript stays internally
+consistent. A path that appears in an edit but not in its matching result would
+change what the detectors see.
+
+Drop the `/work/proj/` prefix: relative paths read better in the report and the
+tool does not require absolute ones.
+
+AFTER editing, confirm the ranking shape is unchanged apart from the names:
+
+```bash
+cargo build --release -p sumcp-cli
+./target/release/sumcp --file fixtures/demo/demo-session.jsonl 2>/dev/null \
+  | sed -n '/struggle areas/,$p' | head -8
+```
+
+Expected: both `.py` files first with the same edit counts (8, then 2), then the
+`.md` files (4, 3, 2), and the `.jpg` last. If any edit count or the order
+changed, a replacement was incomplete: fix it rather than accepting the new
+output.
+
+Run `cargo test --workspace` and `python3 scripts/check_payloads.py` again after
+this edit, since a fixture change can move a test that parses it.
+
 - [ ] **Step 3: Regenerate the hero screenshot**
 
 The ranking order changed, so `docs/assets/report-hero.png` is stale and the
