@@ -81,11 +81,15 @@ const CONFIG_EXT: &[&str] = &[
 ///    caught alongside `.env`, but `.environment.rs` is not: the boundary
 ///    stops at the dot, so the extension table still gets a look.
 /// 2. A memory or notes DIRECTORY (a path segment, not merely a prefix of
-///    one) is [`FileClass::Notes`], checked BEFORE extensions so
-///    `memory/plan.md` is notes rather than documentation, while
-///    `notesctl/main.rs` is still code.
-/// 3. Extension tables, in the order code, docs, config, web.
-/// 4. Everything else is [`FileClass::Other`].
+///    one) is [`FileClass::Notes`] regardless of extension, checked BEFORE
+///    extensions so `memory/helper.rs` is notes even though `.rs` is
+///    otherwise code, while `notesctl/main.rs` is still code.
+/// 3. A basename starting with `memory.` is [`FileClass::Notes`] only when
+///    its extension is doc-like (in [`DOCS_EXT`]), so `memory.md` and
+///    `memory.txt` are notes but `memory.rs` and `memory.ts` are still
+///    classified by the extension tables below.
+/// 4. Extension tables, in the order code, docs, config, web.
+/// 5. Everything else is [`FileClass::Other`].
 pub fn classify(path: &str) -> FileClass {
     let lower = path.to_ascii_lowercase();
     // `rsplit('/')` always yields at least one item, so a bare filename with
@@ -95,7 +99,8 @@ pub fn classify(path: &str) -> FileClass {
     if name == ".env" || name.starts_with(".env.") {
         return FileClass::Config;
     }
-    if lower.contains("/memory/") || name.starts_with("memory.") || lower.contains("/notes/") {
+    // Directory-based notes/memory paths win regardless of extension.
+    if lower.contains("/memory/") || lower.contains("/notes/") {
         return FileClass::Notes;
     }
 
@@ -105,6 +110,14 @@ pub fn classify(path: &str) -> FileClass {
     let Some((_stem, ext)) = name.rsplit_once('.') else {
         return FileClass::Other;
     };
+
+    // Unlike the directory check above, a bare `memory.` basename prefix is
+    // NOT extension-blind: `memory.rs` is still source, only a doc-like
+    // extension turns it into notes.
+    if name.starts_with("memory.") && DOCS_EXT.contains(&ext) {
+        return FileClass::Notes;
+    }
+
     if CODE_EXT.contains(&ext) {
         FileClass::Code
     } else if DOCS_EXT.contains(&ext) {
@@ -153,6 +166,26 @@ mod tests {
         assert_eq!(classify("/repo/.env"), FileClass::Config);
         assert_eq!(classify("/repo/.env.local"), FileClass::Config);
         assert_eq!(classify("/repo/.env.production"), FileClass::Config);
+    }
+
+    #[test]
+    fn a_memory_prefixed_source_file_is_code() {
+        // "memory." as a bare basename prefix also captured source files,
+        // the same overreach the notes clause had.
+        assert_eq!(classify("/repo/src/memory.rs"), FileClass::Code);
+        assert_eq!(classify("/repo/memory.ts"), FileClass::Code);
+        // Doc-like memory files are still notes.
+        assert_eq!(classify("/repo/memory.md"), FileClass::Notes);
+        assert_eq!(classify("/repo/memory.txt"), FileClass::Notes);
+    }
+
+    #[test]
+    fn a_memory_directory_beats_the_extension_table() {
+        assert_eq!(classify("/home/u/.claude/memory/plan.md"), FileClass::Notes);
+        assert_eq!(
+            classify("/home/u/.claude/memory/helper.rs"),
+            FileClass::Notes
+        );
     }
 
     #[test]
