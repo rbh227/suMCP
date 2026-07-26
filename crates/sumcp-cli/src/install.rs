@@ -1428,6 +1428,22 @@ mod tests {
         serde_json::from_str(&fs::read_to_string(p).unwrap()).unwrap()
     }
 
+    /// `settings.json` only exists once something has written it. On Windows the
+    /// installer never does, because the only thing it would write there is a
+    /// Stop hook that cannot run, so on that platform its ABSENCE is the
+    /// correct outcome rather than a failure to read.
+    #[cfg(not(unix))]
+    fn no_stop_hook_registered(settings: &Path) -> bool {
+        if !settings.exists() {
+            return true;
+        }
+        let v = read_json(settings);
+        let Some(obj) = v.as_object() else {
+            return true;
+        };
+        stop_array(obj).is_none_or(|a| a.is_empty())
+    }
+
     #[test]
     fn fresh_install_writes_all_targets() {
         let home = temp_home();
@@ -1537,9 +1553,18 @@ mod tests {
                 .filter_map(|e| e.ok())
                 .any(|e| e.file_name().to_string_lossy().contains(".sumcp-bak."))
         };
+        // settings.json is backed up because registering the hook edits it. On
+        // Windows nothing is registered, so the file is never opened and the
+        // absence of a backup is the correct outcome, not a missing safeguard.
+        #[cfg(unix)]
         assert!(
             has_backup(&home.path().join(".claude")),
             "no settings backup"
+        );
+        #[cfg(not(unix))]
+        assert!(
+            !has_backup(&home.path().join(".claude")),
+            "settings.json is untouched on Windows, so nothing should be backed up"
         );
         assert!(has_backup(home.path()), "no .claude.json backup");
     }
@@ -1552,11 +1577,11 @@ mod tests {
         run_install(&paths, &exe, true).unwrap();
         run_install(&paths, &exe, true).unwrap(); // second time: no-op-ish, still Ok
 
-        let sj = read_json(&paths.settings_json());
         // Reinstalling twice must not register our hook twice. On Windows it is
         // never registered at all, so there is nothing that could duplicate.
         #[cfg(unix)]
         {
+            let sj = read_json(&paths.settings_json());
             let ours = paths.hook_script().to_string_lossy().to_string();
             let dupes = sj["hooks"]["Stop"]
                 .as_array()
@@ -1568,7 +1593,7 @@ mod tests {
         }
         #[cfg(not(unix))]
         assert!(
-            stop_array(sj.as_object().unwrap()).is_none_or(|a| a.is_empty()),
+            no_stop_hook_registered(&paths.settings_json()),
             "no hook is registered on Windows, so reinstall cannot duplicate one"
         );
 
@@ -1805,19 +1830,21 @@ mod tests {
             cj["mcpServers"]["sumcp"].is_object(),
             "server registration lost"
         );
-        let sj = read_json(&paths.settings_json());
         // On Unix the previous install's hook registration must survive the
         // failed reinstall. On Windows no hook was ever registered, so the
         // property to check is that the failure did not invent one.
         #[cfg(unix)]
-        assert_eq!(
-            sj["hooks"]["Stop"].as_array().unwrap().len(),
-            1,
-            "hook registration lost"
-        );
+        {
+            let sj = read_json(&paths.settings_json());
+            assert_eq!(
+                sj["hooks"]["Stop"].as_array().unwrap().len(),
+                1,
+                "hook registration lost"
+            );
+        }
         #[cfg(not(unix))]
         assert!(
-            stop_array(sj.as_object().unwrap()).is_none_or(|a| a.is_empty()),
+            no_stop_hook_registered(&paths.settings_json()),
             "a failed reinstall must not register a hook on Windows"
         );
 
