@@ -209,10 +209,14 @@ pub fn rank(s: &Session, w: &Weights) -> Vec<FileScore> {
     //      predict recurrence (see file_class's module doc);
     //   3. edit count, descending;
     //   4. path, so the order is total and stable.
-    // Deliberately NOT a weighted sum: fitting weights to maximize hits with
-    // the outcomes in hand bought at most 4 hits out of 39 on the only corpus
-    // this has been measured against, and the fit put maximum weight on edit
-    // count anyway (docs/validation/2026-07-26-ceiling-analysis.md).
+    // Deliberately NOT a weighted sum. The 2026-07-22 predictive-validity
+    // study found the weighted ranking did not beat sorting files by edit
+    // count on the author's own corpus, and the weighting's own flags fire on
+    // zero files below 2 edits, making the score a refinement of edit count
+    // rather than an independent signal. See
+    // docs/validation/2026-07-22-predictive-validity.md, and
+    // docs/validation/2026-07-26-file-class-measurement.md for why class
+    // ranks above edit count.
     scores.sort_by(|a, b| {
         (a.edits == 0)
             .cmp(&(b.edits == 0))
