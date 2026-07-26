@@ -4,9 +4,14 @@
 //! `sumcp-mcp` into place.
 
 use std::fs;
-use std::io::Write;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Command;
+// Only the hook test uses these, and that test is Unix only because it spawns
+// /bin/sh. Importing them unconditionally warns on Windows.
+#[cfg(unix)]
+use std::io::Write;
+#[cfg(unix)]
+use std::process::Stdio;
 
 fn sumcp() -> &'static str {
     env!("CARGO_BIN_EXE_sumcp")
@@ -40,14 +45,27 @@ fn dry_run_writes_nothing_then_apply_and_uninstall_roundtrip() {
     // 2. Apply: the whole tree + registrations land.
     let (ok, out) = run(home.path(), &["install", "--apply"]);
     assert!(ok, "apply install failed: {out}");
-    assert!(sumcp_dir.join("bin/sumcp").exists(), "sumcp binary missing");
+    let exe = std::env::consts::EXE_SUFFIX;
     assert!(
-        sumcp_dir.join("bin/sumcp-mcp").exists(),
+        sumcp_dir.join(format!("bin/sumcp{exe}")).exists(),
+        "sumcp binary missing"
+    );
+    assert!(
+        sumcp_dir.join(format!("bin/sumcp-mcp{exe}")).exists(),
         "mcp binary missing"
     );
+    // The hook is a /bin/sh script, installed on Unix and deliberately skipped
+    // on Windows. Assert each platform's real contract, so "correctly skipped"
+    // and "silently broken" cannot be confused.
+    #[cfg(unix)]
     assert!(
         sumcp_dir.join("hooks/stop-nudge.sh").exists(),
         "hook missing"
+    );
+    #[cfg(not(unix))]
+    assert!(
+        !sumcp_dir.join("hooks/stop-nudge.sh").exists(),
+        "there is no /bin/sh here, so the hook must not be written"
     );
     assert!(sumcp_dir.join("manifest.json").exists(), "manifest missing");
     assert!(
@@ -77,6 +95,10 @@ fn dry_run_writes_nothing_then_apply_and_uninstall_roundtrip() {
 /// installed hook, which must nudge WITH the session id — the skill passes it
 /// explicitly to every tool call — and must not re-nudge on the next Stop
 /// when nothing new happened (codex review 2026-07-22 P0).
+// Spawns the hook with /bin/sh, which does not exist on Windows, and the hook
+// is not installed there for exactly that reason. Unix only by nature, not by
+// convenience: there is nothing on Windows for this test to drive.
+#[cfg(unix)]
 #[test]
 fn installed_hook_nudges_with_session_id_and_does_not_spam() {
     let home = tempfile::tempdir().unwrap();
