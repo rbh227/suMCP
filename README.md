@@ -51,6 +51,12 @@ registration.
 
 ### From a release archive
 
+> **Before the first tagged release, these links 404.** The archives are built
+> by CI when a `v*` tag is pushed, so until `v0.1.0` exists the
+> [releases page](https://github.com/rbh227/suMCP/releases) is empty and
+> [From source](#from-source) below is the only install path. If a `curl` here
+> returns a 404 page instead of a tarball, that is what happened.
+
 Download for your platform from the
 [latest release](https://github.com/rbh227/suMCP/releases/latest):
 
@@ -69,9 +75,31 @@ tar -xzf sumcp-$V-$T.tar.gz && cd sumcp-$V-$T
 ./sumcp install --apply  # register the MCP server, debrief skill, and Stop hook
 ```
 
-The macOS binaries are not signed or notarized. `curl` downloads are not
-quarantined, but if you download through a browser and Gatekeeper blocks them,
-run `xattr -dr com.apple.quarantine sumcp sumcp-mcp`.
+**macOS signing.** The binaries carry only the ad-hoc signature Rust applies at
+link time. That is enough for them to run, but it carries no developer identity,
+so they are **not notarized**: this project has no Apple Developer ID. A `curl`
+download is not quarantined and will just work. A browser download is
+quarantined, and Gatekeeper will refuse it until you clear the attribute:
+
+```bash
+xattr -dr com.apple.quarantine sumcp sumcp-mcp
+```
+
+Verify what you got, rather than taking the above on trust:
+
+```bash
+codesign -dvv ./sumcp   # expect "Signature=adhoc" until a Developer ID is set up
+```
+
+The release workflow already contains the signing and notarization steps; they
+activate the moment the five `MACOS_*` secrets are configured and are skipped
+until then, so no workflow change is needed to turn this on.
+
+**Both platforms are exercised before publishing.** Every archive's `sumcp` is
+executed in CI and made to analyze a real fixture, including the Intel macOS
+build, which is cross-compiled on an arm64 runner and run through Rosetta 2. A
+binary that links but cannot start, or starts but cannot parse a transcript,
+fails the build rather than reaching you.
 
 Two Linux archives are published. `x86_64-unknown-linux-gnu` is the default.
 If it fails with a `GLIBC_2.3x not found` error, which happens on older
