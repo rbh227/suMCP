@@ -870,6 +870,8 @@ mod tests {
             .map(|i| {
                 let file = huge_path(i);
                 FileScore {
+                    class: crate::file_class::classify(&file),
+                    edits: 1,
                     file: file.clone(),
                     score: 100.0 - i as f64,
                     breakdown: [("churn".to_string(), 500u64), ("rework".to_string(), 90)]
@@ -917,11 +919,16 @@ mod tests {
         );
         // 8 ranked files, ordinary short paths, one small finding each.
         let ranked: Vec<FileScore> = (0..8)
-            .map(|i| FileScore {
-                file: format!("/src/f{i}.rs"),
-                score: 10.0 - i as f64,
-                breakdown: [("churn".to_string(), 2u64)].into_iter().collect(),
-                findings: vec![],
+            .map(|i| {
+                let file = format!("/src/f{i}.rs");
+                FileScore {
+                    class: crate::file_class::classify(&file),
+                    edits: 1,
+                    file,
+                    score: 10.0 - i as f64,
+                    breakdown: [("churn".to_string(), 2u64)].into_iter().collect(),
+                    findings: vec![],
+                }
             })
             .collect();
         let p = session_overview(&s, &ranked, &meta());
@@ -968,6 +975,8 @@ mod tests {
         findings.push(fat_finding(FindingKind::FailureLoop, file, 2));
         findings.push(fat_finding(FindingKind::BlindWriteAttempt, file, 1));
         let ranked = vec![FileScore {
+            class: crate::file_class::classify(file),
+            edits: 6,
             file: file.into(),
             score: 10.0,
             breakdown: [

@@ -15,7 +15,7 @@
 //! this module stays pure — file I/O lives in the binaries, keeping
 //! `sumcp-core` serde-only (ADR A2).
 
-use crate::model::{Confidence, Finding, FindingKind, Idx, Session};
+use crate::model::{ActionKind, Confidence, Finding, FindingKind, Idx, Session};
 use crate::signals;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -75,12 +75,17 @@ impl Default for Weights {
 /// at most. Not `Weights` fields — they are not evidence-bearing knobs.
 const REL_CHURN_CLAMP: (f64, f64) = (0.5, 2.0);
 
-/// One file's rank, with the breakdown that explains it.
+/// One file's place in the ranking, with the evidence that explains it.
 #[derive(Debug, Clone, Serialize)]
 pub struct FileScore {
     /// The file path.
     pub file: String,
-    /// The weighted score.
+    /// What kind of file this is. First ranking key after edited-ness.
+    pub class: crate::file_class::FileClass,
+    /// How many Edit or Write actions targeted this file. Second ranking key.
+    pub edits: u64,
+    /// The weighted score. Retained for one task only; the ranking no longer
+    /// consults it (spec 2026-07-26 §2b removes it next).
     pub score: f64,
     /// Per-category magnitudes (churn/rework/failure_loops/re_read/fumbles/action_loops).
     pub breakdown: BTreeMap<String, u64>,
@@ -138,12 +143,28 @@ fn finding_multiplier(f: &Finding) -> f64 {
     }
 }
 
+/// Edit/Write actions per file. Not a signal: the ranking's second key and a
+/// displayed number, so it counts ATTEMPTS exactly as `Overview::edits` does
+/// rather than only confirmed successes.
+fn edit_counts(s: &Session) -> BTreeMap<&str, u64> {
+    let mut out: BTreeMap<&str, u64> = BTreeMap::new();
+    for a in &s.actions {
+        if matches!(a.kind, ActionKind::Edit | ActionKind::Write)
+            && let Some(f) = a.file_path.as_deref()
+        {
+            *out.entry(f).or_insert(0) += 1;
+        }
+    }
+    out
+}
+
 /// Rank the files by weighted struggle. Descending score; file path breaks ties
 /// (deterministic). Only files with at least one ranking finding appear.
 pub fn rank(s: &Session, w: &Weights) -> Vec<FileScore> {
     // Per-file accumulator: running score, per-category magnitudes, findings.
     type Acc = (f64, BTreeMap<String, u64>, Vec<Finding>);
     let mut acc: BTreeMap<String, Acc> = BTreeMap::new();
+    let edits = edit_counts(s);
 
     for f in all_findings(s) {
         let Some(file) = f.file.clone() else { continue };
@@ -168,18 +189,35 @@ pub fn rank(s: &Session, w: &Weights) -> Vec<FileScore> {
 
     let mut scores: Vec<FileScore> = acc
         .into_iter()
-        .map(|(file, (score, breakdown, findings))| FileScore {
-            file,
-            score,
-            breakdown,
-            findings,
+        .map(|(file, (score, breakdown, findings))| {
+            let edits = edits.get(file.as_str()).copied().unwrap_or(0);
+            FileScore {
+                class: crate::file_class::classify(&file),
+                edits,
+                file,
+                score,
+                breakdown,
+                findings,
+            }
         })
         .collect();
-    // Descending score; file name breaks ties so the order is total & stable.
+    // The ranking rule, in full. Four keys, each one checkable by hand
+    // against the rendered report (spec 2026-07-26 §2b):
+    //   1. edited files before never-edited ones, because a file with no
+    //      change has nothing to review;
+    //   2. class tier, because documentation and config churn does not
+    //      predict recurrence (see file_class's module doc);
+    //   3. edit count, descending;
+    //   4. path, so the order is total and stable.
+    // Deliberately NOT a weighted sum: fitting weights to maximize hits with
+    // the outcomes in hand bought at most 4 hits out of 39 on the only corpus
+    // this has been measured against, and the fit put maximum weight on edit
+    // count anyway (docs/validation/2026-07-26-ceiling-analysis.md).
     scores.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
+        (a.edits == 0)
+            .cmp(&(b.edits == 0))
+            .then_with(|| a.class.tier().cmp(&b.class.tier()))
+            .then_with(|| b.edits.cmp(&a.edits))
             .then_with(|| a.file.cmp(&b.file))
     });
     scores
@@ -334,5 +372,117 @@ mod tests {
             (ranked[0].score - w.action_loop * w.low_confidence_factor).abs() < 1e-9,
             "Low confidence ⇒ ×low_confidence_factor"
         );
+    }
+
+    /// Read-only files carry ReRead findings and so enter the ranking with
+    /// zero edits. On the demo fixture a never-edited `.jpg` ranked FOURTH,
+    /// above a `.py` file whose commands were failing, purely for having been
+    /// read four times. A review queue is about changes, so anything unedited
+    /// sorts last regardless of class.
+    #[test]
+    fn edited_files_outrank_unedited_ones() {
+        let read = |id: &str, ts: &str, file: &str| {
+            format!(
+                r#"{{"type":"assistant","timestamp":"{ts}","message":{{"content":[{{"type":"tool_use","id":"{id}","name":"Read","input":{{"file_path":"{file}"}}}}]}}}}"#
+            )
+        };
+        let mut lines: Vec<String> = (0..4)
+            .map(|i| {
+                read(
+                    &format!("r{i}"),
+                    &format!("2026-01-01T00:00:0{i}Z"),
+                    "/a/hero.jpg",
+                )
+            })
+            .collect();
+        // One edited code file, fewer signals than the read-thrashed image.
+        for i in 0..2 {
+            lines.push(edit(
+                &format!("e{i}"),
+                &format!("2026-01-01T00:01:0{i}Z"),
+                "/a/main.rs",
+            ));
+        }
+        let s = ingest_str(&lines.join("\n"), Lane::Main);
+        let ranked = rank(&s, &Weights::default());
+        assert_eq!(ranked[0].file, "/a/main.rs", "edited file first");
+        assert_eq!(ranked[0].edits, 2);
+        assert_eq!(ranked.last().unwrap().file, "/a/hero.jpg");
+        assert_eq!(ranked.last().unwrap().edits, 0, "never edited");
+    }
+
+    #[test]
+    fn code_outranks_docs_even_with_fewer_edits() {
+        let mut lines = Vec::new();
+        // Docs edited 5x, code edited 2x. Code still wins on class.
+        for i in 0..5 {
+            lines.push(edit(
+                &format!("d{i}"),
+                &format!("2026-01-01T00:00:0{i}Z"),
+                "/a/NOTES-FOR-RELEASE.md",
+            ));
+        }
+        for i in 0..2 {
+            lines.push(edit(
+                &format!("c{i}"),
+                &format!("2026-01-01T00:01:0{i}Z"),
+                "/a/main.rs",
+            ));
+        }
+        let s = ingest_str(&lines.join("\n"), Lane::Main);
+        let ranked = rank(&s, &Weights::default());
+        assert_eq!(ranked[0].file, "/a/main.rs");
+        assert_eq!(ranked[0].class, crate::file_class::FileClass::Code);
+        assert_eq!(ranked[1].file, "/a/NOTES-FOR-RELEASE.md");
+        assert_eq!(ranked[1].class, crate::file_class::FileClass::Docs);
+    }
+
+    #[test]
+    fn within_a_class_more_edits_ranks_first_and_path_breaks_ties() {
+        let mut lines = Vec::new();
+        for i in 0..4 {
+            lines.push(edit(
+                &format!("h{i}"),
+                &format!("2026-01-01T00:00:0{i}Z"),
+                "/a/hot.rs",
+            ));
+        }
+        for i in 0..2 {
+            lines.push(edit(
+                &format!("m{i}"),
+                &format!("2026-01-01T00:01:0{i}Z"),
+                "/a/mid.rs",
+            ));
+        }
+        // Same edit count as mid.rs, so only the path can separate them.
+        for i in 0..2 {
+            lines.push(edit(
+                &format!("z{i}"),
+                &format!("2026-01-01T00:02:0{i}Z"),
+                "/a/also.rs",
+            ));
+        }
+        let s = ingest_str(&lines.join("\n"), Lane::Main);
+        let ranked = rank(&s, &Weights::default());
+        let files: Vec<&str> = ranked.iter().map(|f| f.file.as_str()).collect();
+        assert_eq!(files, vec!["/a/hot.rs", "/a/also.rs", "/a/mid.rs"]);
+    }
+
+    #[test]
+    fn edits_counts_writes_as_well_as_edits() {
+        let write = |id: &str, ts: &str, file: &str| {
+            format!(
+                r#"{{"type":"assistant","timestamp":"{ts}","message":{{"content":[{{"type":"tool_use","id":"{id}","name":"Write","input":{{"file_path":"{file}","content":"x"}}}}]}}}}"#
+            )
+        };
+        let raw = format!(
+            "{}\n{}\n{}",
+            write("w1", "2026-01-01T00:00:01Z", "/a/main.rs"),
+            edit("e1", "2026-01-01T00:00:02Z", "/a/main.rs"),
+            edit("e2", "2026-01-01T00:00:03Z", "/a/main.rs"),
+        );
+        let s = ingest_str(&raw, Lane::Main);
+        let ranked = rank(&s, &Weights::default());
+        assert_eq!(ranked[0].edits, 3, "Write counts toward edits");
     }
 }
