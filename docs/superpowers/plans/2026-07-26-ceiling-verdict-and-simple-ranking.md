@@ -1736,7 +1736,397 @@ configuration to diverge on. A user with a stale config gets a notice."
 
 ---
 
-### Task 6: Documentation claims
+### Task 6: Surface a secrets-file touch as a blind spot
+
+**Files:**
+- Modify: `crates/sumcp-core/src/file_class.rs` (add `is_secrets`)
+- Modify: `crates/sumcp-core/src/model.rs` (`FindingKind` gains a variant)
+- Create: `crates/sumcp-core/src/signals/secrets.rs`
+- Modify: `crates/sumcp-core/src/signals.rs` (register the module)
+- Modify: `crates/sumcp-core/src/score.rs` (`all_findings`, `ranked_category`)
+- Modify: `crates/sumcp-core/src/review.rs` (`is_solo_qualifying`, `reason_sentence`)
+- Modify: `crates/sumcp-core/src/payloads.rs` (`blind_spots`)
+- Modify: `fixtures/mock-payloads/blind_spots.json`, `scripts/check_payloads.py`,
+  `docs/payload-schema.md`, `docs/metrics.md`
+
+**Why this task exists.** The user's rule is that a `.env` file should never be
+edited or even read. The ranking change puts `Config` in the LAST tier, so a
+secrets file the agent touched would be buried at the bottom of the queue,
+which is backwards: if it must never be touched, a touch is the single most
+important thing in the report. Ranking is the wrong instrument for a
+zero-tolerance rule, so this surfaces it through `blind_spots` instead, where
+one occurrence is enough. The class stays `Config` so ordinary config churn
+keeps ranking low.
+
+Secret VALUES are already handled: `redact.rs` scrubs excerpt text on the
+`evidence()` path, so citing these actions cannot print a key.
+
+**Interfaces:**
+- Consumes: `file_class` from Task 1; the payload v1 shape from Task 5.
+- Produces: `file_class::is_secrets(path: &str) -> bool`;
+  `FindingKind::SecretsFileTouched` serializing as `secrets_file_touched`;
+  `signals::secrets(s: &Session) -> Vec<Finding>`; a
+  `blind_spots.secrets_file_touched` list plus its `totals` entry.
+
+- [ ] **Step 1: Write the failing tests**
+
+In `crates/sumcp-core/src/file_class.rs`, add:
+
+```rust
+    #[test]
+    fn secrets_paths_are_recognized_and_ordinary_config_is_not() {
+        assert!(is_secrets("/repo/.env"));
+        assert!(is_secrets("/repo/.env.production"));
+        assert!(is_secrets("/home/u/.ssh/id_rsa"));
+        assert!(is_secrets("/repo/certs/server.pem"));
+        assert!(is_secrets("/repo/private.key"));
+        assert!(is_secrets("/home/u/.netrc"));
+        // Ordinary config is NOT a secret: it must not trip the blind spot.
+        assert!(!is_secrets("/repo/Cargo.toml"));
+        assert!(!is_secrets("/repo/package.json"));
+        assert!(!is_secrets("/repo/src/main.rs"));
+    }
+
+    #[test]
+    fn secrets_files_still_classify_as_config() {
+        // The blind spot is the instrument for a secrets touch, not the
+        // ranking: a secrets file keeps the low Config tier.
+        assert_eq!(classify("/repo/.env"), FileClass::Config);
+        assert_eq!(classify("/repo/certs/server.pem"), FileClass::Config);
+    }
+```
+
+Create `crates/sumcp-core/src/signals/secrets.rs` with only this test module:
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ingest::ingest_str;
+    use crate::model::{FindingKind, Lane};
+
+    fn tool(id: &str, ts: &str, name: &str, file: &str) -> String {
+        format!(
+            r#"{{"type":"assistant","timestamp":"{ts}","message":{{"content":[{{"type":"tool_use","id":"{id}","name":"{name}","input":{{"file_path":"{file}"}}}}]}}}}"#
+        )
+    }
+
+    #[test]
+    fn a_read_of_a_secrets_file_is_a_finding() {
+        let raw = tool("r1", "2026-01-01T00:00:01Z", "Read", "/repo/.env");
+        let s = ingest_str(&raw, Lane::Main);
+        let f = secrets(&s);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].kind, FindingKind::SecretsFileTouched);
+        assert_eq!(f[0].file.as_deref(), Some("/repo/.env"));
+        assert_eq!(f[0].nums.get("reads"), Some(&1.0));
+        assert_eq!(f[0].nums.get("edits"), Some(&0.0));
+        assert_eq!(f[0].idxs.len(), 1);
+    }
+
+    #[test]
+    fn reads_and_edits_of_one_file_collapse_into_one_finding() {
+        let raw = format!(
+            "{}\n{}\n{}",
+            tool("r1", "2026-01-01T00:00:01Z", "Read", "/repo/.env"),
+            tool("e1", "2026-01-01T00:00:02Z", "Edit", "/repo/.env"),
+            tool("r2", "2026-01-01T00:00:03Z", "Read", "/repo/.env"),
+        );
+        let s = ingest_str(&raw, Lane::Main);
+        let f = secrets(&s);
+        assert_eq!(f.len(), 1, "one finding per file, not per action");
+        assert_eq!(f[0].nums.get("reads"), Some(&2.0));
+        assert_eq!(f[0].nums.get("edits"), Some(&1.0));
+        assert_eq!(f[0].idxs.len(), 3, "every touching action is cited");
+    }
+
+    #[test]
+    fn ordinary_files_produce_nothing() {
+        let raw = format!(
+            "{}\n{}",
+            tool("e1", "2026-01-01T00:00:01Z", "Edit", "/repo/src/main.rs"),
+            tool("e2", "2026-01-01T00:00:02Z", "Edit", "/repo/Cargo.toml"),
+        );
+        let s = ingest_str(&raw, Lane::Main);
+        assert!(secrets(&s).is_empty());
+    }
+
+    #[test]
+    fn findings_are_ordered_by_path_for_determinism() {
+        let raw = format!(
+            "{}\n{}",
+            tool("r1", "2026-01-01T00:00:01Z", "Read", "/repo/z.pem"),
+            tool("r2", "2026-01-01T00:00:02Z", "Read", "/repo/a.pem"),
+        );
+        let s = ingest_str(&raw, Lane::Main);
+        let files: Vec<&str> = secrets(&s).iter().filter_map(|f| f.file.as_deref()).collect();
+        assert_eq!(files, vec!["/repo/a.pem", "/repo/z.pem"]);
+    }
+}
+```
+
+In `crates/sumcp-core/src/review.rs`, add:
+
+```rust
+    #[test]
+    fn a_single_secrets_touch_qualifies_alone() {
+        // Zero-tolerance rule: one occurrence is the whole signal, so it must
+        // not need a second finding to clear the floor.
+        let all = vec![finding(FindingKind::SecretsFileTouched, "/repo/.env")];
+        let picked = needs_review(&[], &all);
+        assert_eq!(picked.len(), 1);
+        assert_eq!(picked[0].file, "/repo/.env");
+        assert!(reason_sentence(&picked[0]).contains("secrets file"));
+    }
+```
+
+- [ ] **Step 2: Run to verify they fail**
+
+Run: `cargo test -p sumcp-core secrets`
+Expected: FAIL to compile, `cannot find function is_secrets`, `no variant
+SecretsFileTouched`, `cannot find function secrets`.
+
+- [ ] **Step 3: Add `is_secrets` and route `classify` through it**
+
+In `crates/sumcp-core/src/file_class.rs`, add the table and function, then make
+the existing dotenv branch in `classify` call `is_secrets` so there is exactly
+one definition of what a secrets path is:
+
+```rust
+/// Basenames that are secrets outright, matched exactly.
+const SECRET_NAMES: &[&str] = &[".netrc", ".pgpass", "credentials"];
+/// Basename prefixes that mark a secret. `.env` itself is matched exactly by
+/// `is_secrets`; these cover the suffixed and keypair forms.
+const SECRET_PREFIXES: &[&str] = &["id_rsa", "id_ed25519", "id_ecdsa", "id_dsa", "secrets."];
+/// Extensions that carry key material.
+const SECRET_EXT: &[&str] = &["pem", "key", "p12", "pfx"];
+
+/// Whether a path names a credentials or key file.
+///
+/// Deliberately NARROW and deny-list shaped: a false positive here puts a file
+/// in the review queue that does not belong there, which trains the reader to
+/// ignore the signal. Extend the tables rather than loosening the matching.
+///
+/// This is the ONLY definition of a secrets path. [`classify`] calls it, so a
+/// path recognized here always classifies as [`FileClass::Config`] and the two
+/// cannot disagree.
+pub fn is_secrets(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    let name = lower.rsplit('/').next().unwrap_or(lower.as_str());
+    if name == ".env" || name.starts_with(".env.") {
+        return true;
+    }
+    if SECRET_NAMES.contains(&name) {
+        return true;
+    }
+    if SECRET_PREFIXES.iter().any(|p| name.starts_with(p)) {
+        return true;
+    }
+    match name.rsplit_once('.') {
+        Some((_, ext)) => SECRET_EXT.contains(&ext),
+        None => false,
+    }
+}
+```
+
+Replace `classify`'s dotenv branch with a call to `is_secrets`, keeping it as
+the FIRST check so it still wins over every other rule.
+
+- [ ] **Step 4: Add the finding kind**
+
+In `crates/sumcp-core/src/model.rs`, add to `FindingKind`, after `ReviewBurden`:
+
+```rust
+    /// A credentials or key file was read, edited, or written. Zero-tolerance
+    /// by design: one occurrence is the entire signal, so it solo-qualifies
+    /// for review rather than needing a second finding. Surfaced through
+    /// `blind_spots`, not through the ranking, because the ranking puts
+    /// `Config` last and burying this would defeat the point.
+    SecretsFileTouched,
+```
+
+Confirm the enum's serde attribute renders it as `secrets_file_touched`; the
+enum already serializes snake_case, so no per-variant attribute is needed.
+
+- [ ] **Step 5: Write the detector**
+
+Insert above the test module in `crates/sumcp-core/src/signals/secrets.rs`:
+
+```rust
+//! Secrets-file touches (spec 2026-07-26, added during execution).
+//!
+//! One finding per secrets-class file that the session read, edited, or wrote.
+//! Exact and high-confidence: this is a literal fact about the action log, not
+//! an inference. Per file rather than per action so a file read ten times
+//! produces one review item carrying ten citations.
+
+use crate::file_class::is_secrets;
+use crate::model::{ActionKind, Confidence, Finding, FindingKind, Idx, Session, Tier};
+use std::collections::BTreeMap;
+
+/// Findings for every secrets-class file the session touched, ordered by path.
+pub fn secrets(s: &Session) -> Vec<Finding> {
+    // BTreeMap so the output order is path order: deterministic without a
+    // separate sort.
+    let mut per_file: BTreeMap<&str, (u64, u64, Vec<Idx>)> = BTreeMap::new();
+    for a in &s.actions {
+        let Some(file) = a.file_path.as_deref() else {
+            continue;
+        };
+        let is_read = matches!(a.kind, ActionKind::Read);
+        let is_write = matches!(a.kind, ActionKind::Edit | ActionKind::Write);
+        if !(is_read || is_write) || !is_secrets(file) {
+            continue;
+        }
+        let entry = per_file.entry(file).or_insert((0, 0, Vec::new()));
+        if is_read {
+            entry.0 += 1;
+        } else {
+            entry.1 += 1;
+        }
+        entry.2.push(a.idx);
+    }
+
+    per_file
+        .into_iter()
+        .map(|(file, (reads, edits, idxs))| {
+            let mut nums = BTreeMap::new();
+            nums.insert("reads".to_string(), reads as f64);
+            nums.insert("edits".to_string(), edits as f64);
+            Finding {
+                kind: FindingKind::SecretsFileTouched,
+                tier: Tier::T1,
+                exact: true,
+                confidence: Confidence::High,
+                idxs,
+                file: Some(file.to_string()),
+                note: Some(format!(
+                    "credentials or key file: {reads} read(s), {edits} write(s)"
+                )),
+                nums,
+            }
+        })
+        .collect()
+}
+```
+
+Register it in `crates/sumcp-core/src/signals.rs`, alphabetically:
+`pub mod secrets;` after `pub mod failures;`, and
+`pub use secrets::secrets;` after `pub use failures::failures;`.
+
+Add it to `all_findings` in `crates/sumcp-core/src/score.rs`:
+`f.extend(signals::secrets(s));` after the `comprehension` line.
+
+Leave `ranked_category` returning `None` for the new kind, which the existing
+`_ => None` arm already does. It is not a struggle category and must not
+contribute to the ordering.
+
+- [ ] **Step 6: Make it solo-qualify and give it a phrase**
+
+In `crates/sumcp-core/src/review.rs`, add `FindingKind::SecretsFileTouched` to
+the `matches!` list in `is_solo_qualifying`, and add to `reason_sentence`,
+placed FIRST among the non-ranking phrases so it leads the sentence:
+
+```rust
+    let sec_n = count_of(&FindingKind::SecretsFileTouched);
+    if sec_n > 0 {
+        parts.push("secrets file touched".into());
+    }
+```
+
+Place this block before the existing `flip_n` block so the phrase order puts it
+ahead of the others.
+
+- [ ] **Step 7: Add it to `blind_spots`**
+
+In `crates/sumcp-core/src/payloads.rs`, inside `blind_spots`: add
+`let secrets = of_kind(FindingKind::SecretsFileTouched);`, include `&secrets`
+in the `findings_cut` chain and in the `longest` maximum, add
+`"secrets_file_touched": list(&secrets),` as the FIRST list in the JSON object,
+and add `"secrets_file_touched": secrets.len(),` to `totals`.
+
+Add this test:
+
+```rust
+    #[test]
+    fn blind_spots_reports_a_secrets_touch() {
+        let raw = format!(
+            r#"{{"type":"assistant","timestamp":"2026-01-01T00:00:01Z","message":{{"content":[{{"type":"tool_use","id":"r1","name":"Read","input":{{"file_path":"/repo/.env"}}}}]}}}}"#
+        );
+        let s = crate::ingest::ingest_str(&raw, crate::model::Lane::Main);
+        let p = blind_spots(&s, &meta());
+        assert_eq!(p["totals"]["secrets_file_touched"], 1);
+        assert_eq!(p["secrets_file_touched"][0]["kind"], "secrets_file_touched");
+    }
+```
+
+- [ ] **Step 8: Update the contract files**
+
+- `scripts/check_payloads.py`: add `"secrets_file_touched"` to the `KINDS` set.
+- `fixtures/mock-payloads/blind_spots.json`: add a
+  `"secrets_file_touched": []` list and a `"secrets_file_touched": 0` total, so
+  the mock shows the field's shape. Keep every existing value unchanged.
+- `docs/payload-schema.md`: extend the v1 section with a row for the new
+  `blind_spots` list and the new finding kind.
+- `docs/metrics.md`: add a row for `secrets_file_touched`: T1, exact,
+  high confidence, solo-qualifying, surfaced in `blind_spots`. State that it
+  has NO predictive validation, because it did not exist when the corpus was
+  measured, and that it is a policy signal rather than a measured one.
+
+- [ ] **Step 9: Run everything**
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+python3 scripts/check_payloads.py
+python3 scripts/check_narration.py
+```
+
+Expected: all five clean.
+
+- [ ] **Step 10: Confirm it fires on a real touch**
+
+```bash
+cargo build --release -p sumcp-cli
+printf '%s\n' '{"type":"assistant","timestamp":"2026-01-01T00:00:01Z","message":{"content":[{"type":"tool_use","id":"r1","name":"Read","input":{"file_path":"/tmp/demo/.env"}}]}}' > /tmp/secrets-probe.jsonl
+./target/release/sumcp --file /tmp/secrets-probe.jsonl 2>&1 | head -20
+```
+
+Expected: the run completes and reports the session. A one-action transcript is
+below most detector thresholds, so the value of this probe is that the binary
+does not crash on the new kind; the unit tests are what prove the finding
+fires.
+
+- [ ] **Step 11: Commit**
+
+```bash
+git add -A
+git commit -m "core: surface a secrets-file touch as a blind spot
+
+A .env file should never be read or edited, so a touch is the most important
+thing a report can say. Ranking is the wrong instrument for a zero-tolerance
+rule: Config sits in the last tier, so the ranking would have buried it.
+
+One finding per secrets-class file that was read, edited, or written, exact
+and high-confidence because it is a literal fact about the action log. It
+solo-qualifies for review, so one occurrence is enough, and it is surfaced
+through blind_spots rather than the ranking. Ordinary config churn keeps its
+low rank.
+
+file_class::is_secrets is the single definition of a secrets path and classify
+calls it, so the classifier and the detector cannot disagree. The table is
+deliberately narrow: a false positive here trains the reader to ignore the
+signal. Secret values were already safe, since redact.rs scrubs excerpts on
+the evidence path.
+
+No predictive validation: this kind did not exist when the corpus was
+measured. It is a policy signal, not a measured one, and metrics.md says so."
+```
+
+---
+
+### Task 7: Documentation claims
 
 **Files:**
 - Modify: `docs/metrics.md`, `SPEC.md`, `README.md`, `tasks/todo.md`
@@ -1851,7 +2241,7 @@ for the same hits, and every entry is cited. No accuracy claim."
 
 ---
 
-### Task 7: Publish the negative result and run the release gate
+### Task 8: Publish the negative result and run the release gate
 
 **Files:**
 - Create: `docs/validation/2026-07-26-ceiling-analysis.md`
@@ -1978,8 +2368,8 @@ visible.
 
 **Spec coverage.** Every numbered spec section maps to a task: 1a to Task 2
 steps 1-3; 1b to Task 3; 1c to Task 2 steps 5-7; 1d to Task 3 steps 3-5; 2a to
-Task 1; 2b to Tasks 4 and 5; 2c to Task 6 step 1; 2d to Task 5 steps 4, 8, 9,
-10; 2e to Task 5 steps 5-6; 2f to Task 5 step 6; Part 3 to Tasks 6 and 7. The
+Task 1; 2b to Tasks 4 and 5; 2c to Task 7 step 1; 2d to Task 5 steps 4, 8, 9,
+10; 2e to Task 5 steps 5-6; 2f to Task 5 step 6; Part 3 to Tasks 7 and 8. The
 spec's testing section is distributed across each task's own verification
 steps, and its "docs-only session must not produce an empty report" requirement
 is covered by `code_outranks_docs_even_with_fewer_edits` in Task 4 plus the
@@ -1987,7 +2377,7 @@ is covered by `code_outranks_docs_even_with_fewer_edits` in Task 4 plus the
 file is ever excluded.
 
 **Known gap, deliberate.** The spec asks for a regression test pinning the demo
-fixture's new order. Task 4 step 7 eyeballs it and Task 7 step 3 checks the
+fixture's new order. Task 4 step 7 eyeballs it and Task 8 step 3 checks the
 screenshot, but there is no automated assertion, because the fixture path
 depends on which demo fixture survives and a brittle pin on a large fixture
 would fail for unrelated reasons. If the implementer wants one, add it to
