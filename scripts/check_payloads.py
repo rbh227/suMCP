@@ -4,8 +4,8 @@
 Hardened per the /ship code-review + test-engineer findings: the checker now
 enforces the schema's own rules that earlier passed silently (kind enum,
 non-empty idxs, note-when-heuristic, full error shape, ranking payloads echo
-weights + breakdown). It is the regression test the Rust `report.rs` builders
-must also pass.
+the ranking rule + breakdown). It is the regression test the Rust `report.rs`
+builders must also pass.
 
 Token caps use chars/3.5 — compact JSON tokenizes hotter than prose, so
 chars/4 undercounts in the unsafe direction for a hard cap.
@@ -26,7 +26,8 @@ CAPS_TOKENS = {
     "context_health": 1000,
     "evidence": 1500,
 }
-# payloads whose top-level content is ranked and must echo weights (SPEC §7)
+# payloads whose top-level content is ranked: they must echo the RULE that
+# produced the order, never an opaque score (SPEC §7)
 RANKING_PAYLOADS = {"struggle_areas"}
 
 FINDING_FIELDS = {"kind", "tier", "exact", "confidence", "idxs"}
@@ -80,10 +81,23 @@ def check_finding(f) -> list[str]:
     return errors
 
 
+def check_overview_top_struggles(payload) -> list[str]:
+    """session_overview embeds ranked entries too, and the same v1 rule
+    applies to them: class and edits, never an opaque score."""
+    errors = []
+    for entry in payload.get("top_struggles", []):
+        if "score" in entry:
+            errors.append("v1 removed the opaque 'score' from top_struggles")
+        for field in ("class", "edits", "breakdown"):
+            if field not in entry:
+                errors.append(f"top_struggles entry missing '{field}'")
+    return errors
+
+
 def check_success(name, payload) -> list[str]:
     errors = []
-    if payload.get("v") != 0:
-        errors.append("missing/wrong schema version 'v' (expected 0)")
+    if payload.get("v") != 1:
+        errors.append("missing/wrong schema version 'v' (expected 1)")
     session = payload.get("session", {})
     if not session.get("id"):
         errors.append("session.id missing")
@@ -92,10 +106,23 @@ def check_success(name, payload) -> list[str]:
     if "truncated" not in payload or not isinstance(payload["truncated"], bool):
         errors.append("missing/non-bool 'truncated' flag")
     if name in RANKING_PAYLOADS:
-        if "weights" not in payload:
-            errors.append("ranking payload must echo 'weights' (SPEC §7, never opaque)")
-        if not any("breakdown" in f for f in payload.get("files", [])):
+        rule = payload.get("ranking_rule")
+        if not (isinstance(rule, str) and rule.strip()):
+            errors.append("ranking payload must echo a non-empty 'ranking_rule'"
+                          " (SPEC §7, never opaque)")
+        if "weights" in payload:
+            errors.append("'weights' was removed in v1; ranking has no weights")
+        files = payload.get("files", [])
+        if not any("breakdown" in f for f in files):
             errors.append("ranking payload must show per-file 'breakdown'")
+        for f in files:
+            if "score" in f:
+                errors.append("v1 removed the opaque per-file 'score'")
+            for field in ("class", "edits"):
+                if field not in f:
+                    errors.append(f"ranked file missing '{field}'")
+    if name == "session_overview":
+        errors += check_overview_top_struggles(payload)
     for f in iter_findings(payload):
         errors += check_finding(f)
     return errors
@@ -103,7 +130,7 @@ def check_success(name, payload) -> list[str]:
 
 def check_error(payload) -> list[str]:
     errors = []
-    if payload.get("v") != 0:
+    if payload.get("v") != 1:
         errors.append("error payload missing 'v'")
     if payload.get("error") != "ambiguous_session":
         errors.append("error must be 'ambiguous_session'")

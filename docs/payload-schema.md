@@ -51,8 +51,8 @@ Every finding-like object (anything with a `kind`) carries:
 | `context_health` | 1000 | `read_never_referenced` sampled, total count always present |
 | `evidence(idxs)` | 1500 | ≤10 actions, excerpts ≤600 chars |
 
-All ranking output shows the per-category `breakdown` and the `weights` used
-(`source: defaults` or the config path) — never an opaque score.
+All ranking output shows the per-category `breakdown` and the `ranking_rule`
+that produced the order. There is no score: see the v1 section below.
 
 These caps are enforced by construction as of 2026-07-25; see the dated
 section at the bottom for the exact shrink order and disclosure fields.
@@ -188,3 +188,26 @@ yet. When they land they must arrive with their own cap and total.
 
 `v` bumps on any breaking shape change; the checker and mock payloads update
 in the same commit (they are the contract test).
+
+## 2026-07-26 BREAKING: `v` goes 0 to 1 (spec 2026-07-26)
+
+The weighted score is gone, so two payloads change shape. Every payload's `v`
+becomes `1`.
+
+| payload | removed | added |
+|---|---|---|
+| `struggle_areas` | `weights` object, per-file `score` | `ranking_rule` string, per-file `class` and `edits` |
+| `session_overview` | `top_struggles[].score` | `top_struggles[].class`, `top_struggles[].edits` |
+
+`class` is one of `code`, `web`, `notes`, `docs`, `config`, `other`. `edits`
+counts Edit and Write attempts against that file.
+
+Why: fitting ranking weights to maximize hits with the outcomes in hand bought
+at most 4 hits out of 39 on the only corpus this has been measured against, and
+the fit assigned maximum weight to edit count anyway. The order is now four
+declared keys a reader can check by hand, and `ranking_rule` ships alongside
+the order so SPEC §7's "never an opaque number" holds more strongly than
+before. Full method and tables in
+`docs/validation/2026-07-22-predictive-validity.md`, and the file-class
+measurement study is forward-referenced at
+`docs/validation/2026-07-26-file-class-measurement.md`.

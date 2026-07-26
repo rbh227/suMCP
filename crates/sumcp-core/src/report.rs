@@ -185,8 +185,8 @@ impl Overview {
 
 /// Gaps between consecutive actions longer than this are counted at the cap
 /// when summing "active" time (a session left open over lunch is not 3h of
-/// work). A documented constant, not a Weights field: it shapes display,
-/// never ranking, so it must not appear in the weights payload echo.
+/// work). A documented constant, not a ranking input: it shapes display,
+/// never the ranking order, so it plays no part in `score::rank`.
 pub const ACTIVE_GAP_CAP_SECS: i64 = 300;
 
 /// Parse an ISO-8601 timestamp ("2026-01-01T10:00:00Z", fractional seconds

@@ -182,7 +182,6 @@ mod tests {
             file: file.into(),
             class: crate::file_class::classify(file),
             edits: 1,
-            score: 1.0,
             breakdown: breakdown.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
             findings: Vec::new(),
         }

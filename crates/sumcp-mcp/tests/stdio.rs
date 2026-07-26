@@ -2,7 +2,7 @@
 //!
 //! Spawns the real `sumcp-mcp` binary (cargo builds it for us and exposes the
 //! path as `CARGO_BIN_EXE_sumcp-mcp`), speaks line-delimited JSON-RPC over its
-//! stdin/stdout — exactly what Claude Code does — and checks the frozen v0
+//! stdin/stdout — exactly what Claude Code does — and checks the v1
 //! contract on real fixture data:
 //!
 //! - handshake works, six tools listed, every one `readOnlyHint: true`;
@@ -215,7 +215,7 @@ fn six_tools_answer_the_frozen_contract_over_stdio() {
     let sid = serde_json::json!({"session_id": SESSION_ID});
     let (overview, err) = rpc.tool("session_overview", sid.clone());
     assert!(!err);
-    assert_eq!(overview["v"], 0);
+    assert_eq!(overview["v"], 1);
     assert_eq!(overview["session"]["identified_by"], "explicit");
     assert!(overview["truncated"].is_boolean());
     cap_ok("session_overview", &overview, 1000);
@@ -225,7 +225,7 @@ fn six_tools_answer_the_frozen_contract_over_stdio() {
         serde_json::json!({"n": 3, "session_id": SESSION_ID}),
     );
     assert!(!err);
-    assert!(struggles["weights"]["source"].is_string(), "weights echoed");
+    assert!(struggles["ranking_rule"].is_string(), "ranking rule echoed");
     cap_ok("struggle_areas", &struggles, 1500);
     let top = &struggles["files"][0];
     let top_file = top["file"].as_str().expect("donor fixture has struggles");
@@ -279,7 +279,7 @@ fn subagent_actions_merge_and_dereference_over_stdio() {
     // --- session_overview: merge succeeded, no missing subagent files ---
     let (overview, err) = rpc.tool("session_overview", sid.clone());
     assert!(!err, "overview must not error: {overview}");
-    assert_eq!(overview["v"], 0);
+    assert_eq!(overview["v"], 1);
     // The one Agent spawn's child transcript was discovered, validated, and
     // merged — so the honesty counter reads zero.
     assert_eq!(

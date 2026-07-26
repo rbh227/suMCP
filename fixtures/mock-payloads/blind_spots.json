@@ -1,4 +1,4 @@
-{"v":0,
+{"v":1,
 "session":{"id":"5717aaaa-1111-2222-3333-444455556666","identified_by":"tool_use_id"},
 "blind_write_attempts":[
  {"kind":"blind_write_attempt","tier":"T1","exact":true,"confidence":"high","idxs":[301],"file":"src/ui/DetailPanel.tsx","error":"File has not been read yet"},
