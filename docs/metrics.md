@@ -37,21 +37,74 @@ and it surfaces separately as an active/suppressed status flag in the
 row of evidence. Review burden is the layer's actual anchor; approval latency
 is a corroborating, and more fragile, secondary signal.
 
-## Ranking stays a transparent weighted count, never a score
+## Ranking is a stated rule, never a score
 
-Only six of the thirteen finding kinds above feed the file ranking that
-`struggle_areas` and `session_overview.top_struggles` return: churn, rework,
-failure loops, re-read, blind-write attempts (category `fumbles`), and action
-loops. Rank is `sum of (config weight x evidence count)` per category, per
-file, always returned as a per-category `breakdown` alongside the `weights`
-used, never collapsed into a single opaque number. It is never based on
-session length. True revert, flip, user corrected, opening move, review
-burden, large-write-instant-accept, and secrets file touched are
-informational: they carry real evidence but do not move a file's rank.
+Files are ordered by four keys, in this order:
 
-The default category weights are editorial, not literature-derived; only
-their relative order (rework and blind-write attempts tied for highest, then
-failure loops, then re-read, then churn lowest; action loops always
-advisory) reflects the research summarized in
-[docs/metrics-spec.md](metrics-spec.md). The decimals themselves are tuning
-knobs, overridable via `~/.config/sumcp/config.toml`.
+1. **edited files before never-edited ones**, because a file with no change has
+   nothing to review;
+2. **file class**, code and web first, then notes, then docs, then config and
+   other;
+3. **edit count**, descending;
+4. **path**, so the order is total and stable.
+
+Every ranked entry carries its `class`, its `edits`, the per-category
+`breakdown` of findings about it, and `ranking_rule`: the rule above as one
+sentence, shipped with the order it produced. There is no score.
+
+**Why there is no score.** Until 2026-07-26 rank was
+`sum of (weight x evidence count)` per category. The 2026-07-22 study found
+that ranking did not beat sorting files by edit count, and a follow-up pass that
+fitted weights to maximize hits *with the outcomes in hand* gained at most 4
+hits out of 39, assigning maximum weight to edit count regardless. A tuned sum
+that cannot beat counting edits even while cheating is not worth its opacity, so
+the sum, the `Weights` type, and its TOML override (ADR A6) were removed.
+
+Findings still do all the explaining. Every kind above keeps its tier, its
+exact-versus-heuristic flag, its confidence, and the action indices that prove
+it. They explain and cite; they no longer vote.
+
+## What each signal did on the measured corpus
+
+From the tune split of the 2026-07-22 study, 552 (session, file) pairs with 39
+strong-recurrence outcomes. These are occurrence counts and outcome rates, not
+weights: nothing here is tuned or fed into the ordering.
+
+| kind | pairs | outcomes | rate |
+|---|---|---|---|
+| churn | 242 | 33 | 0.136 |
+| re_read | 97 | 21 | 0.216 |
+| rework | 94 | 19 | 0.202 |
+| blind_write_attempt | 24 | 0 | 0.000 |
+| failure_loop | 4 | 2 | 0.500 |
+| true_revert | 2 | 1 | 0.500 |
+
+Three things follow, and no more than these:
+
+- **`blind_write_attempt` was weighted joint-highest** on the strength of
+  IDE-Bench's finding that premature editing appears in 63% of failed runs, and
+  on this corpus it fired 24 times with **zero** outcomes. Read that precisely:
+  zero in 24 rules out a large positive effect. It does not establish the signal
+  is harmful, and it does not refute IDE-Bench, whose population is autonomous
+  benchmark trajectories rather than interactive sessions.
+- **`failure_loop` and `true_revert` are too rare here to characterise.** There
+  were 58 confirmed failed commands across the tune sessions, a median of 1 per
+  session. That is a property of this corpus, not of the detectors.
+- **`re_read` had the best rate of the frequent kinds** while being weighted
+  below both `rework` and `fumble`. The literature-derived weight ordering did
+  not reproduce on the only corpus it has been measured against, which is part
+  of why the weights are gone rather than adjusted.
+
+## File class
+
+`class` is a pure function of the path (`sumcp_core::file_class`): `code`,
+`web`, `notes`, `docs`, `config`, or `other`, from a fixed table of extensions
+and path patterns, with no filesystem access.
+
+Only the **code versus docs-and-config** boundary rests on adequate data:
+documentation was 192 of 552 pairs carrying 1 of 39 outcomes, config was 37
+carrying none, code was 285 carrying 34. Every other tier relationship is a
+declared judgment on thin cells: `notes` is 19 pairs with 3 outcomes and shows a
+*higher* rate than code, too thin to promote it, and `web` is 7 pairs grouped
+with code because web files are code-like. Full breakdown and caveats in
+[docs/validation/2026-07-26-file-class-measurement.md](validation/2026-07-26-file-class-measurement.md).
