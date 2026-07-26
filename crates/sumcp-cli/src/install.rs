@@ -1402,10 +1402,16 @@ mod tests {
 
     /// A directory with dummy `sumcp` / `sumcp-mcp` "binaries" to copy. Returns
     /// the guard (keep it alive to keep the dir) plus its path.
+    ///
+    /// The names carry `EXE_SUFFIX`, exactly as the production lookup does. Hard
+    /// coding them cost a red Windows CI run: the installer correctly searched
+    /// for `sumcp.exe` while this helper had written `sumcp`, so eleven install
+    /// tests failed on a fixture mismatch rather than on a real defect.
     fn fake_exe_dir() -> (TempDir, PathBuf) {
         let d = tempdir().unwrap();
-        fs::write(d.path().join("sumcp"), b"#!fake sumcp\n").unwrap();
-        fs::write(d.path().join("sumcp-mcp"), b"#!fake mcp\n").unwrap();
+        let exe = std::env::consts::EXE_SUFFIX;
+        fs::write(d.path().join(format!("sumcp{exe}")), b"#!fake sumcp\n").unwrap();
+        fs::write(d.path().join(format!("sumcp-mcp{exe}")), b"#!fake mcp\n").unwrap();
         let p = d.path().to_path_buf();
         (d, p)
     }
@@ -1723,7 +1729,12 @@ mod tests {
         run_install(&paths, &exe, true).unwrap();
 
         let broken = tempdir().unwrap();
-        fs::write(broken.path().join("sumcp"), b"#!new sumcp\n").unwrap();
+        let exe_sfx = std::env::consts::EXE_SUFFIX;
+        fs::write(
+            broken.path().join(format!("sumcp{exe_sfx}")),
+            b"#!new sumcp\n",
+        )
+        .unwrap();
         // no sumcp-mcp sibling
         assert!(
             run_install(&paths, broken.path(), true).is_err(),
@@ -1775,8 +1786,17 @@ mod tests {
         std::os::unix::fs::symlink(&decoy, paths.settings_json()).unwrap();
 
         let exe2 = tempdir().unwrap();
-        fs::write(exe2.path().join("sumcp"), b"#!new sumcp\n").unwrap();
-        fs::write(exe2.path().join("sumcp-mcp"), b"#!new mcp\n").unwrap();
+        let exe_sfx = std::env::consts::EXE_SUFFIX;
+        fs::write(
+            exe2.path().join(format!("sumcp{exe_sfx}")),
+            b"#!new sumcp\n",
+        )
+        .unwrap();
+        fs::write(
+            exe2.path().join(format!("sumcp-mcp{exe_sfx}")),
+            b"#!new mcp\n",
+        )
+        .unwrap();
         assert!(
             run_install(&paths, exe2.path(), true).is_err(),
             "symlinked settings.json should abort the reinstall"
