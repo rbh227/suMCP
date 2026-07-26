@@ -1437,7 +1437,6 @@ mod tests {
 
         assert!(paths.installed_sumcp().exists());
         assert!(paths.installed_mcp().exists());
-        assert!(paths.hook_script().exists());
         assert!(paths.skill_dest().join("SKILL.md").exists());
         assert!(paths.manifest().exists());
 
@@ -1446,8 +1445,34 @@ mod tests {
             cj["mcpServers"]["sumcp"]["command"].as_str(),
             Some(paths.installed_mcp().to_string_lossy().as_ref())
         );
-        let sj = read_json(&paths.settings_json());
-        assert_eq!(sj["hooks"]["Stop"].as_array().unwrap().len(), 1);
+
+        // The Stop hook is a /bin/sh script, so it is installed on Unix and
+        // deliberately skipped on Windows. Assert the platform's ACTUAL
+        // contract rather than skipping the check there: silently not
+        // installing a hook and silently installing a broken one look
+        // identical to a test that only runs on Unix.
+        #[cfg(unix)]
+        {
+            assert!(paths.hook_script().exists());
+            let sj = read_json(&paths.settings_json());
+            assert_eq!(sj["hooks"]["Stop"].as_array().unwrap().len(), 1);
+        }
+        #[cfg(not(unix))]
+        {
+            assert!(
+                !paths.hook_script().exists(),
+                "no /bin/sh here, so the hook script must not be written"
+            );
+            // settings.json may not exist at all, which is also correct: we
+            // only touch it to register the hook.
+            if paths.settings_json().exists() {
+                let sj = read_json(&paths.settings_json());
+                assert!(
+                    stop_array(sj.as_object().unwrap()).is_none_or(|a| a.is_empty()),
+                    "no Stop hook should be registered on Windows"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1479,10 +1504,27 @@ mod tests {
 
         let sj = read_json(&settings);
         assert_eq!(sj["model"], "opus", "unrelated setting clobbered");
+        // The user arrived with one Stop hook of their own. On Unix ours is
+        // APPENDED beside it; on Windows ours is never registered. Either way
+        // theirs must survive untouched, which is the property that actually
+        // matters here.
+        let stop = sj["hooks"]["Stop"].as_array().unwrap();
+        #[cfg(unix)]
         assert_eq!(
-            sj["hooks"]["Stop"].as_array().unwrap().len(),
+            stop.len(),
             2,
             "our hook should append, not replace the user's"
+        );
+        #[cfg(not(unix))]
+        assert_eq!(
+            stop.len(),
+            1,
+            "no hook is registered on Windows, and the user's must be left alone"
+        );
+        assert!(
+            stop.iter()
+                .any(|g| g["hooks"][0]["command"] == "/usr/bin/true"),
+            "the user's own Stop hook was lost"
         );
         let cj = read_json(&cjp);
         assert!(cj["mcpServers"]["other"].is_object(), "user server lost");
@@ -1511,14 +1553,24 @@ mod tests {
         run_install(&paths, &exe, true).unwrap(); // second time: no-op-ish, still Ok
 
         let sj = read_json(&paths.settings_json());
-        let ours = paths.hook_script().to_string_lossy().to_string();
-        let dupes = sj["hooks"]["Stop"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter(|g| group_has_command(g, &ours))
-            .count();
-        assert_eq!(dupes, 1, "reinstall duplicated the Stop hook");
+        // Reinstalling twice must not register our hook twice. On Windows it is
+        // never registered at all, so there is nothing that could duplicate.
+        #[cfg(unix)]
+        {
+            let ours = paths.hook_script().to_string_lossy().to_string();
+            let dupes = sj["hooks"]["Stop"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|g| g["hooks"][0]["command"] == ours.as_str())
+                .count();
+            assert_eq!(dupes, 1, "reinstall duplicated the Stop hook");
+        }
+        #[cfg(not(unix))]
+        assert!(
+            stop_array(sj.as_object().unwrap()).is_none_or(|a| a.is_empty()),
+            "no hook is registered on Windows, so reinstall cannot duplicate one"
+        );
 
         // User adds their own MCP server AFTER install.
         let cjp = paths.claude_json();
@@ -1754,10 +1806,19 @@ mod tests {
             "server registration lost"
         );
         let sj = read_json(&paths.settings_json());
+        // On Unix the previous install's hook registration must survive the
+        // failed reinstall. On Windows no hook was ever registered, so the
+        // property to check is that the failure did not invent one.
+        #[cfg(unix)]
         assert_eq!(
             sj["hooks"]["Stop"].as_array().unwrap().len(),
             1,
             "hook registration lost"
+        );
+        #[cfg(not(unix))]
+        assert!(
+            stop_array(sj.as_object().unwrap()).is_none_or(|a| a.is_empty()),
+            "a failed reinstall must not register a hook on Windows"
         );
 
         // The surviving install must still uninstall cleanly.
