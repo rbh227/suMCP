@@ -41,6 +41,51 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: cargo package -p sumcp-core -p sumcp-cli -p sumcp-mcp --no-verify --allow-dirty
 
+  # Native Windows. `cargo check` from a Mac proves it compiles; only this job
+  # proves it WORKS, by running the same suite as every other platform. Kept
+  # separate from the `test` matrix because Windows skips two things the others
+  # do not: the symlink security tests (creating a symlink needs elevated
+  # privileges on Windows) and the Stop-hook install (the hook is a /bin/sh
+  # script, so it is never registered there).
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Tests
+        run: cargo test --workspace
+      - name: Payload contract checker
+        run: python3 scripts/check_payloads.py
+      - name: The CLI runs and analyzes a fixture
+        run: |
+          set -euo pipefail
+          cargo build --release -p sumcp-cli
+          bin="./target/release/sumcp.exe"
+          "$bin" --version
+          "$bin" --file fixtures/demo/demo-session.jsonl --json > out.json
+          python3 -c 'import json; d=json.load(open("out.json")); assert d["v"]==1, d["v"]; assert d["top_struggles"], "no ranked files"; print("Windows binary analyzed the fixture:", d["top_struggles"][0]["file"])'
+      - name: install --apply then uninstall --apply round trip
+        run: |
+          set -euo pipefail
+          # Prove the installer works on Windows end to end, in a throwaway HOME
+          # so the runner's real profile is untouched. This is the part most
+          # likely to be wrong: it resolves the home directory, copies a sibling
+          # .exe, and edits Claude Code's JSON config.
+          cargo build --release -p sumcp-cli -p sumcp-mcp
+          export HOME="$(pwd)/fake-home"
+          mkdir -p "$HOME"
+          ./target/release/sumcp.exe install --apply
+          test -f "$HOME/.claude/sumcp/bin/sumcp.exe"
+          test -f "$HOME/.claude/sumcp/bin/sumcp-mcp.exe"
+          grep -q '"sumcp"' "$HOME/.claude.json"
+          ./target/release/sumcp.exe uninstall --apply
+          test ! -f "$HOME/.claude/sumcp/bin/sumcp.exe"
+          echo "install and uninstall round trip clean on Windows"
+
   # The Intel macOS archive is cross-compiled from an arm64 runner, so nothing
   # ever EXECUTED it: a binary that links but crashes on startup would have
   # shipped. Rosetta 2 is present on GitHub's arm64 macOS runners, so

@@ -41,8 +41,25 @@ risk is.
 
 ## Install
 
-**Supported platforms:** macOS (Apple Silicon and Intel) and Linux (x86-64),
-both tested on every push. Windows is not supported and not tested.
+**Supported platforms:** macOS (Apple Silicon and Intel), Linux (x86-64), and
+Windows (x86-64). Every one of them is built AND executed in CI on every push,
+and the full test suite runs on Linux, macOS, and Windows.
+
+Two things differ on Windows, both stated rather than discovered:
+
+- **No end-of-session nudge.** The Stop hook is a `/bin/sh` script, so it is not
+  installed on Windows. Everything else `install` does works: the MCP server is
+  registered and the debrief skill is placed. Run the debrief yourself instead
+  of waiting to be prompted.
+- **Installed files are not permission-restricted.** On Unix the installer
+  chmods what it writes (0700 directories, 0600 data) so another account cannot
+  read your Claude Code config. Windows has no mode bits, and the ACL
+  equivalent would mean a new dependency, so files inherit whatever your user
+  profile directory already grants. That is normally private to you, but it is
+  not explicitly locked down the way the Unix install is.
+
+Running inside WSL is also fine, and is the better option if you want the hook:
+WSL is Linux, so use the Linux archive there.
 
 Every archive contains **both** binaries, `sumcp` and `sumcp-mcp`. `install`
 registers the MCP server by looking for `sumcp-mcp` as a sibling of `sumcp`, so
@@ -61,8 +78,8 @@ Download for your platform from the
 [latest release](https://github.com/rbh227/suMCP/releases/latest):
 
 ```bash
-# macOS, Apple Silicon. Swap the target for x86_64-apple-darwin (Intel Mac)
-# or x86_64-unknown-linux-gnu (Linux).
+# macOS, Apple Silicon. Swap the target for x86_64-apple-darwin (Intel Mac),
+# x86_64-unknown-linux-gnu (Linux), or x86_64-pc-windows-msvc (Windows).
 V=v0.1.0; T=aarch64-apple-darwin
 curl -LO https://github.com/rbh227/suMCP/releases/download/$V/sumcp-$V-$T.tar.gz
 curl -LO https://github.com/rbh227/suMCP/releases/download/$V/sumcp-$V-$T.tar.gz.sha256

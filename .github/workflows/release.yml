@@ -91,7 +91,19 @@ jobs:
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
             native: true
+          # Native Windows. Archive is still .tar.gz rather than .zip: Windows
+          # 10 and later ship `tar`, so one format across every platform keeps
+          # the staging, checksum, and publish steps identical instead of
+          # branching a release path that is hard to test.
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            native: true
     runs-on: ${{ matrix.os }}
+    # bash everywhere, so the shell steps below are identical on all four
+    # platforms. Windows runners ship git-bash, and Windows 10+ ships tar.
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
 
@@ -129,7 +141,9 @@ jobs:
         if: matrix.native
         run: |
           set -euo pipefail
-          bin="./target/${{ matrix.target }}/release/sumcp"
+          exe=""
+          case "${{ matrix.target }}" in *windows*) exe=".exe";; esac
+          bin="./target/${{ matrix.target }}/release/sumcp${exe}"
           # An x86-64 binary built on an arm64 runner has to go through Rosetta.
           # Every other combination here is genuinely native.
           run_bin() {
@@ -139,7 +153,8 @@ jobs:
               "$@"
             fi
           }
-          file "$bin"
+          # `file` is not present on Windows runners.
+          command -v file >/dev/null 2>&1 && file "$bin" || true
           run_bin "$bin" --version
           # Exercise the real analysis path, not just the version string, so a
           # binary that starts but cannot parse a transcript fails here.
@@ -147,8 +162,7 @@ jobs:
           python3 -c 'import json; d=json.load(open("/tmp/smoke.json")); assert d["v"]==1, d["v"]; assert d["top_struggles"], "no ranked files"; print("analyzed the fixture:", d["top_struggles"][0]["file"])'
           # sumcp-mcp is a stdio server with no --version flag, so running it
           # would block on stdin. Prove it exists and is a real executable.
-          test -x "./target/${{ matrix.target }}/release/sumcp-mcp"
-          file "./target/${{ matrix.target }}/release/sumcp-mcp"
+          test -x "./target/${{ matrix.target }}/release/sumcp-mcp${exe}"
 
       # WHAT A USER GETS, recorded rather than assumed. Rust ad-hoc signs macOS
       # binaries at link time, which is enough for them to RUN, but an ad-hoc
@@ -184,10 +198,12 @@ jobs:
           set -euo pipefail
           stage="sumcp-${GITHUB_REF_NAME}-${{ matrix.target }}"
           mkdir -p "dist/${stage}"
-          cp "target/${{ matrix.target }}/release/sumcp" "dist/${stage}/sumcp"
-          cp "target/${{ matrix.target }}/release/sumcp-mcp" "dist/${stage}/sumcp-mcp"
+          exe=""
+          case "${{ matrix.target }}" in *windows*) exe=".exe";; esac
+          cp "target/${{ matrix.target }}/release/sumcp${exe}" "dist/${stage}/sumcp${exe}"
+          cp "target/${{ matrix.target }}/release/sumcp-mcp${exe}" "dist/${stage}/sumcp-mcp${exe}"
           cp README.md LICENSE-MIT LICENSE-APACHE "dist/${stage}/"
-          chmod +x "dist/${stage}/sumcp" "dist/${stage}/sumcp-mcp"
+          chmod +x "dist/${stage}/sumcp${exe}" "dist/${stage}/sumcp-mcp${exe}"
           tar -czf "dist/${stage}.tar.gz" -C dist "${stage}"
           rm -rf "dist/${stage}"
           ls -l dist
