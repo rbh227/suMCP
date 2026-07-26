@@ -1,4 +1,4 @@
-{"v":0,
+{"v":1,
 "session":{"id":"5717aaaa-1111-2222-3333-444455556666","identified_by":"tool_use_id"},
 "actions":[
  {"idx":102,"t":"14:33:40","agent":"main","type":"tool_use","tool":"Edit","file":"src/store/DataStore.ts","excerpt":"old: const cam = new Config(opts) / new: const cam = this.initConfig(opts)"},

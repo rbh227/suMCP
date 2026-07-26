@@ -6,7 +6,7 @@
 
 use crate::model::Session;
 use crate::payloads::SessionMeta;
-use crate::score::{FileScore, Weights};
+use crate::score::FileScore;
 use std::fmt::Write;
 
 /// HTML-escape the five metacharacters. Every dynamic string that reaches the
@@ -43,12 +43,7 @@ fn inline_js() -> &'static str {
 }
 
 /// Render the full self-contained report document.
-pub fn render_html(
-    s: &Session,
-    ranked: &[FileScore],
-    weights: &Weights,
-    meta: &SessionMeta,
-) -> String {
+pub fn render_html(s: &Session, ranked: &[FileScore], meta: &SessionMeta) -> String {
     let all = crate::score::all_findings(s);
     let review = crate::review::needs_review(ranked, &all);
     let o = crate::report::Overview::from_session(s);
@@ -66,7 +61,7 @@ pub fn render_html(
     h.push_str(&facts_strip(&o, s));
     h.push_str(&needs_review_section(&review, &all, ranked, s)); // Task 5
     h.push_str(&timeline_section(s, ranked, &review)); // Task 6
-    h.push_str(&struggles_section(ranked, weights, &review)); // Task 7
+    h.push_str(&struggles_section(ranked, &review)); // Task 7
     h.push_str(&file_stories_section(s, &review, meta)); // Task 8
     h.push_str(&blind_spots_section(s, meta)); // Task 8
     h.push_str(&status_bar(s, &o));
@@ -508,13 +503,9 @@ fn timeline_section(
 }
 
 /// Ranked files: cap 10, plain-language breakdown, top-3 emphasized and
-/// linked to their stories, formula + exact weights footnoted (the
-/// transparency promise in SPEC decision 6).
-fn struggles_section(
-    ranked: &[FileScore],
-    weights: &Weights,
-    review: &[crate::review::ReviewCandidate],
-) -> String {
+/// linked to their stories, the ranking rule footnoted (the transparency
+/// promise in SPEC decision 6).
+fn struggles_section(ranked: &[FileScore], review: &[crate::review::ReviewCandidate]) -> String {
     if ranked.is_empty() {
         return "<section class=\"sec\"><h2>Struggle areas</h2>\
              <p class=\"calm\">No struggle signals fired.</p></section>"
@@ -539,10 +530,11 @@ fn struggles_section(
         let _ = write!(
             rows,
             "<tr{top}><td class=\"r\">{rank}</td><td>{file_cell}</td>\
-             <td class=\"r\">{score:.1}</td><td>{phrases}</td></tr>",
+             <td>{class}</td><td class=\"r\">{edits}</td><td>{phrases}</td></tr>",
             top = if i < 3 { " class=\"top\"" } else { "" },
             rank = i + 1,
-            score = f.score,
+            class = esc(f.class.as_str()),
+            edits = f.edits,
             phrases = esc(&phrases.join(", ")),
         );
     }
@@ -557,23 +549,15 @@ fn struggles_section(
         String::new()
     };
     let footnote = format!(
-        "<p class=\"foot\">score = weight x count, low-confidence x{lcf}, \
-         churn scaled by relative churn when known (x0.5 to x2) · \
-         weights: rewrites {c} · rework {rw} · failure loops {fl} · \
-         re-reads {rr} · blind-writes {fu} · loops {al} ({src})</p>",
-        lcf = weights.low_confidence_factor,
-        c = weights.churn,
-        rw = weights.rework,
-        fl = weights.failure_loop,
-        rr = weights.re_read,
-        fu = weights.fumble,
-        al = weights.action_loop,
-        src = esc(&weights.source),
+        "<p class=\"foot\">ranked by: {rule}. No weighted score: on the only \
+         corpus this has been measured against, no weighting over the \
+         observable signals beat counting edits.</p>",
+        rule = esc(crate::score::RANKING_RULE),
     );
     format!(
         "<section class=\"sec\"><h2>Struggle areas</h2>\
          <table class=\"tbl\"><thead><tr><th>#</th><th>file</th>\
-         <th>score</th><th>signals</th></tr></thead>\
+         <th>class</th><th>edits</th><th>signals</th></tr></thead>\
          <tbody>{rows}</tbody></table>{overflow}{footnote}</section>"
     )
 }
@@ -822,7 +806,12 @@ fn file_stories_section(
         body.push_str(&evidence_details(s, &idxs, meta));
         let why = crate::review::reason_sentence(c);
         let why_line = match c.ranked {
-            Some(fs) => format!("score {:.1} · {}", fs.score, esc(&why)),
+            Some(fs) => format!(
+                "{} · edited {}x · {}",
+                esc(fs.class.as_str()),
+                fs.edits,
+                esc(&why)
+            ),
             None => esc(&why),
         };
         let _ = write!(
@@ -959,7 +948,7 @@ mod tests {
     use crate::ingest::ingest_str;
     use crate::model::Lane;
     use crate::payloads::SessionMeta;
-    use crate::score::{Weights, rank};
+    use crate::score::rank;
 
     fn meta() -> SessionMeta {
         SessionMeta {
@@ -970,9 +959,8 @@ mod tests {
 
     fn render(raw: &str) -> String {
         let s = ingest_str(raw, Lane::Main);
-        let w = Weights::default();
-        let r = rank(&s, &w);
-        render_html(&s, &r, &w, &meta())
+        let r = rank(&s);
+        render_html(&s, &r, &meta())
     }
 
     #[test]
@@ -1223,7 +1211,7 @@ mod tests {
     }
 
     #[test]
-    fn struggle_breakdown_is_plain_language_with_weights_footnote() {
+    fn struggle_breakdown_is_plain_language_with_ranking_rule_footnote() {
         let mut lines = Vec::new();
         for i in 0..6 {
             lines.push(format!(
@@ -1233,15 +1221,7 @@ mod tests {
         let html = render(&lines.join("\n"));
         assert!(html.contains("rewritten 6x"), "plain-language breakdown");
         assert!(!html.contains("re_read"), "no internal jargon in the table");
-        assert!(
-            html.contains("score = weight x count"),
-            "formula footnote present"
-        );
-        assert!(
-            html.contains("relative churn"),
-            "Fix 4: footnote must disclose the churn-scaling clause"
-        );
-        assert!(html.contains("rework 3"), "actual weights echoed");
+        assert!(html.contains(crate::score::RANKING_RULE), "rule echoed");
     }
 
     #[test]

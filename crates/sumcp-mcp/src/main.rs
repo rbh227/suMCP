@@ -10,46 +10,6 @@ mod store;
 
 use rmcp::ServiceExt as _;
 use std::path::PathBuf;
-use sumcp_core::score::Weights;
-
-/// Load the optional weights override (ADR A6): `~/.config/sumcp/config.toml`
-/// (or `$XDG_CONFIG_HOME/sumcp/config.toml`). Missing file → compiled
-/// defaults. A *broken* file also falls back to defaults, but says so on
-/// stderr — a bad config must never take the server down.
-fn load_weights_from(path: Option<PathBuf>) -> Weights {
-    let Some(path) = path else {
-        return Weights::default();
-    };
-    let raw = match std::fs::read_to_string(&path) {
-        Ok(raw) => raw,
-        // No config file at all — the normal, silent case.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Weights::default(),
-        // A config that EXISTS but can't be read (permissions, encoding) is
-        // a broken config, and broken configs must say so — silence here
-        // would be indistinguishable from "no config".
-        Err(e) => {
-            eprintln!(
-                "sumcp-mcp: cannot read {} ({e}); using default weights",
-                path.display()
-            );
-            return Weights::default();
-        }
-    };
-    match toml::from_str::<Weights>(&raw) {
-        Ok(mut w) => {
-            // Transparency guardrail: payloads echo where weights came from.
-            w.source = path.display().to_string();
-            w
-        }
-        Err(e) => {
-            eprintln!(
-                "sumcp-mcp: ignoring malformed {} ({e}); using default weights",
-                path.display()
-            );
-            Weights::default()
-        }
-    }
-}
 
 /// `$XDG_CONFIG_HOME/sumcp/config.toml`, falling back to `~/.config/…`.
 fn config_path() -> Option<PathBuf> {
@@ -62,8 +22,8 @@ fn config_path() -> Option<PathBuf> {
 /// The pure core of [`config_path`] (env-free, so tests can drive it).
 /// Per the XDG spec, an empty or relative `XDG_CONFIG_HOME` is IGNORED —
 /// honoring a relative one would resolve against our cwd, letting a
-/// checked-out repo containing `./sumcp/config.toml` silently override the
-/// user's weights.
+/// checked-out repo containing `./sumcp/config.toml` silently shadow the
+/// real one.
 fn config_path_from(xdg: Option<PathBuf>, home: Option<PathBuf>) -> Option<PathBuf> {
     let base = match xdg {
         Some(p) if p.is_absolute() => p,
@@ -80,6 +40,33 @@ fn claude_home() -> Option<PathBuf> {
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".claude")))
 }
 
+/// Whether a stale `~/.config/sumcp/config.toml` warning should be printed.
+/// Split out from [`warn_if_stale_config`] so the decision is testable
+/// without capturing stderr: given `None` (no `$HOME`/`$XDG_CONFIG_HOME`) or
+/// a path that does not exist, there is nothing stale to warn about.
+///
+/// Known gap, tracked for the whole-branch review rather than fixed here:
+/// `Path::exists` reports `false` on a permission error too, so an unreadable
+/// stale config gets no notice either.
+fn should_warn_stale_config(path: &Option<PathBuf>) -> bool {
+    matches!(path, Some(p) if p.exists())
+}
+
+/// ADR A6 retired (spec 2026-07-26 §2f): ranking has no weights to configure,
+/// so `~/.config/sumcp/config.toml` is no longer read. A user who wrote one is
+/// told rather than silently ignored. The message names no repo-internal
+/// path: a release-binary user has no checkout to read one from.
+fn warn_if_stale_config(path: Option<PathBuf>) {
+    if should_warn_stale_config(&path) {
+        let path = path.expect("should_warn_stale_config only returns true for Some");
+        eprintln!(
+            "sumcp-mcp: {} is no longer read. It used to set ranking weights; \
+             weights were removed, and ranking is now a fixed rule.",
+            path.display()
+        );
+    }
+}
+
 // `current_thread`: one connection over stdio needs no thread pool.
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -91,12 +78,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     };
 
+    warn_if_stale_config(config_path());
     let server = server::SumcpServer {
         // Claude Code launches project-scoped stdio servers with cwd = the
         // project root, so this resolves to the right transcript directory.
         project_dir: sumcp_core::locate::project_dir(&home, &cwd),
         store: store::SessionStore::new(),
-        weights: load_weights_from(config_path()),
     };
 
     // serve() runs the MCP handshake; waiting() parks until the client
@@ -109,24 +96,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn missing_config_yields_defaults() {
-        let w = load_weights_from(Some(PathBuf::from("/nonexistent/config.toml")));
-        assert_eq!(w.source, "defaults");
-    }
-
-    #[test]
-    fn partial_toml_overrides_and_records_source() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
-        std::fs::write(&path, "churn = 9.5\n").unwrap();
-        let w = load_weights_from(Some(path.clone()));
-        assert_eq!(w.churn, 9.5);
-        // Unspecified fields keep their defaults (serde(default) on Weights).
-        assert_eq!(w.rework, sumcp_core::score::Weights::default().rework);
-        assert_eq!(w.source, path.display().to_string());
-    }
 
     #[test]
     fn empty_or_relative_xdg_config_home_is_ignored() {
@@ -151,25 +120,30 @@ mod tests {
     }
 
     #[test]
-    fn unreadable_config_falls_back_to_defaults() {
-        use std::os::unix::fs::PermissionsExt as _;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
-        std::fs::write(&path, "churn = 9.5\n").unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
-        let w = load_weights_from(Some(path.clone()));
-        assert_eq!(w.source, "defaults");
-        // restore so tempdir cleanup can delete it
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-    }
+    fn stale_config_warning_fires_only_when_the_path_exists() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("does-not-exist.toml");
+        assert!(
+            !should_warn_stale_config(&Some(missing.clone())),
+            "a path that does not exist has nothing stale to warn about"
+        );
+        assert!(
+            !should_warn_stale_config(&None),
+            "no config path at all (no $HOME) has nothing to warn about"
+        );
 
-    #[test]
-    fn malformed_toml_falls_back_to_defaults() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
-        std::fs::write(&path, "churn = \"not a number\"").unwrap();
-        let w = load_weights_from(Some(path));
-        assert_eq!(w.source, "defaults");
-        assert_eq!(w.churn, 1.0);
+        let present = dir.path().join("config.toml");
+        std::fs::write(&present, "").expect("write fixture config");
+        assert!(
+            should_warn_stale_config(&Some(present.clone())),
+            "an existing stale config must be flagged"
+        );
+
+        // warn_if_stale_config itself must not panic in any of the three
+        // cases; the printed message goes to stderr, which this test does
+        // not capture, so only "did not panic" is asserted here.
+        warn_if_stale_config(Some(missing));
+        warn_if_stale_config(None);
+        warn_if_stale_config(Some(present));
     }
 }

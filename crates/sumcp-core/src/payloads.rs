@@ -1,4 +1,4 @@
-//! The six MCP tool payloads (T3.5), built to the frozen v0 contract
+//! The six MCP tool payloads (T3.5), built to the v1 contract
 //! (`docs/payload-schema.md`) and enforced by `scripts/check_payloads.py`.
 //!
 //! Compact JSON, hard token caps, `truncated` markers. The tool returns
@@ -7,7 +7,7 @@
 
 use crate::model::{Action, ActionKind, Finding, Idx, Session};
 use crate::report::Overview;
-use crate::score::{FileScore, Weights};
+use crate::score::FileScore;
 use serde_json::{Value, json};
 
 /// Token-cap headroom uses chars/3.5 (compact JSON tokenizes hot).
@@ -233,7 +233,8 @@ pub fn session_overview(s: &Session, ranked: &[FileScore], meta: &SessionMeta) -
         .map(|f| {
             json!({
                 "file": elide_middle(&f.file, PATH_MAX),
-                "score": round1(f.score), "breakdown": f.breakdown
+                "class": f.class, "edits": f.edits,
+                "breakdown": f.breakdown
             })
         })
         .collect();
@@ -270,7 +271,7 @@ pub fn session_overview(s: &Session, ranked: &[FileScore], meta: &SessionMeta) -
             .map(|(t, c)| (t.as_str(), *c))
             .collect();
         json!({
-            "v": 0,
+            "v": 1,
             "session": {
                 "id": id, "identified_by": meta.identified_by,
                 "started": started, "duration_min": duration_min
@@ -323,7 +324,7 @@ pub fn session_overview(s: &Session, ranked: &[FileScore], meta: &SessionMeta) -
     })
 }
 
-/// `struggle_areas(n)` — ranked files with breakdown, weights, findings.
+/// `struggle_areas(n)`: ranked files with breakdown, ranking rule, findings.
 ///
 /// Three caps stack, in the order the schema advertises (tail-first):
 /// `n` is clamped to `STRUGGLE_FILES_MAX`, findings per file are capped and
@@ -332,25 +333,10 @@ pub fn session_overview(s: &Session, ranked: &[FileScore], meta: &SessionMeta) -
 /// files dropped first, and only once a single file is left do its findings
 /// start going. Measured before this existed: `n=99` on an ordinary 12-file
 /// session produced 2827 tokens, and a 200-file session 1.6M.
-pub fn struggle_areas(
-    ranked: &[FileScore],
-    weights: &Weights,
-    meta: &SessionMeta,
-    n: usize,
-) -> Value {
+pub fn struggle_areas(ranked: &[FileScore], meta: &SessionMeta, n: usize) -> Value {
     // `n` arrives straight from an MCP caller and was honored verbatim.
     let n = n.min(STRUGGLE_FILES_MAX);
     let (session, id_cut) = session_block(meta);
-    // `weights.source` is a config PATH, so it is caller-controlled too.
-    let mut weights_json = serde_json::to_value(weights).unwrap_or_else(|_| json!({}));
-    let long_source = weights_json
-        .get("source")
-        .and_then(|v| v.as_str())
-        .filter(|src| would_elide(src, PATH_MAX))
-        .map(|src| elide_middle(src, PATH_MAX));
-    if let Some(src) = long_source.as_deref() {
-        weights_json["source"] = json!(src);
-    }
 
     let build = |files_k: usize, per_file: usize| -> Value {
         let shown = &ranked[..files_k.min(ranked.len())];
@@ -361,7 +347,8 @@ pub fn struggle_areas(
                 let kept = representative_findings(f, per_file);
                 let mut entry = json!({
                     "rank": i + 1, "file": elide_middle(&f.file, PATH_MAX),
-                    "score": round1(f.score), "breakdown": f.breakdown,
+                    "class": f.class, "edits": f.edits,
+                    "breakdown": f.breakdown,
                     "findings": kept.iter().map(|f| compact_finding(f)).collect::<Vec<_>>()
                 });
                 // Same disclosure contract as `file_story`'s `elided` count:
@@ -381,9 +368,9 @@ pub fn struggle_areas(
                 .flat_map(|f| &f.findings)
                 .any(finding_was_capped);
         json!({
-            "v": 0,
+            "v": 1,
             "session": session,
-            "weights": weights_json,
+            "ranking_rule": crate::score::RANKING_RULE,
             "files": files,
             // How many files ranked in total, so a clamped or shrunk list is
             // legible as "20 of 200" rather than looking complete.
@@ -391,7 +378,7 @@ pub fn struggle_areas(
             "n_max": STRUGGLE_FILES_MAX,
             // The cap ACTUALLY applied, which the size loop may have lowered.
             "findings_per_file_cap": per_file,
-            "truncated": content_cut || id_cut || long_source.is_some()
+            "truncated": content_cut || id_cut
         })
     };
 
@@ -456,7 +443,7 @@ pub fn file_story(s: &Session, path: &str, meta: &SessionMeta) -> Value {
             (events.iter().map(|a| render(a)).collect(), Vec::new(), None)
         };
         json!({
-            "v": 0,
+            "v": 1,
             "session": session,
             "file": file,
             "events": head,
@@ -467,7 +454,8 @@ pub fn file_story(s: &Session, path: &str, meta: &SessionMeta) -> Value {
     })
 }
 
-/// `blind_spots()` — blind-write attempts, review burden, approval outliers.
+/// `blind_spots()` — secrets touches, blind-write attempts, review burden,
+/// approval outliers.
 ///
 /// Every matching finding used to be emitted in full with `truncated: false`.
 /// An ordinary 300-edit session measured 3166 tokens against a 1000 budget,
@@ -476,7 +464,7 @@ pub fn file_story(s: &Session, path: &str, meta: &SessionMeta) -> Value {
 /// payload fits, with the true counts kept in `totals`.
 ///
 /// WHY one shared `k` rather than a global budget spent list by list: the
-/// three lists are different KINDS of blind spot, and a session with 2000
+/// four lists are different KINDS of blind spot, and a session with 2000
 /// blind-write attempts would otherwise spend the whole payload on them and
 /// push `review_burden` out entirely. Review burden is the metric this file
 /// promises never to suppress, so crowding it out would break that promise by
@@ -486,6 +474,10 @@ pub fn blind_spots(s: &Session, meta: &SessionMeta) -> Value {
     let all = crate::score::all_findings(s);
     let of_kind =
         |kind: FindingKind| -> Vec<&Finding> { all.iter().filter(|f| f.kind == kind).collect() };
+    // Zero-tolerance: a .env/credentials/key touch, surfaced here rather than
+    // ranked because `file_class` puts Config in the last ranking tier and
+    // burying this would defeat the point (file_class.rs module doc).
+    let secrets = of_kind(FindingKind::SecretsFileTouched);
     let blind = of_kind(FindingKind::BlindWriteAttempt);
     // The comprehension-layer anchor (metrics-spec #27): agent LOC per human
     // turn vs the 200–400 LOC review band. Never suppressed — it is exactly
@@ -493,12 +485,17 @@ pub fn blind_spots(s: &Session, meta: &SessionMeta) -> Value {
     let burden = of_kind(FindingKind::ReviewBurden);
     let outliers = of_kind(FindingKind::LargeWriteInstantAccept);
     let (session, id_cut) = session_block(meta);
-    let findings_cut = blind
+    let findings_cut = secrets
         .iter()
+        .chain(&blind)
         .chain(&burden)
         .chain(&outliers)
         .any(|f| finding_was_capped(f));
-    let longest = blind.len().max(burden.len()).max(outliers.len());
+    let longest = secrets
+        .len()
+        .max(blind.len())
+        .max(burden.len())
+        .max(outliers.len());
     // Start at the full cap even when the lists are shorter, so `list_cap`
     // reports the cap that was in force rather than "however many I had".
     shrink_to_fit(CAP_BLIND, BLIND_LIST_MAX, |k| {
@@ -506,14 +503,16 @@ pub fn blind_spots(s: &Session, meta: &SessionMeta) -> Value {
             v.iter().take(k).map(|f| compact_finding(f)).collect()
         };
         json!({
-            "v": 0,
+            "v": 1,
             "session": session,
+            "secrets_file_touched": list(&secrets),
             "blind_write_attempts": list(&blind),
             "review_burden": list(&burden),
             "approval_outliers": list(&outliers),
             // Full counts, always present: the lists above are a sample, and
             // "2 shown" must never be mistaken for "2 happened".
             "totals": {
+                "secrets_file_touched": secrets.len(),
                 "blind_write_attempts": blind.len(),
                 "review_burden": burden.len(),
                 "approval_outliers": outliers.len()
@@ -547,7 +546,7 @@ pub fn context_health(s: &Session, meta: &SessionMeta) -> Value {
     let (session, id_cut) = session_block(meta);
     shrink_to_fit(CAP_HEALTH, 1, |keep_note| {
         json!({
-            "v": 0,
+            "v": 1,
             "session": session,
             "cache_hit_ratio": o.cache_hit_ratio.map(round2),
             "tokens": {
@@ -617,7 +616,7 @@ pub fn evidence(s: &Session, idxs: &[Idx], meta: &SessionMeta) -> Value {
     let mut dropped_for_cap = false;
     loop {
         let payload = json!({
-            "v": 0,
+            "v": 1,
             "session": session,
             "actions": found,
             "not_found": not_found,
@@ -658,9 +657,6 @@ fn kind_str(k: &ActionKind) -> String {
     }
 }
 
-fn round1(x: f64) -> f64 {
-    (x * 10.0).round() / 10.0
-}
 fn round2(x: f64) -> f64 {
     (x * 100.0).round() / 100.0
 }
@@ -670,7 +666,7 @@ mod tests {
     use super::*;
     use crate::ingest::ingest_str;
     use crate::model::Lane;
-    use crate::score::{Weights, rank};
+    use crate::score::rank;
 
     fn meta() -> SessionMeta {
         SessionMeta {
@@ -687,6 +683,33 @@ mod tests {
             ));
         }
         ingest_str(&lines.join("\n"), Lane::Main)
+    }
+
+    /// One Edit action line, keyed by tool_use id and timestamp.
+    fn edit(id: &str, ts: &str, file: &str) -> String {
+        format!(
+            r#"{{"type":"assistant","timestamp":"{ts}","message":{{"content":[{{"type":"tool_use","id":"{id}","name":"Edit","input":{{"file_path":"{file}","new_string":"x"}}}}]}}}}"#
+        )
+    }
+
+    /// Two same-class files with different edit counts: enough to rank.
+    fn churny_session() -> crate::model::Session {
+        let mut lines = Vec::new();
+        for i in 0..4 {
+            lines.push(edit(
+                &format!("h{i}"),
+                &format!("2026-01-01T00:00:0{i}Z"),
+                "/a/hot.rs",
+            ));
+        }
+        for i in 0..2 {
+            lines.push(edit(
+                &format!("w{i}"),
+                &format!("2026-01-01T00:01:0{i}Z"),
+                "/a/warm.rs",
+            ));
+        }
+        crate::ingest::ingest_str(&lines.join("\n"), crate::model::Lane::Main)
     }
 
     #[test]
@@ -769,19 +792,18 @@ mod tests {
     #[test]
     fn all_payloads_are_valid_json_with_provenance_and_under_cap() {
         let s = busy_session();
-        let w = Weights::default();
-        let r = rank(&s, &w);
+        let r = rank(&s);
         let m = meta();
         let caps = [
             (session_overview(&s, &r, &m), 1000),
-            (struggle_areas(&r, &w, &m, 10), 1500),
+            (struggle_areas(&r, &m, 10), 1500),
             (file_story(&s, "/a.ts", &m), 1500),
             (blind_spots(&s, &m), 1000),
             (context_health(&s, &m), 1000),
             (evidence(&s, &[Idx(0), Idx(1)], &m), 1500),
         ];
         for (payload, cap) in caps {
-            assert_eq!(payload["v"], 0);
+            assert_eq!(payload["v"], 1);
             assert_eq!(payload["session"]["identified_by"], "explicit");
             assert!(
                 payload.get("truncated").is_some(),
@@ -827,12 +849,61 @@ mod tests {
     }
 
     #[test]
-    fn struggle_areas_echoes_weights_and_breakdown() {
-        let s = busy_session();
-        let w = Weights::default();
-        let p = struggle_areas(&rank(&s, &w), &w, &meta(), 5);
-        assert_eq!(p["weights"]["source"], "defaults");
-        assert!(p["files"][0]["breakdown"]["churn"].as_u64().unwrap() >= 2);
+    fn struggle_areas_echoes_the_ranking_rule_and_breakdown() {
+        let s = churny_session();
+        let p = struggle_areas(&rank(&s), &meta(), 5);
+        assert_eq!(p["v"], 1);
+        // SPEC §7: ranking output is never an opaque number. The rule that
+        // produced the order ships with the order.
+        assert_eq!(p["ranking_rule"], crate::score::RANKING_RULE);
+        assert!(p["files"][0]["breakdown"].is_object());
+        assert!(p["files"][0]["class"].is_string());
+        assert!(p["files"][0]["edits"].is_u64());
+        assert!(
+            p["files"][0].get("score").is_none(),
+            "the weighted score is gone, not renamed"
+        );
+        assert!(p.get("weights").is_none(), "weights are gone");
+    }
+
+    /// `check_payloads.py` only requires the mock fixture's `ranking_rule` to
+    /// be non-empty, so editing `score::RANKING_RULE` would leave the fixture
+    /// silently stale with CI green. Pin the two together.
+    #[test]
+    fn mock_fixture_ranking_rule_matches_the_constant() {
+        let path: std::path::PathBuf = [
+            env!("CARGO_MANIFEST_DIR"),
+            "..",
+            "..",
+            "fixtures",
+            "mock-payloads",
+            "struggle_areas.json",
+        ]
+        .iter()
+        .collect();
+        let raw = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let fixture: serde_json::Value =
+            serde_json::from_str(&raw).unwrap_or_else(|e| panic!("parse {}: {e}", path.display()));
+        assert_eq!(
+            fixture["ranking_rule"].as_str().unwrap_or_else(|| {
+                panic!("{} has no string ranking_rule field", path.display())
+            }),
+            crate::score::RANKING_RULE,
+            "the mock fixture's ranking_rule has drifted from score::RANKING_RULE"
+        );
+    }
+
+    #[test]
+    fn session_overview_top_struggles_carry_class_and_edits() {
+        let s = churny_session();
+        let ranked = rank(&s);
+        let p = session_overview(&s, &ranked, &meta());
+        assert_eq!(p["v"], 1);
+        let top = &p["top_struggles"][0];
+        assert!(top["class"].is_string());
+        assert!(top["edits"].is_u64());
+        assert!(top.get("score").is_none());
     }
 
     // ---------------------------------------------------------------------
@@ -870,8 +941,9 @@ mod tests {
             .map(|i| {
                 let file = huge_path(i);
                 FileScore {
+                    class: crate::file_class::classify(&file),
+                    edits: 1,
                     file: file.clone(),
-                    score: 100.0 - i as f64,
                     breakdown: [("churn".to_string(), 500u64), ("rework".to_string(), 90)]
                         .into_iter()
                         .collect(),
@@ -917,11 +989,15 @@ mod tests {
         );
         // 8 ranked files, ordinary short paths, one small finding each.
         let ranked: Vec<FileScore> = (0..8)
-            .map(|i| FileScore {
-                file: format!("/src/f{i}.rs"),
-                score: 10.0 - i as f64,
-                breakdown: [("churn".to_string(), 2u64)].into_iter().collect(),
-                findings: vec![],
+            .map(|i| {
+                let file = format!("/src/f{i}.rs");
+                FileScore {
+                    class: crate::file_class::classify(&file),
+                    edits: 1,
+                    file,
+                    breakdown: [("churn".to_string(), 2u64)].into_iter().collect(),
+                    findings: vec![],
+                }
             })
             .collect();
         let p = session_overview(&s, &ranked, &meta());
@@ -936,8 +1012,7 @@ mod tests {
     #[test]
     fn struggle_areas_clamps_n_and_holds_its_cap() {
         let ranked = adversarial_ranked(200, 40);
-        let w = Weights::default();
-        let p = struggle_areas(&ranked, &w, &meta(), usize::MAX);
+        let p = struggle_areas(&ranked, &meta(), usize::MAX);
         assert!(
             est_tokens(&p) <= 1500,
             "over cap: ~{} tokens",
@@ -968,8 +1043,9 @@ mod tests {
         findings.push(fat_finding(FindingKind::FailureLoop, file, 2));
         findings.push(fat_finding(FindingKind::BlindWriteAttempt, file, 1));
         let ranked = vec![FileScore {
+            class: crate::file_class::classify(file),
+            edits: 6,
             file: file.into(),
-            score: 10.0,
             breakdown: [
                 ("rework".to_string(), 6u64),
                 ("failure_loops".to_string(), 1),
@@ -979,8 +1055,7 @@ mod tests {
             .collect(),
             findings,
         }];
-        let w = Weights::default();
-        let p = struggle_areas(&ranked, &w, &meta(), 5);
+        let p = struggle_areas(&ranked, &meta(), 5);
         let kinds: Vec<&str> = p["files"][0]["findings"]
             .as_array()
             .unwrap()
@@ -1031,6 +1106,15 @@ mod tests {
     }
 
     #[test]
+    fn blind_spots_reports_a_secrets_touch() {
+        let raw = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:01Z","message":{"content":[{"type":"tool_use","id":"r1","name":"Read","input":{"file_path":"/repo/.env"}}]}}"#;
+        let s = crate::ingest::ingest_str(raw, crate::model::Lane::Main);
+        let p = blind_spots(&s, &meta());
+        assert_eq!(p["totals"]["secrets_file_touched"], 1);
+        assert_eq!(p["secrets_file_touched"][0]["kind"], "secrets_file_touched");
+    }
+
+    #[test]
     fn blind_spots_holds_its_cap_with_thousands_of_findings() {
         let s = blind_spot_storm(2000);
         let p = blind_spots(&s, &meta());
@@ -1064,8 +1148,7 @@ mod tests {
         // The one test that covers all six at once: hostile paths, hostile
         // session id, thousands of findings, hundreds of event types.
         let s = blind_spot_storm(1500);
-        let w = Weights::default();
-        let ranked = rank(&s, &w);
+        let ranked = rank(&s);
         let m = SessionMeta {
             id: "z".repeat(8000),
             identified_by: "explicit".into(),
@@ -1073,7 +1156,7 @@ mod tests {
         let path = huge_path(0);
         let caps = [
             (session_overview(&s, &ranked, &m), 1000),
-            (struggle_areas(&ranked, &w, &m, usize::MAX), 1500),
+            (struggle_areas(&ranked, &m, usize::MAX), 1500),
             (file_story(&s, &path, &m), 1500),
             (blind_spots(&s, &m), 1000),
             (context_health(&s, &m), 1000),

@@ -3,7 +3,7 @@
 //! Bare `sumcp` analyzes the most recent session of the current project, so
 //! the first run needs no arguments; `--file <path>` overrides that choice.
 //! Either way it prints the overview + ranked struggle areas, or the
-//! `session_overview` payload (the frozen v0 contract) under `--json`.
+//! `session_overview` payload (the v1 contract) under `--json`.
 
 mod install;
 
@@ -11,7 +11,7 @@ use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use sumcp_core::payloads::{SessionMeta, session_overview};
-use sumcp_core::score::{Weights, rank};
+use sumcp_core::score::rank;
 
 /// Post-session forensics for Claude Code sessions.
 #[derive(Parser)]
@@ -217,7 +217,7 @@ fn main() -> ExitCode {
             }
         };
     let session = assembled.session;
-    let ranked = rank(&session, &Weights::default());
+    let ranked = rank(&session);
     let meta = SessionMeta {
         id: stem_id(&path),
         identified_by: target.identified_by.into(),
@@ -226,7 +226,7 @@ fn main() -> ExitCode {
     if args.html {
         print!(
             "{}",
-            sumcp_core::html::render_html(&session, &ranked, &Weights::default(), &meta)
+            sumcp_core::html::render_html(&session, &ranked, &meta)
         );
         return ExitCode::SUCCESS;
     }
@@ -252,10 +252,11 @@ fn main() -> ExitCode {
                 .map(|(k, v)| format!("{k} {v}"))
                 .collect();
             println!(
-                "{}. {}  (score {:.1}: {})",
+                "{}. {}  ({}, edited {}x: {})",
                 i + 1,
                 f.file,
-                f.score,
+                f.class.as_str(),
+                f.edits,
                 cats.join(", ")
             );
         }

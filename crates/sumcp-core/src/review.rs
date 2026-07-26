@@ -55,6 +55,7 @@ fn is_solo_qualifying(kind: &FindingKind) -> bool {
             | FindingKind::BlindWriteAttempt
             | FindingKind::Flip
             | FindingKind::UserCorrected
+            | FindingKind::SecretsFileTouched
     )
 }
 
@@ -129,6 +130,10 @@ pub fn reason_sentence(c: &ReviewCandidate) -> String {
     let count_of =
         |kind: &FindingKind| c.findings.iter().filter(|f| &f.kind == kind).count() as u64;
 
+    let sec_n = count_of(&FindingKind::SecretsFileTouched);
+    if sec_n > 0 {
+        parts.push("secrets file touched".into());
+    }
     let flip_n = count_of(&FindingKind::Flip);
     if flip_n > 0 {
         parts.push(if flip_n > 1 {
@@ -180,7 +185,8 @@ mod tests {
     fn fs(file: &str, breakdown: &[(&str, u64)]) -> FileScore {
         FileScore {
             file: file.into(),
-            score: 1.0,
+            class: crate::file_class::classify(file),
+            edits: 1,
             breakdown: breakdown.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
             findings: Vec::new(),
         }
@@ -199,6 +205,17 @@ mod tests {
         let picked = needs_review(&ranked, &all);
         assert_eq!(picked.len(), 1);
         assert_eq!(picked[0].file, "/a.rs");
+    }
+
+    #[test]
+    fn a_single_secrets_touch_qualifies_alone() {
+        // Zero-tolerance rule: one occurrence is the whole signal, so it must
+        // not need a second finding to clear the floor.
+        let all = vec![finding(FindingKind::SecretsFileTouched, "/repo/.env")];
+        let picked = needs_review(&[], &all);
+        assert_eq!(picked.len(), 1);
+        assert_eq!(picked[0].file, "/repo/.env");
+        assert!(reason_sentence(&picked[0]).contains("secrets file"));
     }
 
     #[test]

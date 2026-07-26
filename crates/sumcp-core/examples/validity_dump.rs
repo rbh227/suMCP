@@ -1,10 +1,9 @@
 //! Per-session dump for the predictive-validity study (`scripts/validity_sweep.py`).
 //!
 //! Mirrors the CLI's real `--file` pipeline exactly (see `sumcp-cli/src/main.rs`):
-//! `assemble::load_session` (main transcript + subagent merge) →
-//! `score::rank` with `Weights::default()` → `review::needs_review`. Frozen
-//! weights, no tuning: this binary only observes what the product already
-//! computes.
+//! `assemble::load_session` (main transcript + subagent merge) → `score::rank`
+//! → `review::needs_review`. This binary only observes what the product
+//! already computes.
 //!
 //! Usage: `validity_dump <transcript.jsonl>`: prints one JSON object to
 //! stdout. Never panics on a weird transcript: ingest already tolerates parse
@@ -17,7 +16,7 @@ use std::path::PathBuf;
 use sumcp_core::assemble::{MAX_TRANSCRIPT_BYTES, load_session};
 use sumcp_core::model::{Action, ActionKind, Idx};
 use sumcp_core::review::needs_review;
-use sumcp_core::score::{Weights, all_findings, rank};
+use sumcp_core::score::{all_findings, rank};
 
 fn main() -> std::process::ExitCode {
     let mut args = std::env::args_os().skip(1);
@@ -38,7 +37,7 @@ fn main() -> std::process::ExitCode {
     };
     let session = assembled.session;
 
-    let ranked = rank(&session, &Weights::default());
+    let ranked = rank(&session);
     let all = all_findings(&session);
     let review_candidates = needs_review(&ranked, &all);
 

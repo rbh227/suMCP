@@ -1,4 +1,4 @@
-{"v":0,
+{"v":1,
 "error":"ambiguous_session",
 "message":"Could not verify the calling session (own tool_use id not found after bounded retry). Refusing to guess.",
 "candidates":[

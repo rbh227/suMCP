@@ -1,4 +1,4 @@
-# suMCP payload schema v0 (T0.1 — frozen at Checkpoint A)
+# suMCP payload schema v1 (T0.1, frozen at Checkpoint A; bumped 2026-07-26)
 
 The contract for what the six MCP tools return. Canonical examples live in
 `fixtures/mock-payloads/` and are enforced by `scripts/check_payloads.py`
@@ -13,7 +13,7 @@ connected agent narrates.
 
 | field | contents |
 |---|---|
-| `v` | payload schema version, `0` |
+| `v` | payload schema version, `1` |
 | `session.id` | session uuid |
 | `session.identified_by` | **provenance, ADR A4**: `tool_use_id` (verified self-identification), `explicit` (caller passed session_id), or `cli_latest` (CLI-only recency mode). MCP never emits a guess. |
 | `truncated` | `true` whenever any cap trimmed content |
@@ -29,7 +29,8 @@ Every finding-like object (anything with a `kind`) carries:
 - `kind` — churn | rework | failure_loop | re_read (renamed from thrash,
   2026-07-18) | fumble | blind_write_attempt | true_revert | flip |
   user_corrected | write_no_reread | read_unreferenced |
-  large_write_instant_accept | opening_move | action_loop | review_burden
+  large_write_instant_accept | opening_move | action_loop | review_burden |
+  secrets_file_touched (2026-07-26)
 - `tier` — field-reliability tier T1–T3 (metrics-spec parser rules)
 - `exact` — `true` = deterministic count; `false` = heuristic (attribution,
   latency); heuristics also carry a human-readable `note`
@@ -51,8 +52,8 @@ Every finding-like object (anything with a `kind`) carries:
 | `context_health` | 1000 | `read_never_referenced` sampled, total count always present |
 | `evidence(idxs)` | 1500 | ≤10 actions, excerpts ≤600 chars |
 
-All ranking output shows the per-category `breakdown` and the `weights` used
-(`source: defaults` or the config path) — never an opaque score.
+All ranking output shows the per-category `breakdown` and the `ranking_rule`
+that produced the order. There is no score: see the v1 section below.
 
 These caps are enforced by construction as of 2026-07-25; see the dated
 section at the bottom for the exact shrink order and disclosure fields.
@@ -60,7 +61,7 @@ section at the bottom for the exact shrink order and disclosure fields.
 ## Error payload (fail-closed, ADR A4)
 
 ```json
-{"v":0,"error":"ambiguous_session","message":"...","candidates":[{"id":"...","mtime":"...","cwd_match":true}],"hint":"pass session_id"}
+{"v":1,"error":"ambiguous_session","message":"...","candidates":[{"id":"...","mtime":"...","cwd_match":true}],"hint":"pass session_id"}
 ```
 
 Emitted when self-identification cannot verify the caller and no explicit
@@ -188,3 +189,27 @@ yet. When they land they must arrive with their own cap and total.
 
 `v` bumps on any breaking shape change; the checker and mock payloads update
 in the same commit (they are the contract test).
+
+## 2026-07-26 BREAKING: `v` goes 0 to 1 (spec 2026-07-26)
+
+The weighted score is gone, so two payloads change shape. Every payload's `v`
+becomes `1`.
+
+| payload | removed | added |
+|---|---|---|
+| `struggle_areas` | `weights` object, per-file `score` | `ranking_rule` string, per-file `class` and `edits` |
+| `session_overview` | `top_struggles[].score` | `top_struggles[].class`, `top_struggles[].edits` |
+| `blind_spots` | (nothing) | `secrets_file_touched` list plus its `totals` entry: one finding per credentials/key file (`FindingKind::SecretsFileTouched`) the session read, edited, or wrote. Zero-tolerance signal, surfaced here rather than ranked because `file_class` puts `Config` in the last ranking tier and burying a secrets touch there would defeat the point. Shares the same `list_cap` shrink as the other three `blind_spots` lists. |
+
+`class` is one of `code`, `web`, `notes`, `docs`, `config`, `other`. `edits`
+counts Edit and Write attempts against that file.
+
+Why: fitting ranking weights to maximize hits with the outcomes in hand bought
+at most 4 hits out of 39 on the only corpus this has been measured against, and
+the fit assigned maximum weight to edit count anyway. The order is now four
+declared keys a reader can check by hand, and `ranking_rule` ships alongside
+the order so SPEC §7's "never an opaque number" holds more strongly than
+before. Full method and tables in
+`docs/validation/2026-07-22-predictive-validity.md`, and the file-class
+measurement study is forward-referenced at
+`docs/validation/2026-07-26-file-class-measurement.md`.

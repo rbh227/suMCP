@@ -140,9 +140,9 @@ All read-only; all return compact JSON evidence, never narration.
 | Tool | What it returns |
 |------|-----------------|
 | `session_overview` | Totals, token economics, and top-3 struggle files. **Start here.** |
-| `struggle_areas` | Ranked struggle files with a per-category score breakdown, the weights used, and evidence-backed findings. |
+| `struggle_areas` | Ranked struggle files with each file's class, edit count, per-category breakdown, the ranking rule that ordered them, and evidence-backed findings. |
 | `file_story` | Chronological event story for one file (head + tail kept, middle elided). |
-| `blind_spots` | Blind-write attempts, review-burden findings, and large-write-instant-accept outliers, with suppression status for heuristic metrics. |
+| `blind_spots` | Secrets-file touches, blind-write attempts, review-burden findings, and large-write-instant-accept outliers, with suppression status for heuristic metrics. |
 | `context_health` | Cache hit ratio and token economics (informational). |
 | `evidence` | Dereference a finding's `idxs` into the raw actions that prove them (≤10 actions, excerpts ≤600 chars). |
 
@@ -154,12 +154,13 @@ All read-only; all return compact JSON evidence, never narration.
   <img src="docs/assets/diagram-pipeline.svg" alt="session.jsonl to a deterministic Rust parser to a session graph to 6 MCP tools to your agent, cited. No LLM, no network, read-only." width="760">
 </p>
 
-`locate → ingest → model → signals → score → Report`. suMCP parses transcripts
+`locate → ingest → model → signals → rank → Report`. suMCP parses transcripts
 permissively (a bad line never fails a file), merges any subagent transcripts
 into one totally-ordered timeline, then runs pure functions that look for
 edit-shape churn, rework, re-reads, failure loops, reverts, and comprehension
 signals. Every finding carries a **tier**, an **exact-vs-heuristic** flag, a
-**confidence**, and the action indices that prove it. See
+**confidence**, and the action indices that prove it. Findings explain and cite;
+they do not vote on a score. See
 [docs/metrics.md](docs/metrics.md) for the reader-facing catalog, or
 [docs/metrics-spec.md](docs/metrics-spec.md) for the authoritative spec.
 
@@ -179,13 +180,23 @@ next 3 sessions than unflagged edited files.
 and it did not beat them.** Simply sorting files by edit count and taking the
 top 3 scores at least as well on relative risk, precision, and miss rate
 simultaneously. The product's flags turn out to be a strict subset of "edited
-at least twice": `flagged_nr` fires on zero files below that threshold, so the
-weighted score is a refinement of edit count, not an independent signal.
+at least twice": the weighted score was a refinement of edit count, not an
+independent signal.
 
-So the honest claim is narrow: **suMCP surfaces a genuinely predictive signal
-and attaches evidence, an explanation, and a token-cheap payload to it.** That
-is a usability claim, not an accuracy claim, and there is no evidence the
-multi-signal weighting beats counting edits. Single-author corpus, 39 positive
+**So the weighted score was removed rather than retuned.** Ranking is now four
+keys you can check by hand against any report: edited files before never-edited
+ones, then code before documentation and config, then edit count, then path.
+Every ranked entry ships the rule that produced it, so there is no number to
+take on trust. What the old score did instead is documented in
+[docs/validation/2026-07-26-file-class-measurement.md](docs/validation/2026-07-26-file-class-measurement.md):
+on the same 552 file-sessions, documentation was 192 of them and carried 1 of 39
+outcomes, config was 37 and carried none, and code was 285 and carried 34.
+Restricting the queue to code cut flagged files from 65 to 52 for an identical
+hit count, a 20% reduction in false alarms at no cost to recall.
+
+So the honest claim is narrow: **suMCP surfaces a genuinely predictive signal,
+orders it by a rule you can verify, and attaches evidence to every entry.** That
+is a usability claim, not an accuracy claim. Single-author corpus, 39 positive
 outcomes total, so it is also underpowered to claim the baseline is better.
 Method, full comparison tables, confidence intervals, and caveats in
 [docs/validation/2026-07-22-predictive-validity.md](docs/validation/2026-07-22-predictive-validity.md).
@@ -222,6 +233,14 @@ Read these before trusting a ranking:
   suppressed when the session ran under auto-accept.
 - **Single-session only.** No cross-session/project memory yet (a planned v0.2
   direction).
+- **The ranking is a stated rule, not a model.** It orders by file class and
+  edit count, so it inherits their blind spots: a file changed once, carefully
+  and wrongly, ranks low. The weighted score that used to sit here was removed
+  because it did not beat counting edits (see
+  [the measurement note](docs/validation/2026-07-26-file-class-measurement.md)).
+- **File class is a fixed extension table.** A project whose layout it misreads
+  gets ranked accordingly. It is the first thing to check if an ordering looks
+  wrong.
 - **Single-user validation.** v0.1 is validated on the author's own projects,
   not by external users. External validation is the top post-v0.1 item.
 

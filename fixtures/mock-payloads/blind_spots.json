@@ -1,5 +1,6 @@
-{"v":0,
+{"v":1,
 "session":{"id":"5717aaaa-1111-2222-3333-444455556666","identified_by":"tool_use_id"},
+"secrets_file_touched":[],
 "blind_write_attempts":[
  {"kind":"blind_write_attempt","tier":"T1","exact":true,"confidence":"high","idxs":[301],"file":"src/ui/DetailPanel.tsx","error":"File has not been read yet"},
  {"kind":"blind_write_attempt","tier":"T1","exact":true,"confidence":"high","idxs":[344],"file":"src/store/DataStore.ts","error":"File has not been read yet"}],
@@ -9,7 +10,7 @@
  {"kind":"review_burden","tier":"T1","exact":false,"confidence":"medium","idxs":[203,204,207,211],"nums":{"loc":612.0,"band_hi":400.0},"note":"612 lines written before the next human turn — above the 200–400 LOC review band"}],
 "approval_outliers":[
  {"kind":"large_write_instant_accept","tier":"T2","exact":false,"confidence":"medium","idxs":[203,204],"file":"src/App.tsx","write_chars":9814,"latency_s":2.1,"note":"heuristic: Edit/Write only; delta ~= human decision time"}],
-"totals":{"blind_write_attempts":2,"review_burden":1,"approval_outliers":1},
+"totals":{"secrets_file_touched":0,"blind_write_attempts":2,"review_burden":1,"approval_outliers":1},
 "list_cap":8,
 "suppression":{"approval_latency":"active","reason":null,"suppressed_when":"permissionMode grants auto-accept","review_burden":"never suppressed"},
 "truncated":false}

@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use sumcp_core::model::Idx;
 use sumcp_core::payloads::{self, SessionMeta};
-use sumcp_core::score::{Weights, rank};
+use sumcp_core::score::rank;
 
 use crate::identify::{self, IdentifyError, Resolved};
 use crate::store::SessionStore;
@@ -35,14 +35,12 @@ pub const SERVER_KEY: &str = "sumcp";
 const SCAN_ATTEMPTS: u32 = 2;
 const SCAN_RETRY_DELAY: Duration = Duration::from_millis(150);
 
-/// The server: project directory to scan, parsed-session cache, weights.
+/// The server: project directory to scan and parsed-session cache.
 pub struct SumcpServer {
     /// `~/.claude/projects/<dashified-cwd>` for the cwd we were launched in.
     pub project_dir: PathBuf,
     /// Memoized transcript parser (ADR A3).
     pub store: SessionStore,
-    /// Ranking weights — defaults or the user's TOML override (ADR A6).
-    pub weights: Weights,
 }
 
 impl SumcpServer {
@@ -144,11 +142,11 @@ fn identify_error_result(err: IdentifyError) -> CallToolResult {
     let payload = match err {
         IdentifyError::Ambiguous(candidates) => identify::ambiguous_payload(&candidates),
         IdentifyError::InvalidId(raw) => serde_json::json!({
-            "v": 0, "error": "invalid_session_id",
+            "v": 1, "error": "invalid_session_id",
             "message": format!("'{raw}' is not a valid session id (36-char UUID expected)")
         }),
         IdentifyError::NotFound(id) => serde_json::json!({
-            "v": 0, "error": "session_not_found",
+            "v": 1, "error": "session_not_found",
             "message": format!("no transcript for session '{id}' in this project")
         }),
     };
@@ -187,7 +185,7 @@ fn tool(
     )
 }
 
-/// The six tools of the frozen v0 contract (`docs/payload-schema.md`).
+/// The six tools of the v1 contract (`docs/payload-schema.md`).
 fn tool_list() -> Vec<Tool> {
     vec![
         tool(
@@ -198,7 +196,7 @@ fn tool_list() -> Vec<Tool> {
         ),
         tool(
             "struggle_areas",
-            "Ranked struggle files with per-category score breakdown, the weights used, and evidence-backed findings.",
+            "Ranked struggle files with per-category breakdown, the ranking rule used, and evidence-backed findings.",
             serde_json::json!({"n": {"type": "integer", "description": "Max files to return (default 5)."}}),
             &[],
         ),
@@ -297,13 +295,13 @@ impl ServerHandler for SumcpServer {
             id: resolved.id,
             identified_by: resolved.identified_by.into(),
         };
-        let ranked = rank(&session, &self.weights);
+        let ranked = rank(&session);
 
         let payload = match request.name.as_ref() {
             "session_overview" => payloads::session_overview(&session, &ranked, &meta),
             "struggle_areas" => {
                 let n = args.get("n").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
-                payloads::struggle_areas(&ranked, &self.weights, &meta, n)
+                payloads::struggle_areas(&ranked, &meta, n)
             }
             "file_story" => {
                 let path = args.get("path").and_then(|v| v.as_str()).ok_or_else(|| {
@@ -343,7 +341,6 @@ mod tests {
         SumcpServer {
             project_dir: dir.to_path_buf(),
             store: SessionStore::new(),
-            weights: Weights::default(),
         }
     }
 
