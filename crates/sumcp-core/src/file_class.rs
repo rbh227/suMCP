@@ -91,9 +91,13 @@ const CONFIG_EXT: &[&str] = &[
 
 /// Basenames that are secrets outright, matched exactly.
 const SECRET_NAMES: &[&str] = &[".netrc", ".pgpass", "credentials"];
-/// Basename prefixes that mark a secret. `.env` itself is matched exactly by
-/// `is_secrets`; these cover the suffixed and keypair forms.
-const SECRET_PREFIXES: &[&str] = &["id_rsa", "id_ed25519", "id_ecdsa", "id_dsa", "secrets."];
+/// Basename prefixes naming an SSH/PGP keypair's PRIVATE half. `.env` itself
+/// is matched exactly by `is_secrets`; this covers the suffixed and keypair
+/// forms. The public half (`*.pub`) is excluded up front in `is_secrets`,
+/// before this table is ever consulted, so it never needs its own carve-out
+/// here. A doc-like extension (a notes/setup file merely NAMED after a key)
+/// is also exempted where this table is consulted; see `is_secrets`.
+const KEYPAIR_PREFIXES: &[&str] = &["id_rsa", "id_ed25519", "id_ecdsa", "id_dsa"];
 /// Extensions that carry key material.
 const SECRET_EXT: &[&str] = &["pem", "key", "p12", "pfx"];
 
@@ -109,19 +113,43 @@ const SECRET_EXT: &[&str] = &["pem", "key", "p12", "pfx"];
 pub fn is_secrets(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
     let name = lower.rsplit('/').next().unwrap_or(lower.as_str());
+    // Basename extension, empty for an extensionless name like `id_rsa`.
+    // Computed once so every boundary check below reads the same value.
+    let ext = name.rsplit_once('.').map(|(_, e)| e).unwrap_or("");
+
+    // A public key's entire purpose is being shared, so it is never a
+    // secret. Checked FIRST, before any table below, so it also covers any
+    // future key type this file learns about: `whatever.pub` is exempt no
+    // matter what `whatever` would otherwise match.
+    if name.ends_with(".pub") {
+        return false;
+    }
+
     if name == ".env" || name.starts_with(".env.") {
         return true;
     }
     if SECRET_NAMES.contains(&name) {
         return true;
     }
-    if SECRET_PREFIXES.iter().any(|p| name.starts_with(p)) {
+    // A doc-like extension means this is prose ABOUT a key (a setup guide, a
+    // notes file), not the key material itself, so it is exempted the same
+    // way `secrets.` is below. A real key has no extension, and a real
+    // backup uses a non-doc one (`.bak`, `.orig`), so neither is affected.
+    if KEYPAIR_PREFIXES.iter().any(|p| name.starts_with(p)) && !DOCS_EXT.contains(&ext) {
         return true;
     }
-    match name.rsplit_once('.') {
-        Some((_, ext)) => SECRET_EXT.contains(&ext),
-        None => false,
+    // `secrets.` counts ONLY when the extension is not doc-like. This is the
+    // INVERSE of `classify`'s `memory.` rule: there, a doc-like extension is
+    // what makes a `memory.*` file matter (it is prose worth keeping as
+    // notes). Here, a doc-like extension is what makes a `secrets.*` file
+    // NOT matter (it is prose ABOUT secrets, e.g. a `SECRETS.md` runbook,
+    // not a credential). `secrets.json`/`secrets.yaml` still count: their
+    // extension isn't prose, so nothing exempts them.
+    if name.starts_with("secrets.") && !DOCS_EXT.contains(&ext) {
+        return true;
     }
+
+    SECRET_EXT.contains(&ext)
 }
 
 /// Classify a path. Precedence matters and is tested:
@@ -326,5 +354,41 @@ mod tests {
         // ranking: a secrets file keeps the low Config tier.
         assert_eq!(classify("/repo/.env"), FileClass::Config);
         assert_eq!(classify("/repo/certs/server.pem"), FileClass::Config);
+    }
+
+    #[test]
+    fn a_document_about_secrets_is_not_a_secret() {
+        // "secrets." with no boundary caught prose. Note this is the INVERSE
+        // of the memory. rule: a memory file matters when it is prose, a
+        // secrets file matters when it is not.
+        assert!(is_secrets("/repo/secrets.json"));
+        assert!(is_secrets("/repo/secrets.yaml"));
+        assert!(!is_secrets("/repo/SECRETS.md"));
+        assert!(!is_secrets("/repo/docs/secrets.txt"));
+    }
+
+    #[test]
+    fn a_public_key_is_not_a_secret() {
+        // Publishing a .pub file is its whole purpose. Flagging it spends the
+        // reader's attention on a non-event.
+        assert!(is_secrets("/home/u/.ssh/id_rsa"));
+        assert!(!is_secrets("/home/u/.ssh/id_rsa.pub"));
+        assert!(is_secrets("/home/u/.ssh/id_ed25519"));
+        assert!(!is_secrets("/home/u/.ssh/id_ed25519.pub"));
+    }
+
+    #[test]
+    fn a_document_about_a_keypair_is_not_a_secret() {
+        // A third instance of the same unbounded-prefix defect class as
+        // "secrets.": KEYPAIR_PREFIXES matched by `starts_with` with no
+        // extension boundary, so a notes/setup file whose name happens to
+        // start with a key basename was flagged too. Real key files and
+        // their backups (no extension, or a non-doc extension like `.bak`)
+        // still count.
+        assert!(!is_secrets("/repo/docs/id_rsa_notes.md"));
+        assert!(!is_secrets("/repo/id_rsa_setup.txt"));
+        assert!(!is_secrets("/repo/id_dsa_history.md"));
+        assert!(is_secrets("/home/u/.ssh/id_rsa"));
+        assert!(is_secrets("/home/u/.ssh/id_rsa.bak"));
     }
 }
