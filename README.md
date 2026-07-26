@@ -73,8 +73,11 @@ The macOS binaries are not signed or notarized. `curl` downloads are not
 quarantined, but if you download through a browser and Gatekeeper blocks them,
 run `xattr -dr com.apple.quarantine sumcp sumcp-mcp`.
 
-The Linux archive is built on the current Ubuntu runner, so it needs a
-reasonably recent glibc. On older distributions, build from source.
+Two Linux archives are published. `x86_64-unknown-linux-gnu` is the default.
+If it fails with a `GLIBC_2.3x not found` error, which happens on older
+distributions such as Ubuntu 22.04 and Debian 12, use
+`x86_64-unknown-linux-musl` instead: it is statically linked and depends on no
+system libc at all.
 
 ### From source
 

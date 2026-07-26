@@ -68,12 +68,35 @@ jobs:
           - target: x86_64-apple-darwin
             os: macos-latest
             native: false
+          # Linux, dynamically linked against the runner's glibc. Smaller and
+          # the conventional choice, but it inherits a glibc floor from
+          # whatever ubuntu-latest currently is, so it will NOT run on older
+          # distributions (Ubuntu 22.04, Debian 12) that are still widely used.
           - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            native: true
+          # Linux, statically linked against musl. No glibc dependency at all,
+          # so this one binary runs on any x86-64 Linux regardless of age.
+          # This is the archive to recommend when someone reports a
+          # `GLIBC_2.3x not found` error from the gnu build. Kept alongside
+          # rather than replacing gnu: glibc builds can be marginally faster
+          # and are what most users expect by default.
+          - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
             native: true
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+
+      # The musl target links through `cc`, which on a stock Ubuntu runner
+      # cannot produce musl objects. musl-tools supplies musl-gcc. Skipped for
+      # every other target so the macOS jobs do not pay for it.
+      - name: Install musl build tooling
+        if: contains(matrix.target, 'musl')
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
 
       # CI uses dtolnay/rust-toolchain@stable, but `stable` there is a moving
       # branch ref, and release builds should not depend on a floating
@@ -104,6 +127,36 @@ jobs:
           # would block on stdin. Prove it exists and is a real executable.
           test -x "./target/${{ matrix.target }}/release/sumcp-mcp"
           file "./target/${{ matrix.target }}/release/sumcp-mcp"
+
+      # The whole point of the musl archive is that it carries no glibc
+      # dependency. A musl build that silently came out dynamically linked
+      # would still run here and still be published, and would then fail on
+      # exactly the old distributions it exists to serve. Assert staticness
+      # rather than trusting the target name.
+      - name: Assert the musl binaries are statically linked
+        if: contains(matrix.target, 'musl')
+        run: |
+          set -euo pipefail
+          for b in sumcp sumcp-mcp; do
+            path="./target/${{ matrix.target }}/release/${b}"
+            file "$path"
+            # Rust's musl target emits a static-pie (static position
+            # independent executable), which `file` labels "static-pie
+            # linked", not "statically linked". Both are static; accept
+            # either. Matching only the latter rejects every real musl build.
+            if ! file "$path" | grep -qE "statically linked|static-pie linked"; then
+              echo "::error::${b} is not statically linked; the musl archive would inherit a libc dependency"
+              exit 1
+            fi
+            # Belt and braces: a dynamic executable resolves libraries, which
+            # ldd prints as "libfoo.so => /path". No arrows means nothing to
+            # resolve. This catches a build that `file` mislabels.
+            if ldd "$path" 2>&1 | grep -q "=>"; then
+              echo "::error::${b} has dynamic library dependencies:"
+              ldd "$path" || true
+              exit 1
+            fi
+          done
 
       # Layout inside the tarball:
       #   sumcp-<tag>-<target>/{sumcp,sumcp-mcp,README.md,LICENSE-MIT,LICENSE-APACHE}
