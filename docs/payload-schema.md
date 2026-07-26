@@ -29,7 +29,8 @@ Every finding-like object (anything with a `kind`) carries:
 - `kind` — churn | rework | failure_loop | re_read (renamed from thrash,
   2026-07-18) | fumble | blind_write_attempt | true_revert | flip |
   user_corrected | write_no_reread | read_unreferenced |
-  large_write_instant_accept | opening_move | action_loop | review_burden
+  large_write_instant_accept | opening_move | action_loop | review_burden |
+  secrets_file_touched (2026-07-26)
 - `tier` — field-reliability tier T1–T3 (metrics-spec parser rules)
 - `exact` — `true` = deterministic count; `false` = heuristic (attribution,
   latency); heuristics also carry a human-readable `note`
@@ -198,6 +199,7 @@ becomes `1`.
 |---|---|---|
 | `struggle_areas` | `weights` object, per-file `score` | `ranking_rule` string, per-file `class` and `edits` |
 | `session_overview` | `top_struggles[].score` | `top_struggles[].class`, `top_struggles[].edits` |
+| `blind_spots` | (nothing) | `secrets_file_touched` list plus its `totals` entry: one finding per credentials/key file (`FindingKind::SecretsFileTouched`) the session read, edited, or wrote. Zero-tolerance signal, surfaced here rather than ranked because `file_class` puts `Config` in the last ranking tier and burying a secrets touch there would defeat the point. Shares the same `list_cap` shrink as the other three `blind_spots` lists. |
 
 `class` is one of `code`, `web`, `notes`, `docs`, `config`, `other`. `edits`
 counts Edit and Write attempts against that file.

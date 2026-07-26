@@ -89,12 +89,48 @@ const CONFIG_EXT: &[&str] = &[
     "plist",
 ];
 
+/// Basenames that are secrets outright, matched exactly.
+const SECRET_NAMES: &[&str] = &[".netrc", ".pgpass", "credentials"];
+/// Basename prefixes that mark a secret. `.env` itself is matched exactly by
+/// `is_secrets`; these cover the suffixed and keypair forms.
+const SECRET_PREFIXES: &[&str] = &["id_rsa", "id_ed25519", "id_ecdsa", "id_dsa", "secrets."];
+/// Extensions that carry key material.
+const SECRET_EXT: &[&str] = &["pem", "key", "p12", "pfx"];
+
+/// Whether a path names a credentials or key file.
+///
+/// Deliberately NARROW and deny-list shaped: a false positive here puts a file
+/// in the review queue that does not belong there, which trains the reader to
+/// ignore the signal. Extend the tables rather than loosening the matching.
+///
+/// This is the ONLY definition of a secrets path. [`classify`] calls it, so a
+/// path recognized here always classifies as [`FileClass::Config`] and the two
+/// cannot disagree.
+pub fn is_secrets(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    let name = lower.rsplit('/').next().unwrap_or(lower.as_str());
+    if name == ".env" || name.starts_with(".env.") {
+        return true;
+    }
+    if SECRET_NAMES.contains(&name) {
+        return true;
+    }
+    if SECRET_PREFIXES.iter().any(|p| name.starts_with(p)) {
+        return true;
+    }
+    match name.rsplit_once('.') {
+        Some((_, ext)) => SECRET_EXT.contains(&ext),
+        None => false,
+    }
+}
+
 /// Classify a path. Precedence matters and is tested:
 ///
-/// 1. A basename that is exactly `.env` or starts with `.env.` is
-///    [`FileClass::Config`], so `.env.local` and `.env.production` are
-///    caught alongside `.env`, but `.environment.rs` is not: the boundary
-///    stops at the dot, so the extension table still gets a look.
+/// 1. A path that [`is_secrets`] recognizes (`.env` and its suffixed
+///    variants, plus the credentials/key tables) is [`FileClass::Config`],
+///    checked FIRST so it wins over every other rule. `classify` and
+///    `is_secrets` share this one definition of a secrets path, so the two
+///    can never disagree about what counts.
 /// 2. A memory or notes DIRECTORY (a path segment, not merely a prefix of
 ///    one) is [`FileClass::Notes`] regardless of extension, checked BEFORE
 ///    extensions so `memory/helper.rs` is notes even though `.rs` is
@@ -111,7 +147,7 @@ pub fn classify(path: &str) -> FileClass {
     // no directory component still lands here.
     let name = lower.rsplit('/').next().unwrap_or(lower.as_str());
 
-    if name == ".env" || name.starts_with(".env.") {
+    if is_secrets(path) {
         return FileClass::Config;
     }
     // Directory-based notes/memory paths win regardless of extension.
@@ -268,5 +304,27 @@ mod tests {
             let json = serde_json::to_value(c).unwrap();
             assert_eq!(json, serde_json::json!(c.as_str()), "{c:?}");
         }
+    }
+
+    #[test]
+    fn secrets_paths_are_recognized_and_ordinary_config_is_not() {
+        assert!(is_secrets("/repo/.env"));
+        assert!(is_secrets("/repo/.env.production"));
+        assert!(is_secrets("/home/u/.ssh/id_rsa"));
+        assert!(is_secrets("/repo/certs/server.pem"));
+        assert!(is_secrets("/repo/private.key"));
+        assert!(is_secrets("/home/u/.netrc"));
+        // Ordinary config is NOT a secret: it must not trip the blind spot.
+        assert!(!is_secrets("/repo/Cargo.toml"));
+        assert!(!is_secrets("/repo/package.json"));
+        assert!(!is_secrets("/repo/src/main.rs"));
+    }
+
+    #[test]
+    fn secrets_files_still_classify_as_config() {
+        // The blind spot is the instrument for a secrets touch, not the
+        // ranking: a secrets file keeps the low Config tier.
+        assert_eq!(classify("/repo/.env"), FileClass::Config);
+        assert_eq!(classify("/repo/certs/server.pem"), FileClass::Config);
     }
 }

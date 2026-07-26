@@ -40,7 +40,7 @@ KINDS = {
     "churn", "rework", "failure_loop", "re_read", "fumble", "blind_write_attempt",
     "true_revert", "flip", "user_corrected", "write_no_reread",
     "read_unreferenced", "large_write_instant_accept", "opening_move",
-    "action_loop", "review_burden",
+    "action_loop", "review_burden", "secrets_file_touched",
 }
 
 

@@ -55,6 +55,7 @@ pub fn all_findings(s: &Session) -> Vec<Finding> {
     f.extend(signals::failures(s));
     f.extend(signals::dynamics(s));
     f.extend(signals::comprehension(s));
+    f.extend(signals::secrets(s));
     f
 }
 

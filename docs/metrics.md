@@ -25,6 +25,7 @@ that ships in `crates/sumcp-core/src/model.rs` today; nothing here is aspiration
 | Action loop | T1 | Exact (always advisory) | 3+ consecutive byte-identical tool calls (same tool name and same full input hash) within one lane | Always emitted at `confidence: Low` by construction (ranking applies the low-confidence multiplier), because automated loop detectors are known to be false-positive-prone (their own authors abandoned them). Runs are scored per lane so an interleaved subagent call can't break or fabricate a main-lane run. |
 | Review burden | T1 | Heuristic | Agent-written lines (summed `write_lines` from Edit/Write) between two consecutive human turns, flagged when they exceed the 200-400 line human code-review band | This is the comprehension layer's anchor and runs unconditionally, including under auto-accept, because that is exactly when nobody else is gating the writes. Framed strictly as risk ("this volume plausibly could not have been reviewed"), never a verdict that the human didn't read it, since the transcript can't see their editor. Spans files, so per-file detail needs a follow-up `evidence(idxs)` call. |
 | Large-write-instant-accept | T2 | Heuristic | A single main-lane Edit/Write of 2000+ characters whose tool result came back within 3 seconds | A timestamp delta can't distinguish "read it fast" from "auto-accepted" from "stepped away," so this is suppressed **entirely** whenever the session ran under an auto-accept permission mode, rather than reported as a meaningless number (unlike review burden, which is never suppressed). Main-lane only: a subagent write has no human gating it, so the same write on a subagent lane produces no finding. Never reported as exact. |
+| Secrets file touched | T1 | Exact | A credentials or key file (`file_class::is_secrets`: `.env` and its suffixed variants, `.netrc`, `.pgpass`, `credentials`, SSH keypair files, `.pem`/`.key`/`.p12`/`.pfx`) was read, edited, or written | Zero-tolerance by design: the user's rule is that a secrets file should never be touched at all, so one occurrence solo-qualifies a file for review rather than needing a second finding, and it is surfaced through `blind_spots` rather than the ranking (the ranking puts `Config` in the last tier, which would bury exactly this). **No predictive validation**: this kind did not exist when the 2026-07-22/2026-07-26 corpus studies were measured, so unlike every other row above it carries no hit-rate evidence. It is a policy signal, not a measured one. |
 
 ## What "approval latency" is, precisely
 
@@ -38,15 +39,15 @@ is a corroborating, and more fragile, secondary signal.
 
 ## Ranking stays a transparent weighted count, never a score
 
-Only six of the twelve finding kinds above feed the file ranking that
+Only six of the thirteen finding kinds above feed the file ranking that
 `struggle_areas` and `session_overview.top_struggles` return: churn, rework,
 failure loops, re-read, blind-write attempts (category `fumbles`), and action
 loops. Rank is `sum of (config weight x evidence count)` per category, per
 file, always returned as a per-category `breakdown` alongside the `weights`
 used, never collapsed into a single opaque number. It is never based on
 session length. True revert, flip, user corrected, opening move, review
-burden, and large-write-instant-accept are informational: they carry real
-evidence but do not move a file's rank.
+burden, large-write-instant-accept, and secrets file touched are
+informational: they carry real evidence but do not move a file's rank.
 
 The default category weights are editorial, not literature-derived; only
 their relative order (rework and blind-write attempts tied for highest, then

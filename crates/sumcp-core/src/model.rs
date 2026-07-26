@@ -219,6 +219,12 @@ pub enum FindingKind {
     /// human review band (metrics-spec #27, the comprehension-layer anchor).
     /// Frames risk ("plausibly could not have been reviewed"), never verdict.
     ReviewBurden,
+    /// A credentials or key file was read, edited, or written. Zero-tolerance
+    /// by design: one occurrence is the entire signal, so it solo-qualifies
+    /// for review rather than needing a second finding. Surfaced through
+    /// `blind_spots`, not through the ranking, because the ranking puts
+    /// `Config` last and burying this would defeat the point.
+    SecretsFileTouched,
 }
 
 /// One evidence-backed observation about the session.

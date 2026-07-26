@@ -8,8 +8,10 @@ pub mod comprehension;
 pub mod dynamics;
 pub mod edit_shape;
 pub mod failures;
+pub mod secrets;
 
 pub use comprehension::comprehension;
 pub use dynamics::dynamics;
 pub use edit_shape::edit_shape;
 pub use failures::failures;
+pub use secrets::secrets;

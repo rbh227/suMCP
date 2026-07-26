@@ -454,7 +454,8 @@ pub fn file_story(s: &Session, path: &str, meta: &SessionMeta) -> Value {
     })
 }
 
-/// `blind_spots()` — blind-write attempts, review burden, approval outliers.
+/// `blind_spots()` — secrets touches, blind-write attempts, review burden,
+/// approval outliers.
 ///
 /// Every matching finding used to be emitted in full with `truncated: false`.
 /// An ordinary 300-edit session measured 3166 tokens against a 1000 budget,
@@ -463,7 +464,7 @@ pub fn file_story(s: &Session, path: &str, meta: &SessionMeta) -> Value {
 /// payload fits, with the true counts kept in `totals`.
 ///
 /// WHY one shared `k` rather than a global budget spent list by list: the
-/// three lists are different KINDS of blind spot, and a session with 2000
+/// four lists are different KINDS of blind spot, and a session with 2000
 /// blind-write attempts would otherwise spend the whole payload on them and
 /// push `review_burden` out entirely. Review burden is the metric this file
 /// promises never to suppress, so crowding it out would break that promise by
@@ -473,6 +474,10 @@ pub fn blind_spots(s: &Session, meta: &SessionMeta) -> Value {
     let all = crate::score::all_findings(s);
     let of_kind =
         |kind: FindingKind| -> Vec<&Finding> { all.iter().filter(|f| f.kind == kind).collect() };
+    // Zero-tolerance: a .env/credentials/key touch, surfaced here rather than
+    // ranked because `file_class` puts Config in the last ranking tier and
+    // burying this would defeat the point (file_class.rs module doc).
+    let secrets = of_kind(FindingKind::SecretsFileTouched);
     let blind = of_kind(FindingKind::BlindWriteAttempt);
     // The comprehension-layer anchor (metrics-spec #27): agent LOC per human
     // turn vs the 200–400 LOC review band. Never suppressed — it is exactly
@@ -480,12 +485,17 @@ pub fn blind_spots(s: &Session, meta: &SessionMeta) -> Value {
     let burden = of_kind(FindingKind::ReviewBurden);
     let outliers = of_kind(FindingKind::LargeWriteInstantAccept);
     let (session, id_cut) = session_block(meta);
-    let findings_cut = blind
+    let findings_cut = secrets
         .iter()
+        .chain(&blind)
         .chain(&burden)
         .chain(&outliers)
         .any(|f| finding_was_capped(f));
-    let longest = blind.len().max(burden.len()).max(outliers.len());
+    let longest = secrets
+        .len()
+        .max(blind.len())
+        .max(burden.len())
+        .max(outliers.len());
     // Start at the full cap even when the lists are shorter, so `list_cap`
     // reports the cap that was in force rather than "however many I had".
     shrink_to_fit(CAP_BLIND, BLIND_LIST_MAX, |k| {
@@ -495,12 +505,14 @@ pub fn blind_spots(s: &Session, meta: &SessionMeta) -> Value {
         json!({
             "v": 1,
             "session": session,
+            "secrets_file_touched": list(&secrets),
             "blind_write_attempts": list(&blind),
             "review_burden": list(&burden),
             "approval_outliers": list(&outliers),
             // Full counts, always present: the lists above are a sample, and
             // "2 shown" must never be mistaken for "2 happened".
             "totals": {
+                "secrets_file_touched": secrets.len(),
                 "blind_write_attempts": blind.len(),
                 "review_burden": burden.len(),
                 "approval_outliers": outliers.len()
@@ -1091,6 +1103,15 @@ mod tests {
             ));
         }
         ingest_str(&lines.join("\n"), Lane::Main)
+    }
+
+    #[test]
+    fn blind_spots_reports_a_secrets_touch() {
+        let raw = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:01Z","message":{"content":[{"type":"tool_use","id":"r1","name":"Read","input":{"file_path":"/repo/.env"}}]}}"#;
+        let s = crate::ingest::ingest_str(raw, crate::model::Lane::Main);
+        let p = blind_spots(&s, &meta());
+        assert_eq!(p["totals"]["secrets_file_touched"], 1);
+        assert_eq!(p["secrets_file_touched"][0]["kind"], "secrets_file_touched");
     }
 
     #[test]
