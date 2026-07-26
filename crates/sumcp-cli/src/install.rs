@@ -1,4 +1,4 @@
-//! The install / uninstall write path — the ONLY place suMCP writes anything
+//! The install / uninstall write path, the ONLY place suMCP writes anything
 //! outside its own read-only analysis. Everything here honors ADR A8:
 //!
 //! - **Dry-run by default.** `install` and `uninstall` just *print* what they
@@ -39,7 +39,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::fs;
 use std::io::{self, Write};
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -53,7 +52,7 @@ const SERVER_KEY: &str = "sumcp";
 
 /// The debrief skill body, baked into the binary at compile time. Embedding it
 /// (rather than copying from the repo) means `install` works even if the clone
-/// is later deleted — the installed skill is self-contained.
+/// is later deleted: the installed skill is self-contained.
 const SKILL_MD: &str = include_str!("../../../skills/debrief/SKILL.md");
 
 /// The Stop-hook script, also baked in. It shells out to the *installed* sumcp
@@ -90,9 +89,9 @@ case "$last" in ''|*[!0-9]*) last=0;; esac
 [ "$edits" -ge "$((last + THRESHOLD))" ] || exit 0
 printf '%s' "$edits" > "$marker"
 if [ -n "${session:-}" ]; then
-  printf '{"systemMessage":"suMCP: session %s has %s edits — run the debrief skill with session_id=%s to see what actually struggled."}\n' "$session" "$edits" "$session"
+  printf '{"systemMessage":"suMCP: session %s has %s edits, run the debrief skill with session_id=%s to see what actually struggled."}\n' "$session" "$edits" "$session"
 else
-  printf '{"systemMessage":"suMCP: this session had %s edits — run the debrief skill to see what actually struggled."}\n' "$edits"
+  printf '{"systemMessage":"suMCP: this session had %s edits, run the debrief skill to see what actually struggled."}\n' "$edits"
 fi
 exit 0
 "#;
@@ -145,10 +144,12 @@ impl Paths {
         self.claude().join("skills").join("debrief")
     }
     fn installed_sumcp(&self) -> PathBuf {
-        self.bin().join("sumcp")
+        self.bin()
+            .join(format!("sumcp{}", std::env::consts::EXE_SUFFIX))
     }
     fn installed_mcp(&self) -> PathBuf {
-        self.bin().join("sumcp-mcp")
+        self.bin()
+            .join(format!("sumcp-mcp{}", std::env::consts::EXE_SUFFIX))
     }
     fn claude_json(&self) -> PathBuf {
         self.home.join(".claude.json")
@@ -168,7 +169,7 @@ impl Paths {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum Entry {
-    /// A file or directory that did not exist before — remove it on uninstall.
+    /// A file or directory that did not exist before: remove it on uninstall.
     /// For files, `written_hash` records what we wrote (see [`fnv1a64`]) so a
     /// later reinstall can tell our content from a user's edit. `None` for
     /// directories and for manifests written before hashes existed.
@@ -177,7 +178,7 @@ enum Entry {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         written_hash: Option<u64>,
     },
-    /// A file that existed and we replaced wholesale — restore `backup` on
+    /// A file that existed and we replaced wholesale: restore `backup` on
     /// uninstall. `written_hash` as above.
     Replaced {
         path: PathBuf,
@@ -185,7 +186,7 @@ enum Entry {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         written_hash: Option<u64>,
     },
-    /// A nested key we spliced into a shared JSON file — delete just that key
+    /// A nested key we spliced into a shared JSON file: delete just that key
     /// on uninstall. `backup` (if the file pre-existed) is kept on disk as a
     /// recovery artifact but is NOT blindly restored, since the user may have
     /// added other servers/hooks after we installed.
@@ -230,6 +231,29 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
     h
 }
 
+/// Apply Unix permission bits, where the platform has them.
+///
+/// The installer writes Claude Code config and both binaries under the user's
+/// home directory, and on Unix it locks them down (0700 directories, 0600
+/// data) so another account on a shared machine cannot read them.
+///
+/// Windows has no mode bits. The equivalent is an ACL, which would mean a new
+/// dependency for a security property Windows already provides differently: a
+/// user profile directory is not world readable by default the way a
+/// permissive umask can leave a Unix home. So this is a no-op there, and
+/// installed files inherit whatever the parent directory grants rather than
+/// being explicitly restricted.
+#[cfg(unix)]
+fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))
+}
+
+#[cfg(not(unix))]
+fn set_mode(_path: &Path, _mode: u32) -> io::Result<()> {
+    Ok(())
+}
+
 /// Current wall-clock seconds, used to make backup filenames unique-ish.
 fn now_secs() -> u64 {
     SystemTime::now()
@@ -238,7 +262,7 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// Refuse to touch a path whose final component is a symlink — a classic way to
+/// Refuse to touch a path whose final component is a symlink, a classic way to
 /// trick a privileged writer into clobbering a file elsewhere. `symlink_metadata`
 /// does NOT follow the link, so this sees the link itself.
 fn refuse_symlink(path: &Path) -> io::Result<()> {
@@ -247,7 +271,7 @@ fn refuse_symlink(path: &Path) -> io::Result<()> {
             io::ErrorKind::InvalidInput,
             format!("refusing to write through a symlink: {}", path.display()),
         )),
-        _ => Ok(()), // absent, or a real file/dir — both fine
+        _ => Ok(()), // absent, or a real file/dir (both fine)
     }
 }
 
@@ -331,8 +355,16 @@ fn atomic_write(dest: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
     {
         let mut f = fs::File::create(&tmp)?;
         f.write_all(bytes)?;
-        f.set_permissions(fs::Permissions::from_mode(mode))?;
         f.sync_all()?;
+    }
+    // Set the mode by path once the file is closed, rather than on the open
+    // `File` handle: that lets this share `set_mode` with `ensure_dir` below
+    // instead of needing a second helper for the open-file case. It still
+    // happens strictly before the rename, so the file is never briefly
+    // world-readable at its final path.
+    if let Err(e) = set_mode(&tmp, mode) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
     }
     // Rename over the destination. On failure, don't leave the temp behind.
     if let Err(e) = fs::rename(&tmp, dest) {
@@ -413,7 +445,7 @@ impl<'a> Journal<'a> {
         if self.apply {
             fs::create_dir_all(dir)?;
             for d in missing {
-                fs::set_permissions(&d, fs::Permissions::from_mode(0o700))?;
+                set_mode(&d, 0o700)?;
                 self.entries.push(Entry::Created {
                     path: d,
                     written_hash: None,
@@ -924,8 +956,8 @@ fn run_install(paths: &Paths, exe_dir: &Path, apply: bool) -> io::Result<Vec<Str
         // 0. Read and validate everything fallible BEFORE the first write, so
         //    the common failure modes (missing sibling binary, corrupt or
         //    odd-shaped config JSON) abort with zero changes on disk.
-        let src_sumcp = exe_dir.join("sumcp");
-        let src_mcp = exe_dir.join("sumcp-mcp");
+        let src_sumcp = exe_dir.join(format!("sumcp{}", std::env::consts::EXE_SUFFIX));
+        let src_mcp = exe_dir.join(format!("sumcp-mcp{}", std::env::consts::EXE_SUFFIX));
         let sumcp_bytes = fs::read(&src_sumcp).map_err(|e| {
             io::Error::new(e.kind(), format!("reading {}: {e}", src_sumcp.display()))
         })?;
@@ -936,18 +968,28 @@ fn run_install(paths: &Paths, exe_dir: &Path, apply: bool) -> io::Result<Vec<Str
         let sj = read_json_object(&paths.settings_json())?;
         validate_hooks_shape(&sj, &paths.settings_json())?;
 
-        // 1. Our own tree.
+        // 1. Our own tree. The hooks dir only matters on Unix (step 3 below),
+        //    so Windows never creates it: there is nothing to put in it there.
         j.ensure_dir(&paths.bin())?;
-        j.ensure_dir(&paths.hooks())?;
+        if cfg!(unix) {
+            j.ensure_dir(&paths.hooks())?;
+        }
 
         // 2. Place the two binaries read above.
         j.place_file(&paths.installed_sumcp(), &sumcp_bytes, 0o700)?;
         j.place_file(&paths.installed_mcp(), &mcp_bytes, 0o700)?;
 
-        // 3. The Stop-hook script, with the installed sumcp path substituted in.
-        let script =
-            HOOK_TEMPLATE.replace("__SUMCP_BIN__", &paths.installed_sumcp().to_string_lossy());
-        j.place_file(&paths.hook_script(), script.as_bytes(), 0o700)?;
+        // 3. The Stop-hook script, with the installed sumcp path substituted
+        //    in. It is a `/bin/sh` script (see HOOK_TEMPLATE), and native
+        //    Windows has no `/bin/sh` to run it, so installing it there would
+        //    register a hook that can never fire. Skip it outright rather
+        //    than write a script nothing will ever execute; `cmd_install`
+        //    prints a one-line notice explaining the gap.
+        if cfg!(unix) {
+            let script =
+                HOOK_TEMPLATE.replace("__SUMCP_BIN__", &paths.installed_sumcp().to_string_lossy());
+            j.place_file(&paths.hook_script(), script.as_bytes(), 0o700)?;
+        }
 
         // 4. The debrief skill (embedded).
         j.ensure_dir(&paths.skill_dest())?;
@@ -965,8 +1007,11 @@ fn run_install(paths: &Paths, exe_dir: &Path, apply: bool) -> io::Result<Vec<Str
         )?;
 
         // 6. Register the Stop hook (user scope) in ~/.claude/settings.json.
-        //    Appended (not replaced) so existing Stop hooks survive.
-        j.append_stop_hook(&paths.settings_json(), &paths.hook_script())?;
+        //    Appended (not replaced) so existing Stop hooks survive. Skipped
+        //    on Windows along with step 3: there is no script to point it at.
+        if cfg!(unix) {
+            j.append_stop_hook(&paths.settings_json(), &paths.hook_script())?;
+        }
 
         // 7. The manifest, written last so it reflects everything above, but
         //    still inside this fallible block: if the write fails, the error
@@ -1102,7 +1147,7 @@ fn run_uninstall(paths: &Paths, apply: bool) -> io::Result<Vec<String>> {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
             format!(
-                "no manifest at {} — nothing installed (or installed by hand)",
+                "no manifest at {}, nothing installed (or installed by hand)",
                 manifest_path.display()
             ),
         ));
@@ -1215,6 +1260,13 @@ pub fn cmd_install(apply: bool) -> io::Result<()> {
     let dir = exe_dir()?;
     let lines = run_install(&paths, &dir, apply)?;
     print_plan("install", apply, &lines);
+    if cfg!(windows) {
+        println!(
+            "sumcp install: the MCP server and debrief skill are installed, but the \
+             automatic end-of-session nudge (the Stop hook) is not available on \
+             Windows (no /bin/sh to run it); run the debrief skill manually instead."
+        );
+    }
     Ok(())
 }
 
@@ -1232,7 +1284,7 @@ fn print_plan(verb: &str, apply: bool, lines: &[String]) {
     if apply {
         println!("sumcp {verb}: applied {} step(s):", lines.len());
     } else {
-        println!("sumcp {verb} (dry-run — nothing written). Would do:");
+        println!("sumcp {verb} (dry-run, nothing written). Would do:");
     }
     for line in lines {
         println!("  {line}");
@@ -1515,6 +1567,11 @@ mod tests {
         );
     }
 
+    // Creating a symlink needs elevated privileges on Windows, so this test
+    // cannot run there. The protection it exercises (refuse to write through
+    // a symlink) is NOT Unix-only; it applies on every platform, this is just
+    // the only way we have to plant one in a test.
+    #[cfg(unix)]
     #[test]
     fn symlinked_skill_dir_target_is_refused() {
         let home = temp_home();
@@ -1537,6 +1594,8 @@ mod tests {
         assert!(!paths.sumcp().exists(), "not rolled back");
     }
 
+    // Same reason as above: symlink creation requires privileges on Windows.
+    #[cfg(unix)]
     #[test]
     fn symlinked_skills_parent_is_refused() {
         let home = temp_home();
@@ -1558,6 +1617,9 @@ mod tests {
         assert!(!paths.sumcp().exists(), "not rolled back");
     }
 
+    // Same reason: this sabotages settings.json with a symlink, which needs
+    // privileges to create on Windows.
+    #[cfg(unix)]
     #[test]
     fn partial_failure_rolls_back() {
         let home = temp_home();
@@ -1692,6 +1754,9 @@ mod tests {
         assert!(!paths.sumcp().exists());
     }
 
+    // Same reason: sabotages settings.json with a symlink mid-reinstall,
+    // which needs privileges to create on Windows.
+    #[cfg(unix)]
     #[test]
     fn failed_reinstall_midway_preserves_previous_install() {
         // Failure AFTER the reinstall already replaced files: rollback must

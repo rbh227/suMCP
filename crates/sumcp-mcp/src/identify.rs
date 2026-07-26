@@ -269,6 +269,11 @@ mod tests {
         assert!(recent_candidates(dir.path()).is_empty());
     }
 
+    // Creating a symlink needs elevated privileges on Windows, so this test
+    // cannot run there. The ADR A9 protection it exercises is NOT Unix-only;
+    // it applies on every platform, this is just the only way we have to
+    // plant a symlink in a test.
+    #[cfg(unix)]
     #[test]
     fn symlinked_transcript_escaping_the_project_dir_is_rejected() {
         let root = tempfile::tempdir().unwrap();

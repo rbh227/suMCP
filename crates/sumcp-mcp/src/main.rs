@@ -15,7 +15,7 @@ use std::path::PathBuf;
 fn config_path() -> Option<PathBuf> {
     config_path_from(
         std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
-        std::env::var_os("HOME").map(PathBuf::from),
+        sumcp_core::home_dir(),
     )
 }
 
@@ -33,11 +33,13 @@ fn config_path_from(xdg: Option<PathBuf>, home: Option<PathBuf>) -> Option<PathB
 }
 
 /// `~/.claude`, overridable via `SUMCP_CLAUDE_HOME` (tests point this at a
-/// fixture tree; there is no other reason to set it).
+/// fixture tree; there is no other reason to set it). Falls back through
+/// `sumcp_core::home_dir` (`$HOME`, then `%USERPROFILE%` on Windows) only
+/// when `SUMCP_CLAUDE_HOME` is unset; the override still wins outright.
 fn claude_home() -> Option<PathBuf> {
     std::env::var_os("SUMCP_CLAUDE_HOME")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".claude")))
+        .or_else(|| sumcp_core::home_dir().map(|h| h.join(".claude")))
 }
 
 /// Whether a stale `~/.config/sumcp/config.toml` warning should be printed.

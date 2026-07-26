@@ -125,7 +125,7 @@ fn stem_id(path: &Path) -> String {
 fn claude_home() -> Option<PathBuf> {
     claude_home_from(
         std::env::var_os("SUMCP_CLAUDE_HOME").map(PathBuf::from),
-        std::env::var_os("HOME").map(PathBuf::from),
+        sumcp_core::home_dir(),
     )
 }
 

@@ -239,6 +239,11 @@ mod tests {
         assert_eq!(newest_transcript(&td.path().join("never-used")), None);
     }
 
+    // Creating a symlink needs elevated privileges on Windows, so this test
+    // cannot run there. The ADR A9(1) protection it exercises is NOT
+    // Unix-only; `is_within`'s resolve-then-prefix-check applies on every
+    // platform, this is just the only way we have to plant one in a test.
+    #[cfg(unix)]
     #[test]
     fn newest_transcript_skips_a_symlink_escaping_the_project_dir() {
         // ADR A9(1): a planted `<uuid>.jsonl → ~/.ssh/id_rsa` symlink must not
