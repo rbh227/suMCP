@@ -854,6 +854,34 @@ mod tests {
         assert!(p.get("weights").is_none(), "weights are gone");
     }
 
+    /// `check_payloads.py` only requires the mock fixture's `ranking_rule` to
+    /// be non-empty, so editing `score::RANKING_RULE` would leave the fixture
+    /// silently stale with CI green. Pin the two together.
+    #[test]
+    fn mock_fixture_ranking_rule_matches_the_constant() {
+        let path: std::path::PathBuf = [
+            env!("CARGO_MANIFEST_DIR"),
+            "..",
+            "..",
+            "fixtures",
+            "mock-payloads",
+            "struggle_areas.json",
+        ]
+        .iter()
+        .collect();
+        let raw = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let fixture: serde_json::Value =
+            serde_json::from_str(&raw).unwrap_or_else(|e| panic!("parse {}: {e}", path.display()));
+        assert_eq!(
+            fixture["ranking_rule"].as_str().unwrap_or_else(|| {
+                panic!("{} has no string ranking_rule field", path.display())
+            }),
+            crate::score::RANKING_RULE,
+            "the mock fixture's ranking_rule has drifted from score::RANKING_RULE"
+        );
+    }
+
     #[test]
     fn session_overview_top_struggles_carry_class_and_edits() {
         let s = churny_session();

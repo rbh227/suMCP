@@ -8,7 +8,7 @@ hand-reviewed output of `scripts/sanitize.py` is committed here.
 |---|---|---|
 | `session-2_1_210-subagents.jsonl` | sanitized donor, Claude Code 2.1.210 | 1682 lines; a **mid-session harness upgrade** (2.1.207→2.1.210); event types `permission-mode` + `queue-operation` (unknown-type counters); **337 untimestamped lines** and **89 identical-timestamp collisions** (ordering contract, amendment 5); streaming `message.id` duplicates (usage dedup); 12 subagent spawns referenced via `toolUseResult.agentId`; 14 MB largest-fixture cap/timing target |
 | `edge-cases.jsonl` | hand-built | a non-JSON line (counted, never fatal); a duplicate `uuid`+`message.id` replay line (action dedup); an unknown nested type; an untimestamped `permission-mode`; a normal read→result→edit chain |
-| `mock-payloads/*.json` | hand-built from example-app gate-1 findings | the six tool payloads + the fail-closed `ambiguous_session` error; the frozen v0 contract (see `docs/payload-schema.md`), enforced by `scripts/check_payloads.py` |
+| `mock-payloads/*.json` | hand-built from example-app gate-1 findings | the six tool payloads + the fail-closed `ambiguous_session` error; the frozen v1 contract (see `docs/payload-schema.md`), enforced by `scripts/check_payloads.py` |
 | `mock-payloads/sample-debrief.md` | live debrief (T0.2) | the <500-token narration contract, enforced by `scripts/check_debrief.py` |
 
 ## Regenerating a fixture

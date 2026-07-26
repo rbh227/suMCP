@@ -1,4 +1,4 @@
-# suMCP payload schema v0 (T0.1 — frozen at Checkpoint A)
+# suMCP payload schema v1 (T0.1, frozen at Checkpoint A; bumped 2026-07-26)
 
 The contract for what the six MCP tools return. Canonical examples live in
 `fixtures/mock-payloads/` and are enforced by `scripts/check_payloads.py`
@@ -13,7 +13,7 @@ connected agent narrates.
 
 | field | contents |
 |---|---|
-| `v` | payload schema version, `0` |
+| `v` | payload schema version, `1` |
 | `session.id` | session uuid |
 | `session.identified_by` | **provenance, ADR A4**: `tool_use_id` (verified self-identification), `explicit` (caller passed session_id), or `cli_latest` (CLI-only recency mode). MCP never emits a guess. |
 | `truncated` | `true` whenever any cap trimmed content |
@@ -60,7 +60,7 @@ section at the bottom for the exact shrink order and disclosure fields.
 ## Error payload (fail-closed, ADR A4)
 
 ```json
-{"v":0,"error":"ambiguous_session","message":"...","candidates":[{"id":"...","mtime":"...","cwd_match":true}],"hint":"pass session_id"}
+{"v":1,"error":"ambiguous_session","message":"...","candidates":[{"id":"...","mtime":"...","cwd_match":true}],"hint":"pass session_id"}
 ```
 
 Emitted when self-identification cannot verify the caller and no explicit

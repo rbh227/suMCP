@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
 """Predictive-validity sweep (dev-only, like sanitize.py; python3 stdlib only).
 
-Question: do files suMCP flags in session N predict rework in later sessions
-of the SAME project, on this machine's own corpus? Weights are frozen at
-`Weights::default()` everywhere; this is a no-tuning pass by design (any
-future tuning must predict-then-check on held-out projects, never on the
-corpus that produced the tuning).
+NOTE (2026-07-26): the weighted score this script measures was removed the
+same day, in favour of the four-key ordering rule in
+`crates/sumcp-core/src/score.rs`. Everything below, and the report this
+script generates, describes the product AS IT EXISTED on 2026-07-22; see
+`docs/validation/2026-07-22-predictive-validity.md` for the dated record.
+
+Question: did files suMCP flagged in session N predict rework in later
+sessions of the SAME project, on this machine's own corpus? Weights were
+frozen at `Weights::default()` everywhere; this was a no-tuning pass by
+design (any future tuning must predict-then-check on held-out projects,
+never on the corpus that produced the tuning).
 
 Pipeline:
   1. Discover main transcripts under ~/.claude/projects/*/*.jsonl.
@@ -124,7 +130,7 @@ RULES = PRODUCT_RULES + BASELINE_RULES
 
 RULE_LABEL = {
     "flagged_nr": "PRODUCT flagged_nr (review::needs_review)",
-    "flagged_top3": "PRODUCT flagged_top3 (weighted score::rank top-3)",
+    "flagged_top3": "PRODUCT flagged_top3 (weighted score::rank top-3, as measured 2026-07-22)",
     "base_edits_ge2": "baseline edits >= 2",
     "base_edits_ge4": "baseline edits >= 4",
     "base_top3_edits": "baseline top-3 by edit count",
@@ -136,8 +142,8 @@ RULE_LABEL = {
 }
 
 RULE_BASIS = {
-    "flagged_nr": "product rule, frozen Weights::default()",
-    "flagged_top3": "product rule, frozen Weights::default()",
+    "flagged_nr": "product rule as measured 2026-07-22, frozen Weights::default() (weighted score removed 2026-07-26)",
+    "flagged_top3": "product rule as measured 2026-07-22, frozen Weights::default() (weighted score removed 2026-07-26)",
     "base_edits_ge2": (
         "lower boundary of this script's pre-existing edit_stratum() buckets "
         "('1' vs '2-3'), which predate this comparison; also equals the "
@@ -1086,7 +1092,10 @@ def render_draft(
 ) -> str:
     """`pairs`/`metrics` are the TUNE SPLIT only; `held_out_ids` is reported
     so the reader knows what was withheld rather than inferring it."""
-    flag_label = {"flagged_nr": "flagged_nr (review::needs_review)", "flagged_top3": "flagged_top3 (score::rank top-3)"}
+    flag_label = {
+        "flagged_nr": "flagged_nr (review::needs_review)",
+        "flagged_top3": "flagged_top3 (score::rank top-3, as measured 2026-07-22)",
+    }
     window_label = {"next3": "next 3 sessions", "within14d": "within 14 days"}
     outcome_label = {"weak": "weak (any future edit)", "strong": "strong (struggle recurrence)"}
 
@@ -1098,6 +1107,12 @@ def render_draft(
     lines.append("predict-then-check rule: parameters would be set on one subset of")
     lines.append("projects and re-run, unchanged, on the held-out remainder, never")
     lines.append("fit and reported on the same data.")
+    lines.append("")
+    lines.append("This report is a dated record of the product AS IT EXISTED on")
+    lines.append("2026-07-22. The weighted score it measures was removed on 2026-07-26")
+    lines.append("in favour of a stated four-key ordering rule (see")
+    lines.append("`crates/sumcp-core/src/score.rs`); read every present-tense claim")
+    lines.append("below as describing that snapshot, not the current product.")
     lines.append("")
     lines.append("Scope: every number in this report is computed on the TUNE SPLIT only.")
     lines.append("Held-out projects contribute nothing to any table here, and their")
@@ -1122,7 +1137,8 @@ def render_draft(
     lines.append("Two flag definitions from the same session-N analysis are compared against")
     lines.append("both outcomes: flagged_nr (the file qualified for review::needs_review in")
     lines.append("session N) and flagged_top3 (the file was in the top 3 of score::rank in")
-    lines.append("session N). Weights are Weights::default() throughout; nothing is tuned.")
+    lines.append("session N). Weights were Weights::default() throughout, as they existed")
+    lines.append("at measurement time; nothing was tuned.")
     lines.append("")
     lines.append("Sessions with fewer than 20 actions, and the transcript modified in the")
     lines.append("last 10 minutes at run time (the in-progress session), are excluded from")
@@ -1205,9 +1221,10 @@ def render_draft(
     lines.append("- Projects and sessions with fewer than 20 actions are excluded from the")
     lines.append("  corpus outright, including as window members for other sessions; this")
     lines.append("  is a scope choice, not a null result about short sessions.")
-    lines.append("- This is a frozen-weights, no-tuning pass. It measures whether the")
-    lines.append("  existing default weighting is doing anything predictive at all, not")
-    lines.append("  whether it is the best possible weighting.")
+    lines.append("- This was a frozen-weights, no-tuning pass, measuring the weighted")
+    lines.append("  ranking as it existed on 2026-07-22 (removed 2026-07-26). It measured")
+    lines.append("  whether that default weighting was doing anything predictive at all,")
+    lines.append("  not whether it was the best possible weighting.")
     lines.append("- The baseline comparison is descriptive. No rule is fitted, so nothing")
     lines.append("  here is corrected for multiple comparisons; the RR intervals are")
     lines.append("  marginal 95% intervals for each row read on its own, and the rows are")

@@ -124,22 +124,9 @@ pub fn rank(s: &Session) -> Vec<FileScore> {
             }
         })
         .collect();
-    // The ranking rule, in full. Four keys, each one checkable by hand
-    // against the rendered report (spec 2026-07-26 §2b):
-    //   1. edited files before never-edited ones, because a file with no
-    //      change has nothing to review;
-    //   2. class tier, because documentation and config churn does not
-    //      predict recurrence (see file_class's module doc);
-    //   3. edit count, descending;
-    //   4. path, so the order is total and stable.
-    // Deliberately NOT a weighted sum. The 2026-07-22 predictive-validity
-    // study found the weighted ranking did not beat sorting files by edit
-    // count on the author's own corpus, and the weighting's own flags fire on
-    // zero files below 2 edits, making the score a refinement of edit count
-    // rather than an independent signal. See
-    // docs/validation/2026-07-22-predictive-validity.md, and
-    // docs/validation/2026-07-26-file-class-measurement.md for why class
-    // ranks above edit count.
+    // Four keys, in the order RANKING_RULE and the module doc declare. Class
+    // outranks edit count because documentation/config churn does not
+    // predict recurrence (file_class's module doc; studies cited there and above).
     scores.sort_by(|a, b| {
         (a.edits == 0)
             .cmp(&(b.edits == 0))
@@ -330,5 +317,32 @@ mod tests {
         let s = ingest_str(&raw, Lane::Main);
         let ranked = rank(&s);
         assert_eq!(ranked[0].edits, 3, "Write counts toward edits");
+    }
+
+    /// A file that was never edited but carries an advisory ActionLoop
+    /// finding still enters the ranking (`ranked_category` scores
+    /// `ActionLoop`). This is the coverage the deleted
+    /// `action_loop_contributes_at_half_weight` test used to carry: not the
+    /// removed half-weight arithmetic, but the fact of entry itself.
+    #[test]
+    fn action_loop_only_file_still_enters_the_ranking() {
+        let read = |id: &str, ts: &str| {
+            format!(
+                r#"{{"type":"assistant","timestamp":"{ts}","message":{{"content":[{{"type":"tool_use","id":"{id}","name":"Read","input":{{"file_path":"/a/loop.rs"}}}}]}}}}"#
+            )
+        };
+        let lines: Vec<String> = (0..3)
+            .map(|i| read(&format!("r{i}"), &format!("2026-01-01T00:00:0{i}Z")))
+            .collect();
+        let s = ingest_str(&lines.join("\n"), Lane::Main);
+        let ranked = rank(&s);
+        assert_eq!(
+            ranked.len(),
+            1,
+            "the action-loop-only file still enters the ranking"
+        );
+        assert_eq!(ranked[0].file, "/a/loop.rs");
+        assert_eq!(ranked[0].edits, 0, "never edited");
+        assert!(ranked[0].breakdown.contains_key("action_loops"));
     }
 }

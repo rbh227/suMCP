@@ -40,16 +40,28 @@ fn claude_home() -> Option<PathBuf> {
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".claude")))
 }
 
+/// Whether a stale `~/.config/sumcp/config.toml` warning should be printed.
+/// Split out from [`warn_if_stale_config`] so the decision is testable
+/// without capturing stderr: given `None` (no `$HOME`/`$XDG_CONFIG_HOME`) or
+/// a path that does not exist, there is nothing stale to warn about.
+///
+/// Known gap, tracked for the whole-branch review rather than fixed here:
+/// `Path::exists` reports `false` on a permission error too, so an unreadable
+/// stale config gets no notice either.
+fn should_warn_stale_config(path: &Option<PathBuf>) -> bool {
+    matches!(path, Some(p) if p.exists())
+}
+
 /// ADR A6 retired (spec 2026-07-26 §2f): ranking has no weights to configure,
 /// so `~/.config/sumcp/config.toml` is no longer read. A user who wrote one is
-/// told rather than silently ignored.
+/// told rather than silently ignored. The message names no repo-internal
+/// path: a release-binary user has no checkout to read one from.
 fn warn_if_stale_config(path: Option<PathBuf>) {
-    if let Some(path) = path
-        && path.exists()
-    {
+    if should_warn_stale_config(&path) {
+        let path = path.expect("should_warn_stale_config only returns true for Some");
         eprintln!(
-            "sumcp-mcp: {} is no longer read (ranking weights were removed; \
-             see docs/validation/2026-07-26-file-class-measurement.md)",
+            "sumcp-mcp: {} is no longer read. It used to set ranking weights; \
+             weights were removed, and ranking is now a fixed rule.",
             path.display()
         );
     }
@@ -105,5 +117,33 @@ mod tests {
         );
         // No XDG, no HOME → no path at all.
         assert_eq!(config_path_from(None, None), None);
+    }
+
+    #[test]
+    fn stale_config_warning_fires_only_when_the_path_exists() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("does-not-exist.toml");
+        assert!(
+            !should_warn_stale_config(&Some(missing.clone())),
+            "a path that does not exist has nothing stale to warn about"
+        );
+        assert!(
+            !should_warn_stale_config(&None),
+            "no config path at all (no $HOME) has nothing to warn about"
+        );
+
+        let present = dir.path().join("config.toml");
+        std::fs::write(&present, "").expect("write fixture config");
+        assert!(
+            should_warn_stale_config(&Some(present.clone())),
+            "an existing stale config must be flagged"
+        );
+
+        // warn_if_stale_config itself must not panic in any of the three
+        // cases; the printed message goes to stderr, which this test does
+        // not capture, so only "did not panic" is asserted here.
+        warn_if_stale_config(Some(missing));
+        warn_if_stale_config(None);
+        warn_if_stale_config(Some(present));
     }
 }

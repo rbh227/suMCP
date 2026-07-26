@@ -52,7 +52,7 @@ Legend: [H] high value, [D] differentiating (no existing tool computes it), [P] 
 
 ### B. Edit & churn
 6. Files touched, edit/write counts (baseline).
-7. [H] Churn: repeat edits per file AND per region (group by `file_path` + `old_string` overlap) — coherence-collapse signature. *(2026-07-18)* carries a `relative_churn` field (churned lines / last-known file size from the most recent full Read, heuristic [P]) used for within-category weighting; raw count is the fallback when no denominator is known.
+7. [H] Churn: repeat edits per file AND per region (group by `file_path` + `old_string` overlap), coherence-collapse signature. *(2026-07-18)* carries a `relative_churn` field (churned lines / last-known file size from the most recent full Read, heuristic [P]) used for within-category weighting; raw count is the fallback when no denominator is known. *(2026-07-26)* the weighted ranking this fed was removed; `relative_churn` is still computed and reported, it just no longer feeds a weighted score (see "Why these default weights" below).
 8. [H] Blind write: Edit/MultiEdit with no prior Read of that file — premature-editing, top failure mode.
 9. [H] Read-before-edit share + opening-move classification — strongest validated predictors. *(2026-07-18, per interactive caveat)* computed **per task segment** (segments start at each substantive non-meta user message; only segments with ≥5 tool actions are classified), confidence Medium, leading user message cited as evidence so the narrating agent can overrule. Reports the paper's numeric forms as fields: edit-fraction of the segment's first 10 actions, and first-edit index. Session-level roll-up = share of patch-first segments.
 10. [H] Large single-shot writes (size from tool input, no prior read/iteration).
@@ -93,24 +93,33 @@ True git reverts/commits/PRs (need git); tests passing in CI; whether the human 
 3. Comprehension layer (headline features): 4, 15, 16, 17.
 4. Cross-session (25, 26) once Reports persist to SQLite.
 
-## Why these default weights (2026-07-18)
+## Why these default weights (2026-07-18, superseded 2026-07-26)
+
+**Superseded (2026-07-26).** The weighted score this section explains was
+removed. Ranking is now a fixed four-key rule (edited files first, then
+file-class tier, then edit count descending, then path; see
+`crates/sumcp-core/src/score.rs`), and payloads echo `ranking_rule` instead of
+weights. The reasoning below is kept as a dated record of why the weights
+were ordered the way they were, not as a description of the current
+mechanism.
 
 No study provides per-file struggle-category weights; the ρ values are
 session-level correlations from different papers and are not commensurable.
-Default weights are therefore **editorial by construction** — only their rank
-ORDER is research-derived:
+Default weights were therefore **editorial by construction**; only their
+rank ORDER was research-derived:
 
 - `rework` (re-patch/coherence-collapse) and `fumble` (blind-write attempts ≈
-  premature editing) rank highest: dominant failure themes (39.7% of
+  premature editing) ranked highest: dominant failure themes (39.7% of
   edit-quality failures; 63% of failed runs respectively).
 - `failure_loop` next: validation-linked, directly attributed.
 - `thrash` (re-reads) lower: our own corpus observation, no external validation.
 - `churn` lowest among scored: fires constantly, mostly benign iteration;
-  `relative_churn` refines it when a denominator is known.
+  `relative_churn` refined it when a denominator was known.
 - action loops (#21): advisory, always ×`low_confidence_factor`.
 
-The exact decimals are tuning knobs, not findings. Payloads echo the weights
-used and their source; never present them as derived from the literature.
+The exact decimals were tuning knobs, not findings. Payloads echoed the
+weights used and their source at the time; they now echo `ranking_rule`
+instead.
 
 ## Guardrails
 - Every metric labeled: tier (T1-3) and exact vs heuristic.

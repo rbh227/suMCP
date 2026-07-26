@@ -255,7 +255,7 @@ fn main() -> ExitCode {
                 "{}. {}  ({}, edited {}x: {})",
                 i + 1,
                 f.file,
-                format!("{:?}", f.class).to_lowercase(),
+                f.class.as_str(),
                 f.edits,
                 cats.join(", ")
             );

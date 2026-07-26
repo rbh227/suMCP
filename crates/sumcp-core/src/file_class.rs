@@ -49,6 +49,21 @@ impl FileClass {
             FileClass::Config | FileClass::Other => 3,
         }
     }
+
+    /// The class name as it appears in payloads and reports. One definition,
+    /// so the JSON serialization and every rendered surface cannot diverge:
+    /// `Debug` formatting would print `WebAsset` where serde prints
+    /// `web_asset`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FileClass::Code => "code",
+            FileClass::Web => "web",
+            FileClass::Notes => "notes",
+            FileClass::Docs => "docs",
+            FileClass::Config => "config",
+            FileClass::Other => "other",
+        }
+    }
 }
 
 const CODE_EXT: &[&str] = &[
@@ -238,5 +253,20 @@ mod tests {
         assert_eq!(j, serde_json::json!("code"));
         let j = serde_json::to_value(FileClass::Other).unwrap();
         assert_eq!(j, serde_json::json!("other"));
+    }
+
+    #[test]
+    fn as_str_matches_the_serde_name_for_every_variant() {
+        for c in [
+            FileClass::Code,
+            FileClass::Web,
+            FileClass::Notes,
+            FileClass::Docs,
+            FileClass::Config,
+            FileClass::Other,
+        ] {
+            let json = serde_json::to_value(c).unwrap();
+            assert_eq!(json, serde_json::json!(c.as_str()), "{c:?}");
+        }
     }
 }

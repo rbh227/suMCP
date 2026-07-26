@@ -533,7 +533,7 @@ fn struggles_section(ranked: &[FileScore], review: &[crate::review::ReviewCandid
              <td>{class}</td><td class=\"r\">{edits}</td><td>{phrases}</td></tr>",
             top = if i < 3 { " class=\"top\"" } else { "" },
             rank = i + 1,
-            class = esc(&format!("{:?}", f.class).to_lowercase()),
+            class = esc(f.class.as_str()),
             edits = f.edits,
             phrases = esc(&phrases.join(", ")),
         );
@@ -808,7 +808,7 @@ fn file_stories_section(
         let why_line = match c.ranked {
             Some(fs) => format!(
                 "{} · edited {}x · {}",
-                esc(&format!("{:?}", fs.class).to_lowercase()),
+                esc(fs.class.as_str()),
                 fs.edits,
                 esc(&why)
             ),

@@ -2,7 +2,7 @@
 //!
 //! Spawns the real `sumcp-mcp` binary (cargo builds it for us and exposes the
 //! path as `CARGO_BIN_EXE_sumcp-mcp`), speaks line-delimited JSON-RPC over its
-//! stdin/stdout — exactly what Claude Code does — and checks the v1
+//! stdin/stdout (exactly what Claude Code does) and checks the v1
 //! contract on real fixture data:
 //!
 //! - handshake works, six tools listed, every one `readOnlyHint: true`;
