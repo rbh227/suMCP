@@ -17,6 +17,24 @@
 //! with code because web files are code-like, not because 7 pairs measured
 //! anything. Read the tier order as a declared judgment on thin data
 //! everywhere except that one boundary.
+//!
+//! **Prefix matching is the one construct that has produced false
+//! positives.** Every defect found in this file across two review passes was
+//! the same shape: an unbounded `starts_with` match with no extension
+//! boundary, catching a doc, a note, or a script merely NAMED after the
+//! thing the prefix identifies (`SECRETS.md`, `id_rsa_notes.md`,
+//! `id_rsa_rotate.sh`). Exact-basename tables ([`SECRET_NAMES`]) and
+//! extension-only tables ([`SECRET_EXT`], [`CODE_EXT`], [`DOCS_EXT`], ...)
+//! have no such history: equality is already bounded, nothing to add. Every
+//! remaining prefix rule therefore carries its own extension-shaped
+//! boundary, stated at the point it is checked: [`is_secrets`]'s keypair
+//! prefixes require NO extension (a private key is always bare); its
+//! `secrets.` prefix requires an extension that is NOT doc-like
+//! (`secrets.json` is a real credential, `SECRETS.md` is prose about one);
+//! [`classify`]'s `memory.` prefix requires the OPPOSITE, an extension that
+//! IS doc-like (a memory file matters when it is prose, not when it is
+//! code). Three prefix rules, three boundaries, each pointing the direction
+//! that rule's own false positive came from.
 
 use serde::Serialize;
 
@@ -89,16 +107,20 @@ const CONFIG_EXT: &[&str] = &[
     "plist",
 ];
 
-/// Basenames that are secrets outright, matched exactly.
+/// Basenames that are secrets outright, matched exactly. An exact-equality
+/// table has no unbounded-prefix problem: nothing to bound further.
 const SECRET_NAMES: &[&str] = &[".netrc", ".pgpass", "credentials"];
-/// Basename prefixes naming an SSH/PGP keypair's PRIVATE half. `.env` itself
-/// is matched exactly by `is_secrets`; this covers the suffixed and keypair
-/// forms. The public half (`*.pub`) is excluded up front in `is_secrets`,
-/// before this table is ever consulted, so it never needs its own carve-out
-/// here. A doc-like extension (a notes/setup file merely NAMED after a key)
-/// is also exempted where this table is consulted; see `is_secrets`.
+/// Basename prefixes naming an SSH/PGP keypair's PRIVATE half: `id_rsa`,
+/// `id_ed25519`, `id_ecdsa`, `id_dsa`, and hand-named variants like
+/// `id_rsa_backup`. A private key is always extensionless, so `is_secrets`
+/// counts a prefix match here ONLY when the basename has no extension at
+/// all. Anything with one is something else, not a special case to carve
+/// out but a direct reading of the same rule: `id_rsa.pub` is the public
+/// half, `id_rsa_rotate.sh` is a script, `id_rsa_notes.md` is a note,
+/// `id_ed25519_setup.py` is a config generator. None of those are secrets.
 const KEYPAIR_PREFIXES: &[&str] = &["id_rsa", "id_ed25519", "id_ecdsa", "id_dsa"];
-/// Extensions that carry key material.
+/// Extensions that carry key material. An extension-equality table has no
+/// unbounded-prefix problem either: nothing to bound further.
 const SECRET_EXT: &[&str] = &["pem", "key", "p12", "pfx"];
 
 /// Whether a path names a credentials or key file.
@@ -110,6 +132,13 @@ const SECRET_EXT: &[&str] = &["pem", "key", "p12", "pfx"];
 /// This is the ONLY definition of a secrets path. [`classify`] calls it, so a
 /// path recognized here always classifies as [`FileClass::Config`] and the two
 /// cannot disagree.
+///
+/// The two prefix rules below (module doc has the full history) each carry
+/// their own, opposite, extension-shaped boundary: [`KEYPAIR_PREFIXES`]
+/// counts a match only with NO extension; `secrets.` counts a match only
+/// with an extension that is NOT doc-like. `.env`/[`SECRET_NAMES`]/
+/// [`SECRET_EXT`] are exact-name or extension-only matches and need no such
+/// boundary.
 pub fn is_secrets(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
     let name = lower.rsplit('/').next().unwrap_or(lower.as_str());
@@ -117,34 +146,30 @@ pub fn is_secrets(path: &str) -> bool {
     // Computed once so every boundary check below reads the same value.
     let ext = name.rsplit_once('.').map(|(_, e)| e).unwrap_or("");
 
-    // A public key's entire purpose is being shared, so it is never a
-    // secret. Checked FIRST, before any table below, so it also covers any
-    // future key type this file learns about: `whatever.pub` is exempt no
-    // matter what `whatever` would otherwise match.
-    if name.ends_with(".pub") {
-        return false;
-    }
-
     if name == ".env" || name.starts_with(".env.") {
         return true;
     }
     if SECRET_NAMES.contains(&name) {
         return true;
     }
-    // A doc-like extension means this is prose ABOUT a key (a setup guide, a
-    // notes file), not the key material itself, so it is exempted the same
-    // way `secrets.` is below. A real key has no extension, and a real
-    // backup uses a non-doc one (`.bak`, `.orig`), so neither is affected.
-    if KEYPAIR_PREFIXES.iter().any(|p| name.starts_with(p)) && !DOCS_EXT.contains(&ext) {
+    // Keypair boundary: NO extension. A private key is always bare, so
+    // anything with an extension is something else, whatever it is named:
+    // `id_rsa.pub` (the public half), `id_rsa_rotate.sh` (a script),
+    // `id_rsa_notes.md` (a note), `id_ed25519_setup.py` (a config
+    // generator). This single boundary covers all of them; `.pub` needs no
+    // extra carve-out because it is just one more extension.
+    if KEYPAIR_PREFIXES.iter().any(|p| name.starts_with(p)) && ext.is_empty() {
         return true;
     }
-    // `secrets.` counts ONLY when the extension is not doc-like. This is the
-    // INVERSE of `classify`'s `memory.` rule: there, a doc-like extension is
-    // what makes a `memory.*` file matter (it is prose worth keeping as
-    // notes). Here, a doc-like extension is what makes a `secrets.*` file
-    // NOT matter (it is prose ABOUT secrets, e.g. a `SECRETS.md` runbook,
-    // not a credential). `secrets.json`/`secrets.yaml` still count: their
-    // extension isn't prose, so nothing exempts them.
+    // `secrets.` boundary: an extension that is NOT doc-like. The opposite
+    // shape from the keypair rule above, because a structured secrets file
+    // needs SOME extension to exist at all (`secrets.json`, `secrets.yaml`
+    // are real credential files), while a doc-like one (`SECRETS.md`,
+    // `secrets.txt`) is prose ABOUT secrets, not a credential. Also the
+    // inverse of `classify`'s `memory.` rule: there, a doc-like extension
+    // is what makes a `memory.*` file matter (prose worth keeping as
+    // notes); here, a doc-like extension is what makes a `secrets.*` file
+    // NOT matter.
     if name.starts_with("secrets.") && !DOCS_EXT.contains(&ext) {
         return true;
     }
@@ -382,13 +407,30 @@ mod tests {
         // A third instance of the same unbounded-prefix defect class as
         // "secrets.": KEYPAIR_PREFIXES matched by `starts_with` with no
         // extension boundary, so a notes/setup file whose name happens to
-        // start with a key basename was flagged too. Real key files and
-        // their backups (no extension, or a non-doc extension like `.bak`)
-        // still count.
+        // start with a key basename was flagged too.
+        //
+        // Superseded boundary: this test originally also asserted that
+        // `id_rsa.bak` (a real backup) still counted, on the theory that
+        // only a DOC-LIKE extension should exempt a match. The next wave
+        // closed the class harder: a private key is always extensionless,
+        // full stop, so ANY extension (including `.bak`) now exempts a
+        // keypair-prefixed name. See `a_script_named_after_a_key_is_not_a_key`.
         assert!(!is_secrets("/repo/docs/id_rsa_notes.md"));
         assert!(!is_secrets("/repo/id_rsa_setup.txt"));
         assert!(!is_secrets("/repo/id_dsa_history.md"));
         assert!(is_secrets("/home/u/.ssh/id_rsa"));
-        assert!(is_secrets("/home/u/.ssh/id_rsa.bak"));
+        assert!(!is_secrets("/home/u/.ssh/id_rsa.bak"));
+    }
+
+    #[test]
+    fn a_script_named_after_a_key_is_not_a_key() {
+        // Private keys are extensionless. Anything with an extension that
+        // merely starts with a key name is a script, a note, or a config.
+        assert!(is_secrets("/home/u/.ssh/id_rsa"));
+        assert!(is_secrets("/home/u/.ssh/id_rsa_backup"));
+        assert!(!is_secrets("/repo/scripts/id_rsa_rotate.sh"));
+        assert!(!is_secrets("/repo/id_ed25519_setup.py"));
+        assert!(!is_secrets("/repo/docs/id_rsa_notes.md"));
+        assert!(!is_secrets("/home/u/.ssh/id_rsa.pub"));
     }
 }
