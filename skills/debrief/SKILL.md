@@ -45,8 +45,8 @@ record. Never answer from memory what the tools can answer from evidence.
 3. …
 
 **Blind spots for you:**
-- <blind-write attempts / review burden (LOC per human turn) / approval
-  outliers — the three `blind_spots` categories — each with [idx]>
+- <secrets-file touches / blind-write attempts / review burden (LOC per human
+  turn) / approval outliers, the four `blind_spots` categories, each with [idx]>
 
 **One takeaway:** <single most useful action for the developer, one sentence>
 ```
@@ -55,7 +55,13 @@ record. Never answer from memory what the tools can answer from evidence.
 
 - Every claim carries its `[idx]` citation so the developer can drill in with
   `evidence([...])`. A claim you cannot cite does not go in the debrief.
-- Report the breakdown numbers (`churn 24, rework 9…`), not the opaque score.
+- Report the breakdown numbers (`churn 24, rework 9…`). There is no score to
+  report: ranking is a stated rule, echoed as `ranking_rule`, and each ranked
+  file carries its `class` and `edits`.
+- If `blind_spots.secrets_file_touched` is non-empty, LEAD with it. A read or
+  write of a credentials or key file is the most important thing the debrief can
+  say, and unlike the other categories one occurrence is enough. Name the file
+  and cite the `[idx]`. Do not bury it below churn.
 - Do not soften. "I reworked the same region three times" is the point of
   this ritual; euphemisms defeat it.
 - Do not editorialize beyond the evidence ("the code is bad" is not a
