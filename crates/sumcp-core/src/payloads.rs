@@ -42,11 +42,30 @@ pub fn session_overview(s: &Session, ranked: &[FileScore], meta: &SessionMeta) -
         .take(3)
         .map(|f| json!({"file": f.file, "score": round1(f.score), "breakdown": f.breakdown}))
         .collect();
+    // Wall-clock span, first→last action. The debrief contract opens with a
+    // duration, so the overview must carry one (mock contract's `started` +
+    // `duration_min`; both null when the session has no parseable timestamps).
+    let started = o.span.as_ref().map(|(first, _)| first.clone());
+    let duration_min = o.span.as_ref().and_then(|(first, last)| {
+        match (crate::report::ts_secs(first), crate::report::ts_secs(last)) {
+            (Some(a), Some(b)) if b >= a => Some((b - a) / 60),
+            _ => None,
+        }
+    });
     json!({
         "v": 0,
-        "session": {"id": meta.id, "identified_by": meta.identified_by},
+        "session": {
+            "id": meta.id, "identified_by": meta.identified_by,
+            "started": started, "duration_min": duration_min
+        },
         "totals": {
-            "actions": o.actions, "edits": o.edits, "writes": o.writes,
+            // `file_ops` (edits+writes) and `lines_written` lead: `edits` alone
+            // omits Write, and any tool-call count omits the volume of change.
+            // The edits/writes split is kept for consumers that want it.
+            "actions": o.actions, "file_ops": o.file_ops,
+            "lines_written": o.lines_written,
+            "file_ops_unconfirmed": o.file_ops_unconfirmed,
+            "edits": o.edits, "writes": o.writes,
             "reads": o.reads, "bash": o.bash, "files_touched": o.files_touched,
             "interrupts": s.interrupts
         },
@@ -359,6 +378,30 @@ mod tests {
             p["read_edit_file_ratio"].is_null(),
             "no edits ⇒ ratio is no localization signal"
         );
+    }
+
+    #[test]
+    fn overview_reports_started_and_duration_min() {
+        // The debrief output contract opens with a duration; the mock contract
+        // has always promised `session.started` + `session.duration_min`, but
+        // the shipped builder never emitted them (codex review 2026-07-22 P0).
+        let raw = concat!(
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"tool_use","id":"e0","name":"Edit","input":{"file_path":"/a.ts","new_string":"x"}}]}}"#,
+            "\n",
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:30:00Z","message":{"content":[{"type":"tool_use","id":"e1","name":"Edit","input":{"file_path":"/a.ts","new_string":"y"}}]}}"#,
+        );
+        let s = ingest_str(raw, Lane::Main);
+        let p = session_overview(&s, &[], &meta());
+        assert_eq!(p["session"]["started"], "2026-01-01T00:00:00Z");
+        assert_eq!(p["session"]["duration_min"], 30);
+    }
+
+    #[test]
+    fn overview_duration_is_null_for_empty_sessions() {
+        let s = ingest_str("", Lane::Main);
+        let p = session_overview(&s, &[], &meta());
+        assert!(p["session"]["started"].is_null());
+        assert!(p["session"]["duration_min"].is_null());
     }
 
     #[test]

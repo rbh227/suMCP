@@ -60,21 +60,38 @@ const SKILL_MD: &str = include_str!("../../../skills/debrief/SKILL.md");
 /// binary (absolute path substituted at write time) so it has no dependency on
 /// the repo or on `sumcp` being on `PATH`.
 const HOOK_TEMPLATE: &str = r#"#!/bin/sh
-# suMCP Stop-hook nudge (installed by `sumcp install`). Read-only.
-# Claude Code pipes a JSON blob on stdin including "transcript_path". We ask the
-# installed sumcp binary how many edits the session had; if it's a substantial
-# session we print a one-line reminder to run the debrief. Never blocks.
+# suMCP Stop-hook nudge (installed by `sumcp install`). Reads the transcript;
+# its only write is a per-session nudge marker under $TMPDIR so one session is
+# not re-nudged after every response. Never blocks.
+# Claude Code pipes a JSON blob on stdin including "session_id" and
+# "transcript_path". We ask the installed sumcp binary how many edits the
+# session had; a substantial session gets a one-line reminder to run the
+# debrief, carrying the session id so the skill can pass it explicitly
+# (no-argument identification is opportunistic and can be ambiguous).
 set -eu
 SUMCP="__SUMCP_BIN__"
 THRESHOLD=3
 input="$(cat)"
-# Pull transcript_path out of the stdin JSON without needing jq.
-transcript="$(printf '%s' "$input" | sed -n 's/.*"transcript_path"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+# Pull a string field out of the stdin JSON without needing jq.
+field() { printf '%s' "$input" | sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" | head -n1; }
+transcript="$(field transcript_path)"
+session="$(field session_id)"
 [ -n "${transcript:-}" ] || exit 0
 [ -x "$SUMCP" ] || exit 0
 edits="$("$SUMCP" --file "$transcript" --json 2>/dev/null | sed -n 's/.*"edits"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p' | head -n1)"
 [ -n "${edits:-}" ] || exit 0
-if [ "$edits" -ge "$THRESHOLD" ]; then
+[ "$edits" -ge "$THRESHOLD" ] || exit 0
+# The Stop event fires after every response, not at a conceptual session end.
+# Nudge once at the threshold, then again only after THRESHOLD further edits.
+marker="${TMPDIR:-/tmp}/sumcp-nudged-${session:-$(basename "$transcript" .jsonl)}"
+last=0
+[ -f "$marker" ] && last="$(cat "$marker" 2>/dev/null || echo 0)"
+case "$last" in ''|*[!0-9]*) last=0;; esac
+[ "$edits" -ge "$((last + THRESHOLD))" ] || exit 0
+printf '%s' "$edits" > "$marker"
+if [ -n "${session:-}" ]; then
+  printf '{"systemMessage":"suMCP: session %s has %s edits — run the debrief skill with session_id=%s to see what actually struggled."}\n' "$session" "$edits" "$session"
+else
   printf '{"systemMessage":"suMCP: this session had %s edits — run the debrief skill to see what actually struggled."}\n' "$edits"
 fi
 exit 0

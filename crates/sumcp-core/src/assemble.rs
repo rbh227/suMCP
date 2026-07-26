@@ -143,15 +143,13 @@ mod tests {
 
     fn agent_spawn_lines(id: &str, agent_id: &str) -> String {
         // A main-transcript Agent spawn whose result carries an agentId.
-        format!(
-            "{}\n{}",
-            format!(
-                r#"{{"type":"assistant","timestamp":"2026-01-01T00:00:01Z","message":{{"content":[{{"type":"tool_use","id":"{id}","name":"Agent","input":{{"subagent_type":"x"}}}}]}}}}"#
-            ),
-            format!(
-                r#"{{"type":"user","timestamp":"2026-01-01T00:00:02Z","message":{{"content":[{{"type":"tool_result","tool_use_id":"{id}","is_error":false}}]}},"toolUseResult":{{"agentId":"{agent_id}"}}}}"#
-            ),
-        )
+        let spawn = format!(
+            r#"{{"type":"assistant","timestamp":"2026-01-01T00:00:01Z","message":{{"content":[{{"type":"tool_use","id":"{id}","name":"Agent","input":{{"subagent_type":"x"}}}}]}}}}"#
+        );
+        let result = format!(
+            r#"{{"type":"user","timestamp":"2026-01-01T00:00:02Z","message":{{"content":[{{"type":"tool_result","tool_use_id":"{id}","is_error":false}}]}},"toolUseResult":{{"agentId":"{agent_id}"}}}}"#
+        );
+        format!("{spawn}\n{result}")
     }
 
     /// A subagent transcript line: one Edit, carrying a parent sessionId.
