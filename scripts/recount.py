@@ -15,9 +15,10 @@ being a check and becomes a reimplementation.
 
 WHAT IT CHECKS
 --------------
-Countable tool quantities only: edits, writes, reads, bash, file_ops, and
-files_touched, in two scopes. First every transcript alone (`--file`, the v1
-scope), then every work unit the product discloses (`--work-unit`), recounting
+Countable quantities only: edits, writes, reads, bash, file_ops,
+files_touched, and the output / cache-read token totals, in two scopes.
+First every transcript alone (`--file`, the v1 scope), then every work unit
+the product discloses (`--work-unit`), recounting
 exactly the member transcripts its payload names. Signal detection is out of
 scope, because a second implementation of the signal logic would be a
 reimplementation rather than an independent check.
@@ -43,8 +44,10 @@ WRITE_TOOLS = {"Write"}
 # What the committed fixtures must add up to as one unit. Asserted directly in
 # --fixtures mode so a fixture edit cannot silently move the goalposts, and so
 # a bug that zeroes BOTH implementations still fails instead of "agreeing".
+# Tokens: 8 assistant messages, each with output_tokens 5 and no cache reads.
 FIXTURE_UNIT_TOTALS = {"edits": 5, "writes": 1, "reads": 1, "bash": 1,
-                       "file_ops": 6, "files_touched": 6}
+                       "file_ops": 6, "files_touched": 6,
+                       "tokens_output": 40, "tokens_cache_read": 0}
 
 
 def tool_calls(path: Path) -> list[dict]:
@@ -74,10 +77,34 @@ def tool_calls(path: Path) -> list[dict]:
     return [by_key[k] for k in order]
 
 
+def usage_totals(path: Path) -> tuple[int, int]:
+    """(output, cache_read) token totals for one transcript, deduped the way
+    the parser rule declares: one usage record per message id, last wins
+    (streaming re-sends the same message id with growing usage)."""
+    by_msg: dict[str, tuple[int, int]] = {}
+    for line in path.read_text(errors="replace").splitlines():
+        try:
+            e = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        msg = e.get("message") or {}
+        mid = msg.get("id")
+        usage = msg.get("usage")
+        if not (isinstance(mid, str) and isinstance(usage, dict)):
+            continue
+        out = usage.get("output_tokens")
+        cached = usage.get("cache_read_input_tokens")
+        by_msg[mid] = (out if isinstance(out, int) else 0,
+                       cached if isinstance(cached, int) else 0)
+    return (sum(o for o, _ in by_msg.values()),
+            sum(c for _, c in by_msg.values()))
+
+
 def recount(paths: list[Path]) -> dict:
     """Totals over a set of transcripts (a work unit: the main transcripts
     plus every subagent transcript belonging to each)."""
     edits = writes = reads = bash = 0
+    tokens_output = tokens_cache_read = 0
     touched: set[str] = set()
     for p in paths:
         for b in tool_calls(p):
@@ -94,6 +121,9 @@ def recount(paths: list[Path]) -> dict:
             fp = inp.get("file_path")
             if isinstance(fp, str) and fp:
                 touched.add(fp)
+        out, cached = usage_totals(p)
+        tokens_output += out
+        tokens_cache_read += cached
     return {
         "edits": edits,
         "writes": writes,
@@ -101,6 +131,8 @@ def recount(paths: list[Path]) -> dict:
         "bash": bash,
         "file_ops": edits + writes,
         "files_touched": len(touched),
+        "tokens_output": tokens_output,
+        "tokens_cache_read": tokens_cache_read,
     }
 
 
@@ -134,6 +166,16 @@ def sumcp_payload(main: Path, work_unit: bool) -> dict | None:
         return None
 
 
+def product_totals(payload: dict) -> dict:
+    """The product's countable quantities, flattened: `totals` plus the two
+    token sums from the `tokens` object, renamed to this script's keys."""
+    out = dict(payload.get("totals") or {})
+    toks = payload.get("tokens") or {}
+    out["tokens_output"] = toks.get("output")
+    out["tokens_cache_read"] = toks.get("cache_read")
+    return out
+
+
 def compare(label: str, mine: dict, theirs: dict) -> list[str]:
     """Every quantity where the two implementations disagree."""
     bad = []
@@ -153,12 +195,18 @@ def compare(label: str, mine: dict, theirs: dict) -> list[str]:
 def unit_member_paths(main: Path, payload: dict) -> list[Path] | None:
     """Resolve the payload's disclosed unit members back to files on disk.
 
+    An absent `work_unit` block is the schema's way of saying "one
+    transcript, nothing excluded", so that case resolves to the requested
+    transcript's own members rather than being an error.
+
     The payload shortens each session id to its first 8 characters, so each
     one is resolved by prefix against the main transcript's directory. Session
     ids are UUIDs, so a prefix collision effectively cannot happen; if one
     somehow does, this returns None and the caller reports it rather than
     guessing which file was meant.
     """
+    if "work_unit" not in payload:
+        return members_of(main)
     ids = (payload.get("work_unit") or {}).get("session_ids")
     if not isinstance(ids, list) or not ids:
         return None
@@ -210,7 +258,7 @@ def main() -> int:
         if payload is None:
             failures.append(f"{m.name}: could not run")
             continue
-        failures += compare(m.name, recount(members_of(m)), payload.get("totals") or {})
+        failures += compare(m.name, recount(members_of(m)), product_totals(payload))
         checked += 1
 
     # Scope 2: each work unit the product discloses, against `--work-unit`.
@@ -233,7 +281,7 @@ def main() -> int:
             continue
         seen_units.add(key)
         label = f"unit({m.name}, {len(members)} file(s))"
-        failures += compare(label, recount(members), payload.get("totals") or {})
+        failures += compare(label, recount(members), product_totals(payload))
         units_checked += 1
 
     # The fixtures' expected totals are known by hand; hold the recount itself
