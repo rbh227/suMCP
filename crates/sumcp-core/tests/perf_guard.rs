@@ -33,16 +33,18 @@ fn a_sixteen_member_work_unit_analyzes_well_under_the_ceiling() {
         }
         std::fs::write(td.path().join(format!("{id}.jsonl")), body).unwrap();
     }
-    let last = td
-        .path()
-        .join("00000015-1111-2222-3333-444455556666.jsonl");
+    let last = td.path().join("00000015-1111-2222-3333-444455556666.jsonl");
 
     let t0 = Instant::now();
     let a = sumcp_core::assemble::load_work_unit(&last, sumcp_core::assemble::MAX_TRANSCRIPT_BYTES)
         .expect("assembles");
     let dt = t0.elapsed();
 
-    assert_eq!(a.unit.members.len(), 16, "all 16 transcripts joined one unit");
+    assert_eq!(
+        a.unit.members.len(),
+        16,
+        "all 16 transcripts joined one unit"
+    );
     assert_eq!(a.session.actions.len(), 6400, "every action merged");
     assert!(
         dt.as_secs_f64() < 10.0,

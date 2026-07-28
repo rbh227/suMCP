@@ -341,7 +341,15 @@ pub fn session_overview(s: &Session, ranked: &[FileScore], meta: &SessionMeta) -
     let mut unknown: Vec<(&String, &u64)> = s
         .type_counts
         .iter()
-        .filter(|(t, _)| !matches!(t.as_str(), "assistant" | "user"))
+        // `mode` and `permission-mode` are the newer and older names of the
+        // same event; ingest reads both (running permission mode), so neither
+        // may be listed as "unknown".
+        .filter(|(t, _)| {
+            !matches!(
+                t.as_str(),
+                "assistant" | "user" | "mode" | "permission-mode"
+            )
+        })
         .collect();
     unknown.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
     // Wall-clock span, first→last action. The debrief contract opens with a

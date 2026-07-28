@@ -298,6 +298,7 @@ mod tests {
             edit_old: None,
             edit_new: None,
             approval_latency_s: None,
+            auto_accept_here: false,
         };
         let mut bash = edit(1, Lane::Main, "/x");
         bash.kind = ActionKind::Bash;

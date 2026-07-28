@@ -140,7 +140,11 @@ pub(crate) fn segments(s: &Session) -> Vec<Segment<'_>> {
     // `Action::session_ix`'s doc), so a `Vec` here (not a `HashMap`, which
     // would make iteration order nondeterministic) costs nothing to scan.
     let mut by_session: Vec<(u16, Vec<&crate::model::UserText>)> = Vec::new();
-    for u in &s.user_texts {
+    // `is_human` gates boundary drawing: a harness-injected turn (a task
+    // notification) is recorded in `user_texts` but is not the human coming
+    // back to review, so it must not close a task segment. Counting it as a
+    // boundary truncated the review-burden window and understated the metric.
+    for u in s.user_texts.iter().filter(|u| u.is_human) {
         match by_session.iter_mut().find(|(ix, _)| *ix == u.session_ix) {
             Some((_, msgs)) => msgs.push(u),
             None => by_session.push((u.session_ix, vec![u])),
@@ -714,6 +718,7 @@ mod tests {
             edit_old: Some(old.into()),
             edit_new: Some(new.into()),
             approval_latency_s: None,
+            auto_accept_here: false,
         };
         let mut s = crate::model::Session {
             actions: vec![
@@ -782,6 +787,7 @@ mod tests {
             edit_old: Some(old.into()),
             edit_new: Some(new.into()),
             approval_latency_s: None,
+            auto_accept_here: false,
         };
         let s = crate::model::Session {
             actions: vec![
@@ -799,6 +805,7 @@ mod tests {
                 text: "no revert that please".into(),
                 effective_ts: "2026-01-01T00:00:02Z".into(),
                 session_ix: 0,
+                is_human: true,
             }],
             cwd: None,
             tokens: Default::default(),
@@ -1036,6 +1043,7 @@ mod tests {
             line_no: 2, // between 1 and 3 -- but in a DIFFERENT transcript
             text: "no, revert that".into(),
             session_ix: 1,
+            is_human: true,
         }];
         s.session_ids = vec!["sess-0".into(), "sess-1".into()];
 
@@ -1088,6 +1096,7 @@ mod tests {
             line_no: 2,
             text: "no, revert that".into(),
             session_ix: 0, // same transcript as the edits
+            is_human: true,
         }];
         s.session_ids = vec!["sess-0".into()];
 
@@ -1143,6 +1152,7 @@ mod tests {
             line_no: 2,
             text: "no, revert that".into(),
             session_ix: 1, // same transcript as the edits, but not 0
+            is_human: true,
         }];
         s.session_ids = vec!["sess-0".into(), "sess-1".into()];
 
@@ -1209,6 +1219,7 @@ mod tests {
             line_no: 2,
             text: "no, revert that".into(),
             session_ix: 0,
+            is_human: true,
         }];
         s.session_ids = vec!["sess-0".into(), "sess-1".into()];
 
@@ -1251,6 +1262,7 @@ mod tests {
             edit_old: None,
             edit_new: None,
             approval_latency_s: None,
+            auto_accept_here: false,
         };
         let s = Session {
             actions: vec![mk(0, 1), mk(1, 10)],
@@ -1259,6 +1271,7 @@ mod tests {
                 line_no: 5,
                 text: "an unrelated transcript's message".into(),
                 session_ix: 1,
+                is_human: true,
             }],
             session_ids: vec!["sess-0".into(), "sess-1".into()],
             ..Session::default()
@@ -1311,6 +1324,7 @@ mod tests {
             edit_old: None,
             edit_new: None,
             approval_latency_s: None,
+            auto_accept_here: false,
         };
         let actions = vec![
             mk(0, 1, "2026-01-01T00:00:01Z", ActionKind::Read), // t1: transcript 1 reads first

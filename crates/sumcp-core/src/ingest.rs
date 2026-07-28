@@ -39,6 +39,11 @@ pub fn ingest_str(raw: &str, default_lane: Lane) -> Session {
     let mut user_texts: Vec<UserText> = Vec::new();
     let mut interrupts = 0u64;
     let mut auto_accept = false;
+    // The permission mode currently in force. Claude Code emits a `mode`
+    // event whenever it changes, and it changes often within one session
+    // (96 times in one observed transcript), so this is carried forward line
+    // by line exactly the way `last_ts` is, and stamped onto every action.
+    let mut mode_is_auto = false;
     // Tool-use ids of Agent/Task spawns, in first-seen order (post-dedup).
     // Resolved to agentIds after the results map is built.
     let mut spawn_ids: Vec<String> = Vec::new();
@@ -68,12 +73,25 @@ pub fn ingest_str(raw: &str, default_lane: Lane) -> Session {
         }
 
         // Auto-accept permission modes make approval latency meaningless.
+        // `acceptEdits` and `bypassPermissions` both mean edits land without
+        // a human decision. The running mode flips BOTH ways: a `mode` event
+        // carrying `normal` (or `default`/`plan`) ends an auto-accept
+        // stretch, so only the actions inside one are suppressed. A value
+        // outside both lists leaves the running mode alone rather than
+        // guessing what an unknown future mode means.
         let mode = v
             .get("permissionMode")
             .or_else(|| v.get("mode"))
             .and_then(Value::as_str);
-        if matches!(mode, Some("acceptEdits") | Some("bypassPermissions")) {
-            auto_accept = true;
+        match mode {
+            Some("acceptEdits") | Some("bypassPermissions") => {
+                mode_is_auto = true;
+                auto_accept = true; // session-level "ever seen", unchanged
+            }
+            Some("normal") | Some("default") | Some("plan") => {
+                mode_is_auto = false;
+            }
+            _ => {}
         }
 
         // effective timestamp: own, else carry forward the last one we saw.
@@ -109,6 +127,18 @@ pub fn ingest_str(raw: &str, default_lane: Lane) -> Session {
                 // work unit, so this is always `0` here; the merge step
                 // stamps the real value later (see `UserText::session_ix`).
                 session_ix: 0,
+                // `origin.kind` distinguishes a real human turn from a
+                // harness-injected one. Absent means human: the field is
+                // newer than the transcripts we must keep reading, and
+                // defaulting an unknown turn to human keeps the review-burden
+                // window at its pre-existing (wider) behaviour rather than
+                // silently narrowing it on old data.
+                is_human: v
+                    .get("origin")
+                    .and_then(|o| o.get("kind"))
+                    .and_then(Value::as_str)
+                    .map(|k| k == "human")
+                    .unwrap_or(true),
             });
         }
 
@@ -194,6 +224,7 @@ pub fn ingest_str(raw: &str, default_lane: Lane) -> Session {
                             command,
                             edit_old,
                             edit_new,
+                            auto_accept_here: mode_is_auto,
                         });
                     }
                     Some("tool_result") => {
@@ -303,6 +334,7 @@ pub fn ingest_str(raw: &str, default_lane: Lane) -> Session {
                 edit_old: p.edit_old,
                 edit_new: p.edit_new,
                 approval_latency_s,
+                auto_accept_here: p.auto_accept_here,
             }
         })
         .collect();
@@ -411,6 +443,7 @@ struct PendingAction {
     command: Option<String>,
     edit_old: Option<String>,
     edit_new: Option<String>,
+    auto_accept_here: bool,
 }
 
 /// What came back for a tool call.
@@ -646,5 +679,66 @@ mod tests {
             Lane::Main,
         );
         assert_eq!(none.cwd, None, "no cwd line -> None");
+    }
+
+    #[test]
+    fn mode_events_set_auto_accept_per_action_not_per_session() {
+        // A real session emits `mode` events repeatedly (96 times in one
+        // observed session), so the permission mode CHANGES mid-session.
+        // Suppressing latency heuristics for the whole session because the
+        // mode was once auto-accept throws away the parts that were not.
+        let raw = concat!(
+            r#"{"type":"mode","mode":"normal","sessionId":"s"}"#,
+            "\n",
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:01Z","message":{"content":[{"type":"tool_use","id":"e1","name":"Edit","input":{"file_path":"/a.rs","new_string":"x"}}]}}"#,
+            "\n",
+            r#"{"type":"mode","mode":"acceptEdits","sessionId":"s"}"#,
+            "\n",
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:02Z","message":{"content":[{"type":"tool_use","id":"e2","name":"Edit","input":{"file_path":"/a.rs","new_string":"y"}}]}}"#,
+            "\n"
+        );
+        let s = ingest_str(raw, Lane::Main);
+        assert_eq!(s.actions.len(), 2);
+        assert!(
+            !s.actions[0].auto_accept_here,
+            "first edit ran under normal mode"
+        );
+        assert!(
+            s.actions[1].auto_accept_here,
+            "second ran under acceptEdits"
+        );
+        assert!(
+            s.auto_accept,
+            "the session-level flag still reports 'ever seen'"
+        );
+    }
+
+    #[test]
+    fn a_task_notification_is_not_a_human_turn() {
+        // Review burden counts lines written between substantive HUMAN turns.
+        // A task notification is injected by the harness, and counting it as a
+        // human turn truncates the window and understates the metric.
+        let raw = concat!(
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:01Z","origin":{"kind":"human"},"message":{"content":"do the thing"}}"#,
+            "\n",
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:02Z","origin":{"kind":"task-notification"},"message":{"content":"<task-notification>done</task-notification>"}}"#,
+            "\n"
+        );
+        let s = ingest_str(raw, Lane::Main);
+        assert_eq!(s.user_texts.len(), 2, "both are recorded");
+        assert!(s.user_texts[0].is_human);
+        assert!(!s.user_texts[1].is_human);
+    }
+
+    #[test]
+    fn an_absent_origin_defaults_to_human() {
+        // Transcripts written before the `origin` field existed must keep the
+        // old, WIDER review window: defaulting unknown to human means those
+        // turns still draw segment boundaries exactly as they always did.
+        let raw =
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:01Z","message":{"content":"hi"}}"#;
+        let s = ingest_str(raw, Lane::Main);
+        assert_eq!(s.user_texts.len(), 1);
+        assert!(s.user_texts[0].is_human, "no origin field means human");
     }
 }

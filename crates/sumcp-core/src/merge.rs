@@ -251,6 +251,7 @@ mod tests {
                 edit_old: None,
                 edit_new: None,
                 approval_latency_s: None,
+                auto_accept_here: false,
             }],
             user_texts: vec![],
             cwd: None,
@@ -308,6 +309,7 @@ mod tests {
             text: "human says".into(),
             effective_ts: "2026-01-01T00:00:00Z".into(),
             session_ix: 0,
+            is_human: true,
         }];
         main.auto_accept = false;
         let mut sub = one(Lane::Sub("x".into()), "2026-01-01T00:00:01Z", 3, "/b");
@@ -316,6 +318,7 @@ mod tests {
             text: "orchestrator prompt".into(),
             effective_ts: "2026-01-01T00:00:00Z".into(),
             session_ix: 0,
+            is_human: true,
         }];
         sub.auto_accept = true; // a sub in auto-accept must NOT flip the merged flag
 
@@ -488,6 +491,7 @@ mod tests {
             text: "first".into(),
             effective_ts: "2026-01-01T00:00:00Z".into(),
             session_ix: 0,
+            is_human: true,
         }];
         a.auto_accept = false;
         let mut b = one(Lane::Main, "2026-01-01T00:00:02Z", 1, "/b");
@@ -496,6 +500,7 @@ mod tests {
             text: "second".into(),
             effective_ts: "2026-01-01T00:00:02Z".into(),
             session_ix: 0,
+            is_human: true,
         }];
         b.auto_accept = true;
 
@@ -524,6 +529,7 @@ mod tests {
             text: "second transcript's user turn".into(),
             effective_ts: "2026-01-01T00:00:02Z".into(),
             session_ix: 0, // as ingest always leaves it; the merge must restamp
+            is_human: true,
         }];
 
         let merged = merge_work_unit(vec![("a".into(), a), ("b".into(), b)], 0, 0);

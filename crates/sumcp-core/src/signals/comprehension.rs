@@ -8,7 +8,9 @@
 //!   under auto-accept, which is precisely when nobody is gating the writes.
 //! - **Large-write-instant-accept** (#16, corroborating): a timestamp delta
 //!   cannot tell "read carefully" from "auto-accept" from "got coffee", so it
-//!   is suppressed when the session ran under an auto-accept permission mode.
+//!   is suppressed for every action that ran under an auto-accept permission
+//!   mode (per action, via `Action::auto_accept_here`, because the mode
+//!   changes within a session and the normal-mode stretches still count).
 
 use crate::model::{Action, ActionKind, Confidence, Finding, FindingKind, Lane, Session, Tier};
 use crate::signals::dynamics::segments;
@@ -26,12 +28,12 @@ const REVIEW_BAND_HI: usize = 400;
 /// Run the comprehension signals.
 pub fn comprehension(s: &Session) -> Vec<Finding> {
     // Review burden first: it is the anchor, and it never suppresses.
+    // Latency findings are suppressed PER ACTION (`auto_accept_here`, inside
+    // `large_write_instant_accept`), not per session: the mode changes within
+    // a session, and suppressing every latency signal because the mode was
+    // once acceptEdits would throw away the stretches that were not.
     let mut out = review_burden(s);
-    if !s.auto_accept {
-        // Auto-accept in play ⇒ approval timing is meaningless. Say nothing
-        // rather than emit false latency-based findings.
-        out.extend(large_write_instant_accept(s));
-    }
+    out.extend(large_write_instant_accept(s));
     out
 }
 
@@ -86,7 +88,16 @@ fn large_write_instant_accept(s: &Session) -> Vec<Finding> {
         // Deliberately `.lane`, not `.lane_key()`: this asks "is this a
         // main-agent action", which is a meaningful question in any
         // transcript, not a pairing that needs a same-transcript guarantee.
-        .filter(|a| a.lane == Lane::Main && is_large_write(a) && accepted_instantly(a))
+        // `!a.auto_accept_here`: an auto-accepted action's timestamp delta is
+        // machine time, not a human decision, so it can prove nothing about
+        // whether the human read the diff. Checked per action, so the parts
+        // of a session that ran under normal mode still produce signals.
+        .filter(|a| {
+            a.lane == Lane::Main
+                && !a.auto_accept_here
+                && is_large_write(a)
+                && accepted_instantly(a)
+        })
         .map(|a| {
             let latency = a.approval_latency_s.unwrap_or(0.0);
             let chars = a.write_len.unwrap_or(0);
@@ -117,8 +128,17 @@ fn accepted_instantly(a: &Action) -> bool {
 
 /// Whether approval-latency signals are active for this session (for the
 /// `blind_spots` payload's `suppression` field).
+///
+/// With per-action suppression, "active" means SOME main-lane action ran
+/// outside an auto-accept mode, so latency findings were possible. A session
+/// with no main-lane actions falls back to the session-level flag: there was
+/// nothing to suppress, but the flag still says what the mode was.
 pub fn approval_latency_active(s: &Session) -> bool {
-    !s.auto_accept
+    let mut mains = s.actions.iter().filter(|a| a.lane == Lane::Main);
+    if mains.clone().next().is_none() {
+        return !s.auto_accept;
+    }
+    mains.any(|a| !a.auto_accept_here)
 }
 
 #[cfg(test)]
@@ -203,6 +223,35 @@ mod tests {
         assert!(!approval_latency_active(&s));
     }
 
+    #[test]
+    fn a_normal_mode_stretch_still_fires_after_auto_accept_ends() {
+        // The mode changes WITHIN a session. The first write runs under
+        // acceptEdits (suppressed); the mode then returns to normal, and the
+        // second, identical write must still produce a latency finding.
+        // Under the old session-level rule the whole session went silent.
+        let raw = format!(
+            "{}\n{}\n{}\n{}",
+            r#"{"type":"mode","mode":"acceptEdits","sessionId":"s"}"#,
+            write_then_accept("w1", 5000, "2026-01-01T00:00:00Z", "2026-01-01T00:00:01Z"),
+            r#"{"type":"mode","mode":"normal","sessionId":"s"}"#,
+            write_then_accept("w2", 5000, "2026-01-01T00:01:00Z", "2026-01-01T00:01:01Z"),
+        );
+        let s = ingest_str(&raw, Lane::Main);
+        assert!(s.auto_accept, "session-level flag still says 'ever seen'");
+        let f = comprehension(&s);
+        assert_eq!(f.len(), 1, "only the normal-mode write fires");
+        assert_eq!(f[0].kind, FindingKind::LargeWriteInstantAccept);
+        assert_eq!(
+            f[0].idxs,
+            vec![s.actions[1].idx],
+            "the second write, not the first"
+        );
+        assert!(
+            approval_latency_active(&s),
+            "some of the session ran under normal mode, so the signal was active"
+        );
+    }
+
     /// A Write whose content has `lines` lines, instantly accepted.
     fn write_lines_burst(id: &str, lines: usize, t0: &str, t1: &str) -> String {
         let content = vec!["x"; lines].join("\\n");
@@ -255,6 +304,30 @@ mod tests {
             !f.iter().any(|f| f.kind == FindingKind::ReviewBurden),
             "a human turn resets the review window"
         );
+    }
+
+    #[test]
+    fn a_task_notification_does_not_reset_the_review_window() {
+        // 250 + 250 lines with a harness-injected task notification between.
+        // A HUMAN turn there resets the window (see
+        // `review_burden_respects_segment_boundaries`); a notification is not
+        // the human coming back to review, so the two bursts are ONE
+        // 500-line window and burden must fire.
+        let notification = r#"{"type":"user","timestamp":"2026-01-01T00:03:00Z","origin":{"kind":"task-notification"},"message":{"content":"<task-notification>background agent done</task-notification>"}}"#;
+        let raw = format!(
+            "{}\n{}\n{}\n{}",
+            user("2026-01-01T00:00:00Z", "build it"),
+            write_lines_burst("w1", 250, "2026-01-01T00:00:01Z", "2026-01-01T00:02:00Z"),
+            notification,
+            write_lines_burst("w2", 250, "2026-01-01T00:03:01Z", "2026-01-01T00:05:00Z"),
+        );
+        let f = comprehension(&ingest_str(&raw, Lane::Main));
+        let burden: Vec<_> = f
+            .iter()
+            .filter(|f| f.kind == FindingKind::ReviewBurden)
+            .collect();
+        assert_eq!(burden.len(), 1, "one unbroken 500-line window");
+        assert_eq!(burden[0].nums["loc"], 500.0);
     }
 
     #[test]

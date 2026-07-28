@@ -137,6 +137,14 @@ pub struct Action {
     /// Seconds from proposing this Edit/Write to its result — the approval
     /// latency heuristic (execution ≈ instant, so this ≈ human decision time).
     pub approval_latency_s: Option<f64>,
+    /// Whether an auto-accept permission mode was in force when THIS action
+    /// ran. The mode changes within a session (Claude Code emits a `mode`
+    /// event each time), so latency suppression is per action; the
+    /// session-level [`Session::auto_accept`] keeps meaning "ever seen".
+    /// `#[serde(default)]` (false) so transcript caches written before this
+    /// field existed still deserialize.
+    #[serde(default)]
+    pub auto_accept_here: bool,
 }
 
 impl Action {
@@ -187,6 +195,7 @@ impl Default for Action {
             edit_old: None,
             edit_new: None,
             approval_latency_s: None,
+            auto_accept_here: false,
         }
     }
 }
@@ -341,6 +350,20 @@ pub struct UserText {
     /// together, the same way it does for `Action::session_ix`.
     #[serde(default)]
     pub session_ix: u16,
+    /// Whether this turn came from the human, per the `origin.kind` field.
+    /// A harness-injected turn (e.g. a task notification) is recorded but is
+    /// not a human turn, so it must not reset the review-burden window.
+    /// Absent `origin` means human: the field is newer than the transcripts
+    /// we must keep reading, and defaulting an unknown turn to human keeps
+    /// the pre-existing (wider) windowing on old data. The serde default is
+    /// `true` for the same reason.
+    #[serde(default = "default_true")]
+    pub is_human: bool,
+}
+
+/// Serde default helper: see [`UserText::is_human`].
+fn default_true() -> bool {
+    true
 }
 
 /// A fully parsed session: ordered actions plus parse-health counters.
