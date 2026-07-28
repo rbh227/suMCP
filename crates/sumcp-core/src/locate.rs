@@ -101,6 +101,92 @@ pub fn newest_transcript(project_dir: &Path) -> Option<PathBuf> {
         .map(|(path, _)| path)
 }
 
+/// How much of a transcript's head and tail we read to find its time span.
+/// 256 KB each end is far more than enough: transcript lines are rarely over
+/// a few KB, so this always covers hundreds of lines at each end, while a
+/// whole-file read of the largest observed transcript would be 8 MB.
+const SPAN_PROBE_BYTES: u64 = 256 * 1024;
+
+/// The time a transcript covers: its first and last timestamp, as the raw
+/// RFC 3339 strings found in the file.
+///
+/// These are compared as STRINGS everywhere, not parsed into a date type.
+/// That is safe because Claude Code writes fixed-width UTC timestamps ending
+/// in `Z`, so lexical order and chronological order are the same. `merge.rs`
+/// already sorts the whole action stream on that assumption.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptSpan {
+    /// Earliest timestamp seen.
+    pub first: String,
+    /// Latest timestamp seen.
+    pub last: String,
+}
+
+/// Pull every `"timestamp":"..."` value out of a chunk of transcript text.
+///
+/// This deliberately does NOT parse JSON. Scanning for the key is roughly an
+/// order of magnitude cheaper than `serde_json::from_str` per line, and a
+/// span only needs the min and max, so a stray match inside some other
+/// string value would have to be a plausible timestamp to matter at all.
+fn scan_timestamps(chunk: &str) -> Vec<String> {
+    const KEY: &str = "\"timestamp\":\"";
+    let mut out = Vec::new();
+    // `match_indices` walks every occurrence of KEY and hands us its byte
+    // offset. `start + KEY.len()` is then the first character of the value.
+    for (at, _) in chunk.match_indices(KEY) {
+        let rest = &chunk[at + KEY.len()..];
+        // The value runs to the next quote. `find` returns a byte offset
+        // relative to `rest`, or None if the chunk was cut mid-value (which
+        // is expected at a probe boundary, and simply skipped).
+        if let Some(end) = rest.find('"') {
+            let v = &rest[..end];
+            // Cheap sanity filter: real timestamps look like
+            // `2026-01-01T00:00:01...Z`. Anything else is not a timestamp.
+            if v.len() >= 20 && v.as_bytes()[10] == b'T' {
+                out.push(v.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// The time span a transcript covers, or `None` if it has no timestamps.
+///
+/// Reads at most `SPAN_PROBE_BYTES` from each end rather than the whole file.
+/// Both probes are read into their own buffer which is dropped before the
+/// function returns, so peak memory here is 512 KB regardless of file size.
+pub fn transcript_span(path: &Path) -> Option<TranscriptSpan> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    let len = meta.len();
+    let mut f = std::fs::File::open(path).ok()?;
+
+    // Head probe.
+    let mut head = vec![0u8; SPAN_PROBE_BYTES.min(len) as usize];
+    f.read_exact(&mut head).ok()?;
+    let mut stamps = scan_timestamps(&String::from_utf8_lossy(&head));
+
+    // Tail probe, only when the file is bigger than one probe (otherwise the
+    // head already covered the whole thing and a second read would duplicate).
+    if len > SPAN_PROBE_BYTES {
+        let from = len - SPAN_PROBE_BYTES;
+        f.seek(SeekFrom::Start(from)).ok()?;
+        let mut tail = vec![0u8; SPAN_PROBE_BYTES as usize];
+        f.read_exact(&mut tail).ok()?;
+        stamps.extend(scan_timestamps(&String::from_utf8_lossy(&tail)));
+    }
+
+    // `min`/`max` over the collected strings. `cloned()` copies the winners
+    // out so we can return owned Strings after `stamps` is dropped.
+    let first = stamps.iter().min().cloned()?;
+    let last = stamps.iter().max().cloned()?;
+    Some(TranscriptSpan { first, last })
+}
+
 /// Assert `candidate` resolves inside `root` after canonicalization (ADR A9:
 /// reject symlink/`..` escapes — resolve *then* prefix-check).
 pub fn is_within(root: &Path, candidate: &Path) -> bool {
@@ -368,5 +454,60 @@ mod tests {
         }
         let found = discover_subagent_paths(&main, &[]);
         assert_eq!(found.len(), MAX_SUBAGENT_FILES, "capped");
+    }
+
+    #[test]
+    fn transcript_span_reads_first_and_last_timestamp() {
+        let td = tempfile::tempdir().unwrap();
+        let p = td.path().join("s.jsonl");
+        // Three lines; the middle one has no timestamp, which is normal
+        // (about 20% of real lines carry none).
+        std::fs::write(
+            &p,
+            concat!(
+                r#"{"type":"user","timestamp":"2026-01-01T00:00:01Z"}"#,
+                "\n",
+                r#"{"type":"system"}"#,
+                "\n",
+                r#"{"type":"user","timestamp":"2026-01-01T05:30:00Z"}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+
+        let span = transcript_span(&p).expect("a span");
+        assert_eq!(span.first, "2026-01-01T00:00:01Z");
+        assert_eq!(span.last, "2026-01-01T05:30:00Z");
+    }
+
+    #[test]
+    fn transcript_span_is_none_without_timestamps() {
+        let td = tempfile::tempdir().unwrap();
+        let p = td.path().join("s.jsonl");
+        std::fs::write(&p, "{\"type\":\"system\"}\n").unwrap();
+        assert!(transcript_span(&p).is_none());
+    }
+
+    #[test]
+    fn transcript_span_does_not_read_the_whole_file() {
+        // WHY: the whole point of this function is that discovery must not
+        // cost as much as analysis. A 4 MB file padded with untimestamped
+        // filler still resolves its span, because the head and tail carry it.
+        let td = tempfile::tempdir().unwrap();
+        let p = td.path().join("big.jsonl");
+        let filler = format!("{}\n", r#"{"type":"system","pad":"xxxxxxxxxxxxxxxx"}"#);
+        let mut body = String::new();
+        body.push_str(r#"{"type":"user","timestamp":"2026-01-01T00:00:01Z"}"#);
+        body.push('\n');
+        while body.len() < 4 * 1024 * 1024 {
+            body.push_str(&filler);
+        }
+        body.push_str(r#"{"type":"user","timestamp":"2026-01-01T09:00:00Z"}"#);
+        body.push('\n');
+        std::fs::write(&p, &body).unwrap();
+
+        let span = transcript_span(&p).expect("a span");
+        assert_eq!(span.first, "2026-01-01T00:00:01Z");
+        assert_eq!(span.last, "2026-01-01T09:00:00Z");
     }
 }
