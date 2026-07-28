@@ -135,11 +135,24 @@ def load_manifest(dest: Path) -> dict[str, dict]:
 def assert_safe_dest(dest: Path) -> None:
     """Refuse to archive unredacted transcripts anywhere committable."""
     repo = Path(__file__).resolve().parent.parent
-    resolved = dest.resolve() if dest.exists() else dest.absolute()
+    # `resolve()` works for a path that does not exist yet: it resolves the
+    # symlinks of every existing ancestor and keeps the tail as-is, which is
+    # exactly what a safety check on a to-be-created destination needs.
+    resolved = dest.resolve()
     if resolved == repo or repo in resolved.parents:
         sys.exit(f"refusing: {resolved} is inside the suMCP repo. Transcripts "
                  f"carry unredacted secrets and must not be committable.")
-    probe = resolved if resolved.exists() else resolved.parent
+    # Probe the NEAREST EXISTING ancestor, not merely the immediate parent.
+    # A nested nonexistent destination (<worktree>/new/nested/archive) used
+    # to probe only <worktree>/new/nested; `git -C` on a directory that does
+    # not exist fails with a nonzero exit rather than an exception, so the
+    # guard fell open and the copy proceeded into a committable tree (codex
+    # adversarial review, 2026-07-28).
+    probe = resolved
+    while not probe.exists():
+        if probe.parent == probe:
+            break  # filesystem root; nothing left to walk up to
+        probe = probe.parent
     try:
         r = subprocess.run(
             ["git", "-C", str(probe), "rev-parse", "--is-inside-work-tree"],
