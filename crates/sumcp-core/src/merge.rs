@@ -24,13 +24,6 @@ pub fn merge_sessions(main: Session, subs: Vec<Session>, files_missing: u64) -> 
     let mut interrupts = main.interrupts;
     let auto_accept = main.auto_accept; // NOT OR'd — see spec §5
     let spawns = main.spawns;
-    // This merge combines a main transcript with ITS subagents, all of which
-    // came from the same single work unit, so there is still only one
-    // transcript id in play here. Carry main's table through unchanged (it is
-    // empty until a later task's assembly step fills it in) rather than
-    // inventing one; multi-transcript merging (several distinct session ids)
-    // is a different, later mechanism.
-    let session_ids = main.session_ids;
 
     // Fold every subagent's actions and additive counters in.
     for sub in subs {
@@ -73,7 +66,11 @@ pub fn merge_sessions(main: Session, subs: Vec<Session>, files_missing: u64) -> 
         interrupts,
         auto_accept,
         spawns,
-        session_ids,
+        // This merge combines a main transcript with its own subagents into a
+        // single work unit's worth of data, so it does not own the transcript id
+        // table. The assembly step fills in session_ids when it merges multiple
+        // transcripts into a work unit.
+        session_ids: vec![],
         subagent_files_missing: files_missing,
     }
 }
