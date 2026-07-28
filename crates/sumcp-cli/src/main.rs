@@ -1,4 +1,4 @@
-//! `sumcp` — human CLI over the same Report the MCP server serves.
+//! `sumcp`: a human CLI over the same Report the MCP server serves.
 //!
 //! Three entry points, three scopes. Bare `sumcp` needs no arguments: it
 //! analyzes the whole work unit (every transcript in the same continuous
@@ -90,7 +90,7 @@ enum NoTarget {
 /// wins, because the user naming a path is the strongest signal there is.
 /// It is also resolved BEFORE we look at `claude_home`, so `sumcp --file
 /// x.jsonl` keeps working where there is no `~/.claude` and no `$HOME` at all
-/// (a CI container, say) — hence the `Option` arguments. This function only
+/// (a CI container, say): hence the `Option` arguments. This function only
 /// picks the PATH; whether that path is read as one transcript or as its
 /// whole work unit is decided afterward, by which flag supplied it. With
 /// neither flag we fall back to "the session I last worked in here", which
