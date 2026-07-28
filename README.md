@@ -26,8 +26,8 @@
 > corpus, files suMCP flagged recurred at roughly 8 to 9 times the rate of
 > unflagged ones. The ordering is a rule you can verify by hand, not a tuned
 > model, because a tuned model was measured and did not beat counting edits.
-> No external user has validated any of this yet, which is the honest limit on
-> everything below. See [Limitations](#limitations).
+> The corpus so far is the author's own, so external validation is the next
+> milestone. See [Findings and roadmap](#findings-and-roadmap).
 
 ---
 
@@ -156,7 +156,10 @@ Restart Claude Code so it picks up the new user-scope server. See
 ## Quickstart
 
 Run it with no arguments in a project you have worked in. It finds that
-project's most recent session and debriefs it:
+project's most recent session and debriefs the **whole stretch of work** it
+belongs to: every transcript in the same continuous sitting (resumed
+sessions, `/clear`s, concurrent instances), merged into one report. The
+payload discloses the grouping in a `work_unit` block so you can verify it.
 
 ```bash
 cd ~/code/your-project
@@ -164,17 +167,22 @@ sumcp
 ```
 
 It prints which session it picked to stderr, so `--json` and `--html` stay
-pipeable. Add a flag to change the format, or `--file` to pick a session
-yourself:
+pipeable. Add a flag to change the format, `--work-unit` to name the stretch
+by one of its transcripts, or `--file` to analyze exactly one transcript:
 
 ```bash
 sumcp --json                                  # the session_overview payload
 sumcp --html > report.html                    # a self-contained HTML report
 
-sumcp --file <path/to/session.jsonl>          # ranked struggle areas, human-readable
+sumcp --work-unit <path/to/session.jsonl>     # the whole stretch containing that transcript
+sumcp --file <path/to/session.jsonl>          # that single transcript only
 sumcp --file <path/to/session.jsonl> --json   # the session_overview payload
 sumcp --file <path/to/session.jsonl> --html   # a self-contained HTML report
 ```
+
+`--file` stays single-transcript on purpose (an explicit path is an explicit
+scope) and prints a stderr note when the transcript is part of a larger
+stretch, so a partial report is never silent about being partial.
 
 Once installed, at the end of a session the Stop hook nudges you to run the
 **debrief skill**, which calls the tools below and narrates the result. On
@@ -288,38 +296,65 @@ magnitude smaller than re-reading the transcript.
 
 ---
 
-## Limitations
+## Findings and roadmap
 
-Read these before trusting a ranking.
+Building this produced findings as well as a tool. Each one below states what
+the measurement established and what happens to it next. The first two set the
+frame for how much weight a ranking should carry.
 
-- **Nobody but the author has run this.** Zero external users. Every number
-  below is internal consistency, not usefulness. This is the honest limit on
-  everything else here, and the top post-v0.1 item.
-- **One author, one machine, 39 outcomes.** The 8.9x figure comes from a
-  43-session corpus of a single person's working style, and precision is moderate:
-  roughly a third of flags recur. Treat the ranking as a measured hint, not
-  ground truth. The same small sample means it is equally underpowered to claim
-  the edit-count baseline is *better*.
-- **The ranking is a stated rule, not a model**, so it inherits the blind spots
-  of its keys. A file changed exactly once, carefully and wrongly, ranks low. It
-  has no idea what your code means.
-- **File class is a fixed extension table.** A project whose layout it misreads
-  is ranked accordingly, and that is the first thing to check when an ordering
-  looks wrong. Only the code-versus-docs-and-config boundary rests on adequate
-  data; the other tiers are declared judgments on thin cells.
-- **Heuristic signals are labeled as such.** A few (approval latency,
-  instant-accept) infer intent from edit shape and timing, and are suppressed
-  entirely when the session ran under auto-accept rather than reported as
-  meaningless numbers.
-- **The secrets blind spot is a policy signal, not a measured one.** It did not
-  exist when the corpus was measured, so it has no predictive validation. Its
-  table is deliberately narrow, because a false positive there teaches you to
-  ignore it.
-- **Single-session only.** No cross-session or cross-project memory yet, which
-  is the planned v0.2 direction.
+- **The signal is real on the corpus measured; external validation is the next
+  milestone.** Flagged files recurred at 8.9x the rate of unflagged ones on 43
+  of the author's own sessions, which establishes internal consistency. Running
+  suMCP against other people's sessions is the top post-v0.1 item, and the step
+  that turns these figures into evidence of usefulness rather than coherence.
+- **The sample is one author, one machine, 39 outcomes.** Within it the effect
+  holds and precision is moderate: roughly a third of flags recur, so a ranking
+  is a measured hint rather than ground truth. That same sample size is why this
+  README does not claim the edit-count baseline is worse, either. Growing the
+  corpus is what sharpens both directions, and is the reason external users come
+  first on the roadmap.
+- **A stated rule beat a fitted model, so the rule shipped.** Tuning the weights
+  against outcomes already in hand bought at most 4 more hits out of 39 and put
+  maximum weight on edit count anyway, so the score was deleted. The trade is
+  deliberate: you can verify any ordering by hand, and in exchange the ranking
+  inherits the blind spots of its keys. A file changed once, carefully and
+  wrongly, ranks low, because nothing here knows what your code means. New keys
+  get added when data supports them, which is exactly how file class got in.
+- **File class earned its place; the finer tiers have not yet.** The code versus
+  docs-and-config boundary rests on adequate data and cut false alarms by a fifth
+  at no cost to recall. The remaining tiers are declared judgments on thin cells,
+  and the extension table is fixed, so a project whose layout it misreads is the
+  first thing to check when an ordering looks off. Filling in those thin cells is
+  what would promote them from judgment to measurement.
+- **Heuristic signals are labeled and suppressed rather than dressed up.**
+  Approval latency and instant-accept infer intent from edit shape and timing,
+  so they carry the heuristic flag, and they go silent under auto-accept
+  instead of reporting a meaningless number. The suppression is per action:
+  the transcript's own `mode` events say which permission mode each action ran
+  under, so the stretches of a session that ran under normal mode still
+  produce signals instead of being thrown away with the rest.
+- **The secrets blind spot is a policy signal by design.** It postdates the
+  measured corpus, so it carries no predictive validation yet, and its table is
+  deliberately narrow because one false positive there teaches you to ignore the
+  whole signal. It widens in response to reported misses, not ahead of them.
+- **The reporting unit was wrong in v0.1, and the miss was measured at roughly
+  3x.** A single transcript is not how people work: one stretch of work in
+  this project's own corpus spanned 7 transcripts and 275 file operations,
+  split [88, 0, 0, 51, 49, 86, 1], so a debrief of "the most recent session"
+  showed at most 88 of 275, and landing on the wrong transcript showed zero.
+  v0.2 corrects the unit: reports now cover the whole stretch, the payload
+  disclosed the grouping, and an independent recount (a second, deliberately
+  naive counter in CI) holds every countable quantity to exact agreement,
+  because the undercount had survived 271 green tests whose fixtures shared
+  the code's own blind spot.
+- **Scope today is one stretch of work at a time.** Cross-session and
+  cross-project memory is the remaining v0.2 direction. Every payload carries
+  a `v` field (now `2`, for the work-unit contract) so a consumer can tell
+  the shapes apart as that lands.
 - **Two things differ on Windows**, both by design and both detailed under
   [Install](#install): no end-of-session nudge, and installed files are not
-  permission-restricted.
+  permission-restricted. ACL handling would mean a new dependency, so it is
+  queued behind evidence that someone needs it.
 
 ---
 

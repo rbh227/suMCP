@@ -6,6 +6,52 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-28
+
+The measurement-fidelity release: reports now cover the whole stretch of work,
+not one transcript file, and an independent recount holds every countable
+quantity to exact agreement. Motivated by a measured defect: one stretch of
+work spanned 7 transcripts and 275 file operations, and the v0.1 reporting
+unit showed at most 88 of them. See
+`docs/superpowers/specs/2026-07-28-v02-measurement-fidelity-design.md`.
+
+### Added
+- **Work units.** Transcripts in one project directory that overlap in time or
+  sit within 30 minutes of each other merge into one report: resumed sessions,
+  `/clear`s, and concurrent Claude Code instances (which become parallel
+  lanes, disclosed as negative gaps). The threshold is declared, not fitted;
+  grouping was measured to be almost insensitive to it across a 5-to-120
+  minute range. Bare `sumcp`, `--work-unit <transcript>`, and the MCP tools
+  all report the unit; `--file` stays single-transcript by design and prints
+  a stderr note when the named transcript is part of a larger stretch.
+- **A differential recount gate** (`scripts/recount.py`): a second,
+  deliberately naive counter over raw JSONL that must agree exactly with the
+  analyzer on edits, writes, reads, bash calls, and files touched, per
+  transcript and per disclosed work unit. Exists because the undercount above
+  survived 271 green tests whose fixtures were produced by the same code path
+  being tested. CI runs it against committed fixtures; the full-archive run
+  is local. Measured on the archive: 85 transcripts, 32 units, exact
+  agreement.
+- **`mode` and `origin` events adopted.** The parser was counting both as
+  unknown. `mode` makes auto-accept suppression per action instead of per
+  session, so normal-mode stretches keep their latency signals. `origin`
+  distinguishes human turns from harness-injected task notifications, which
+  no longer truncate the review-burden window. Absent fields default to the
+  old behaviour on pre-existing transcripts.
+- A performance guard test (16 members, 6400 actions, generous 10 s ceiling,
+  aimed at algorithmic regressions only) and measured numbers in the spec:
+  the real worst-case unit (14 transcripts, 23.8 MB) analyzes in about
+  0.25 s with under 35 MB peak RSS.
+
+### Changed
+- **BREAKING: payload contract v1 to v2.** Every payload's `v` is now `2`.
+  Payloads computed over a unit carry a `work_unit` block (rule, member ids,
+  gaps, span, drop count), and findings carry a `session` key resolving them
+  to their originating transcript whenever a `work_unit` block explains it.
+- Adjacency findings (rework, reverts, loops, failure attribution) key on
+  (transcript, lane) rather than lane alone, so a merged unit can never pair
+  two actions from different transcripts as if they were consecutive.
+
 ## [0.1.0] - 2026-07-26
 
 First release. Prebuilt archives for five targets, each built and executed in
@@ -67,4 +113,5 @@ CI before publishing.
   are not.
 - No external user has validated the ranking. That is the top post-v0.1 item.
 
+[0.2.0]: https://github.com/rbh227/suMCP/releases/tag/v0.2.0
 [0.1.0]: https://github.com/rbh227/suMCP/releases/tag/v0.1.0

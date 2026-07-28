@@ -1,45 +1,51 @@
 ---
 name: debrief
-description: End-of-session debrief grounded in suMCP evidence. Use at the end of a working session (or when the Stop hook nudges) to report honestly where the agent struggled, flip-flopped, or left blind spots — from transcript evidence, never from memory or self-report.
+description: End-of-session debrief grounded in suMCP evidence. Use at the end of a working session (or when the Stop hook nudges) to report honestly where the agent struggled, flip-flopped, or left blind spots, from transcript evidence, never from memory or self-report.
 ---
 
 # Session debrief
 
-Report what actually happened this session, grounded in suMCP's deterministic
-transcript evidence. Your own recollection is self-report; the tools are the
-record. Never answer from memory what the tools can answer from evidence.
+Report what actually happened this stretch of work, grounded in suMCP's
+deterministic transcript evidence. Your own recollection is self-report; the
+tools are the record. Never answer from memory what the tools can answer from
+evidence.
 
 ## Procedure
 
 1. If the invocation context provides a session id (the Stop-hook nudge
    includes one; a user request may name one), call
    `session_overview(session_id=...)` with it from the start. Otherwise call
-   `session_overview()` bare — the server may verify you opportunistically.
+   `session_overview()` bare; the server may verify you opportunistically.
    If it returns `error: ambiguous_session`, do NOT pick a candidate
    yourself: `cwd_match` is true for every session in this project and
    newest-mtime is exactly the recency guess this tool refuses to make
    (Claude Code flushes transcript writes late, so the live session is often
    not the newest file). Ask the user which session to debrief, listing the
    candidates' ids and mtimes.
+   If the payload carries a `work_unit` block, say how many transcripts the
+   report covers and over what span, because the user thinks in stretches of
+   work and not in transcript files. If the stretch is still in progress,
+   note that re-running later will cover more of it.
 2. Note the resolved id from the response (`session.id`) and pass it as
-   `session_id` on EVERY later call — opportunistic identification is not
+   `session_id` on EVERY later call, because opportunistic identification is not
    guaranteed to resolve twice.
 3. Call `struggle_areas(3, session_id=...)`.
 4. Call `blind_spots(session_id=...)`.
 5. Only if a top finding needs a concrete quote: `evidence(idxs,
    session_id=...)` for ONE finding. Do not bulk-fetch.
 6. Write the debrief. The duration comes from `session.duration_min` in the
-   overview (say "duration unknown" if it is null — do not estimate).
+   overview (say "duration unknown" if it is null, never estimated).
    **Hard budget: 500 tokens.** Do not re-read any transcript, file history,
    or prior conversation to "check" the tools.
 
 ## Output contract
 
 ```
-## Session debrief — <duration>, <edits> edits across <files> files
+## Debrief: <duration>, <edits> edits across <files> files
+   (<N> transcripts merged, when the payload disclosed a work unit)
 
 **Where I struggled:**
-1. <file> (<top categories with counts>) — one sentence of what happened,
+1. <file> (<top categories with counts>), one sentence of what happened,
    with [idx] citations after each claim.
 2. …
 3. …
@@ -75,4 +81,4 @@ record. Never answer from memory what the tools can answer from evidence.
 
 When the MCP server is not yet available, read the payloads from
 `fixtures/mock-payloads/*.json` instead of calling tools. The output contract
-is identical — this mode exists to validate the narration contract (T0.2).
+is identical; this mode exists to validate the narration contract (T0.2).
