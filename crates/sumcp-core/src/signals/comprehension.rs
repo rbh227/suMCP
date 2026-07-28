@@ -83,6 +83,9 @@ fn large_write_instant_accept(s: &Session) -> Vec<Finding> {
         .iter()
         // Main lane only: comprehension debt is a claim about the human, and a
         // subagent lane has no human gating its writes (design §5 corollary).
+        // Deliberately `.lane`, not `.lane_key()`: this asks "is this a
+        // main-agent action", which is a meaningful question in any
+        // transcript, not a pairing that needs a same-transcript guarantee.
         .filter(|a| a.lane == Lane::Main && is_large_write(a) && accepted_instantly(a))
         .map(|a| {
             let latency = a.approval_latency_s.unwrap_or(0.0);

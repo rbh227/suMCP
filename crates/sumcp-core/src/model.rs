@@ -333,7 +333,15 @@ pub struct UserText {
 }
 
 /// A fully parsed session: ordered actions plus parse-health counters.
+///
+/// `Default` is `#[cfg(test)]`-only, same reasoning as `Action`'s: it lets a
+/// unit test build a throwaway `Session` and set only the two or three
+/// fields it cares about (usually `actions` and `session_ids`), instead of
+/// spelling out this whole struct every time. Unlike `Action`, every field
+/// here already implements `Default` on its own, so the derive does the
+/// work instead of a hand-written impl.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(test, derive(Default))]
 pub struct Session {
     /// All actions, in the total order (so `actions[i].idx == Idx(i)`).
     pub actions: Vec<Action>,

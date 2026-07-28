@@ -105,12 +105,16 @@ fn attribute(
     }
 
     // Step 3: the most recent Edit/Write within PROXIMITY_WINDOW actions back,
-    // IN THE SAME LANE (spec §5a). A failure in one lane is only ever caused by
-    // an edit in that same lane; cross-lane adjacency in the merged order is
-    // coincidental. Trade-off: heavy interleaving narrows the effective window.
+    // IN THE SAME (transcript, lane) (spec §5a). A failure in one lane is only
+    // ever caused by an edit in that same lane; cross-lane adjacency in the
+    // merged order is coincidental. `lane_key()` (not `.lane`) also keeps two
+    // merged transcripts from sharing credit/blame through their identical
+    // `Lane::Main`: a failing command in transcript B must never be attributed
+    // to an edit that happened in transcript A. Trade-off: heavy interleaving
+    // narrows the effective window.
     let start = pos.saturating_sub(PROXIMITY_WINDOW);
     if let Some(prev) = s.actions[start..pos].iter().rev().find(|p| {
-        p.lane == a.lane
+        p.lane_key() == a.lane_key()
             && matches!(p.kind, ActionKind::Edit | ActionKind::Write)
             && p.file_path.is_some()
     }) {

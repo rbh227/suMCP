@@ -40,12 +40,20 @@ const LOOP_MIN_REPEATS: usize = 3;
 /// mechanism — ranking multiplies these by `low_confidence_factor`.
 fn action_loops(s: &Session) -> Vec<Finding> {
     let mut out = Vec::new();
-    // Per lane: a run in the main lane must not be broken (or created) by an
-    // interleaved subagent doing its own thing.
-    let lanes: std::collections::BTreeSet<&crate::model::Lane> =
-        s.actions.iter().map(|a| &a.lane).collect();
-    for lane in lanes {
-        let lane_actions: Vec<&Action> = s.actions.iter().filter(|a| &a.lane == lane).collect();
+    // Per (transcript, lane): a run in the main lane must not be broken (or
+    // created) by an interleaved subagent doing its own thing. Grouping by
+    // `.lane` alone would also be WRONG once several transcripts are merged:
+    // every transcript has its own `Lane::Main`, so two unrelated transcripts
+    // would be treated as one lane and their calls compared for a loop that
+    // never happened. `lane_key()` folds in `session_ix` so lanes from
+    // different transcripts never collide. Kept as a `BTreeSet` (not a `Vec`)
+    // so each distinct key is visited once — a `Vec` would run this whole
+    // O(n) pass once per ACTION instead of once per lane, and would emit the
+    // same finding once per action in that lane.
+    let keys: std::collections::BTreeSet<(u16, &crate::model::Lane)> =
+        s.actions.iter().map(|a| a.lane_key()).collect();
+    for key in keys {
+        let lane_actions: Vec<&Action> = s.actions.iter().filter(|a| a.lane_key() == key).collect();
         let mut run: Vec<&Action> = Vec::new();
         // `chain(None)` appends one non-action so the loop flushes the final run.
         for a in lane_actions
@@ -115,11 +123,12 @@ pub(crate) fn segments(s: &Session) -> Vec<Segment<'_>> {
         user_line_no: None,
         actions: Vec::new(),
     };
-    for a in s
-        .actions
-        .iter()
-        .filter(|a| a.lane == crate::model::Lane::Main)
-    {
+    for a in s.actions.iter().filter(|a| {
+        // Deliberately `.lane`, not `.lane_key()`: this asks "is this a
+        // main-agent action", which is a meaningful question in any
+        // transcript, not "is this the same lane as some other action".
+        a.lane == crate::model::Lane::Main
+    }) {
         // Every user message at or before this action's line opens a fresh
         // segment (the LAST such message wins when several are adjacent).
         let mut crossed = None;
@@ -246,12 +255,17 @@ fn reverts_and_flips(s: &Session) -> Vec<Finding> {
     let mut out = Vec::new();
     for (i, later) in edits.iter().enumerate() {
         for earlier in &edits[..i] {
-            // same LANE, same file, and the later edit puts back what the
-            // earlier removed. Lane guard (spec §5a): a revert is one actor
-            // undoing its own change — a cross-lane content coincidence on a
-            // shared path is not a revert, and a subagent edit's line_no
-            // indexes a different file than the main-lane pushback stream.
-            if earlier.lane == later.lane
+            // same (transcript, lane), same file, and the later edit puts
+            // back what the earlier removed. Lane guard (spec §5a): a revert
+            // is one actor undoing its own change — a cross-lane content
+            // coincidence on a shared path is not a revert, and a subagent
+            // edit's line_no indexes a different file than the main-lane
+            // pushback stream. `lane_key()` (not `.lane`) additionally keeps
+            // this from firing across two merged transcripts: both have a
+            // `Lane::Main`, so an edit in transcript A "restoring" what an
+            // edit in transcript B removed is a coincidence of two separate
+            // starting states, never a real revert.
+            if earlier.lane_key() == later.lane_key()
                 && earlier.file_path == later.file_path
                 && later.edit_new == earlier.edit_old
             {
@@ -262,6 +276,11 @@ fn reverts_and_flips(s: &Session) -> Vec<Finding> {
                 // A sub-lane edit's line_no indexes a different file, so those
                 // numbers are incomparable — a sub self-revert stays a
                 // TrueRevert (correct) and is never upgraded to a Flip (§5a).
+                //
+                // Deliberately `.lane`, not `.lane_key()`: this asks "is this
+                // a main-agent action", which is a meaningful question in any
+                // transcript. The pairing above already guaranteed both
+                // actions come from the same transcript (via `lane_key()`).
                 let is_flip = later.lane == crate::model::Lane::Main
                     && pushback_between(s, earlier.line_no, later.line_no)
                         .is_some_and(|push| !evidence_between(s, push, later));
@@ -781,5 +800,78 @@ mod tests {
         );
         let share = read_before_edit_share(&ingest_str(&raw, Lane::Main));
         assert!((share - 0.5).abs() < 1e-9, "1 of 2 edits was read-first");
+    }
+
+    #[test]
+    // Field-by-field construction (see the same allow in model.rs) keeps the
+    // two or three fields each test actually cares about visible, instead of
+    // burying them inside one long struct literal.
+    #[allow(clippy::field_reassign_with_default)]
+    fn true_revert_does_not_fire_across_two_sessions() {
+        // Session 0 writes "a" -> "b". Session 1 later writes "b" -> "a".
+        // Read as one lane that is a textbook revert. They are different
+        // transcripts, so it must NOT fire: the second session simply had a
+        // different starting state, and calling that a revert would invent a
+        // struggle that never happened.
+        let mut s = Session::default();
+        let mut first = Action::default();
+        first.idx = Idx(0);
+        first.effective_ts = "2026-01-01T00:00:01Z".into();
+        first.lane = Lane::Main;
+        first.session_ix = 0;
+        first.kind = ActionKind::Edit;
+        first.file_path = Some("/a.rs".into());
+        first.edit_old = Some("a".into());
+        first.edit_new = Some("b".into());
+
+        let mut second = Action::default();
+        second.idx = Idx(1);
+        second.effective_ts = "2026-01-01T00:00:02Z".into();
+        second.lane = Lane::Main;
+        second.session_ix = 1; // the only difference that matters
+        second.kind = ActionKind::Edit;
+        second.file_path = Some("/a.rs".into());
+        second.edit_old = Some("b".into());
+        second.edit_new = Some("a".into());
+
+        s.actions = vec![first, second];
+        s.session_ids = vec!["sess-0".into(), "sess-1".into()];
+
+        let findings = reverts_and_flips(&s);
+        assert!(
+            findings.is_empty(),
+            "a revert must never span two transcripts, got {findings:?}"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn true_revert_still_fires_within_one_session() {
+        // The same shape, both actions in session 0: this IS a revert.
+        let mut s = Session::default();
+        let mut first = Action::default();
+        first.idx = Idx(0);
+        first.effective_ts = "2026-01-01T00:00:01Z".into();
+        first.lane = Lane::Main;
+        first.session_ix = 0;
+        first.kind = ActionKind::Edit;
+        first.file_path = Some("/a.rs".into());
+        first.edit_old = Some("a".into());
+        first.edit_new = Some("b".into());
+
+        let mut second = first.clone();
+        second.idx = Idx(1);
+        second.effective_ts = "2026-01-01T00:00:02Z".into();
+        second.edit_old = Some("b".into());
+        second.edit_new = Some("a".into());
+
+        s.actions = vec![first, second];
+        s.session_ids = vec!["sess-0".into()];
+
+        assert_eq!(
+            reverts_and_flips(&s).len(),
+            1,
+            "within one session it fires"
+        );
     }
 }
