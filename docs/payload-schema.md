@@ -17,7 +17,11 @@ connected agent narrates.
 | `session.id` | session uuid |
 | `session.identified_by` | **provenance, ADR A4**: `tool_use_id` (verified self-identification), `explicit` (caller passed session_id), or `cli_latest` (CLI-only recency mode). MCP never emits a guess. |
 | `truncated` | `true` whenever any cap trimmed content |
-| `work_unit` | **present only when several transcripts were merged into one report** (T7); see the dedicated section below. Absent for a single-transcript analysis. |
+
+`work_unit` is **not** part of this envelope: it appears only on
+`session_overview`, and only when several transcripts were merged into one
+report (T7). See the dedicated section below. Every other payload never
+carries a `work_unit` key, merged or not.
 
 ## Finding shape
 
@@ -274,6 +278,14 @@ action at that index carries a `session_ix` into the work unit's transcript
 table). Present only when `work_unit` is present: a single-transcript
 report has nothing to disambiguate, so the key is omitted rather than always
 printing the one transcript id.
+
+This is enforced by construction, not just by convention: `finding_session`
+(the one function that produces a `session` value) returns `None` unless
+BOTH the session table has two or more entries AND the caller supplied a
+work unit (`meta.unit.is_some()`). A caller that passes a merged
+multi-transcript `Session` while leaving the work unit unset gets no
+`session` keys at all, so a `session` key can never appear on a payload that
+has no `work_unit` block to explain it.
 
 Ranked entries never carry `session`, in `struggle_areas`' files or
 `session_overview`'s `top_struggles`: a ranked file spans the whole work unit

@@ -133,10 +133,18 @@ fn short_id(id: &str) -> String {
 }
 
 /// Which transcript a finding's evidence came from, as a short id. `None`
-/// when the finding has no evidence indices or the analysis was a single
-/// transcript (in which case there is nothing to disambiguate).
-fn finding_session(s: &Session, idxs: &[Idx]) -> Option<String> {
-    if s.session_ids.len() < 2 {
+/// when the finding has no evidence indices, the analysis was a single
+/// transcript, or the caller never supplied a work unit.
+///
+/// Both conditions matter, not just `session_ids.len()`: the schema (T7)
+/// guarantees a `session` key on a finding only when a `work_unit` block is
+/// also present on the payload, and `work_unit` is driven entirely by
+/// `meta.unit`, not by the session table. Without this check, a caller that
+/// passes a merged multi-transcript `Session` while leaving `unit: None`
+/// (exactly what `sumcp-mcp/src/server.rs` does today) would emit `session`
+/// keys on findings with no `work_unit` block to explain them.
+fn finding_session(s: &Session, meta: &SessionMeta, idxs: &[Idx]) -> Option<String> {
+    if meta.unit.is_none() || s.session_ids.len() < 2 {
         return None;
     }
     let first = idxs.first()?;
@@ -384,18 +392,42 @@ pub fn session_overview(s: &Session, ranked: &[FileScore], meta: &SessionMeta) -
         // single-transcript analysis, which is what keeps that payload
         // byte-identical to v0.1 apart from the version bump.
         if let Some(u) = &meta.unit {
+            // `span_start`/`span_end` come from `TranscriptSpan { first, last }`,
+            // which is scraped straight out of a transcript's JSONL lines: it is
+            // untrusted, caller-controlled text, not something suMCP generates.
+            // Every other timestamp in this file goes through the same
+            // `elide_middle`/`TS_MAX` pair for exactly that reason (see
+            // `started` above, and `file_story`'s and `evidence`'s `t` fields).
+            // It matters more here than elsewhere: `work_unit` is MEASURED by
+            // the `shrink_to_fit` loop above but is not one of its knobs (the
+            // loop only shrinks `unknown_event_types`), so a transcript whose
+            // timestamp field is a 20 KB string would blow `CAP_OVERVIEW` with
+            // nothing left able to trim it back down.
+            let span_start_cut = would_elide(&u.span_start, TS_MAX);
+            let span_end_cut = would_elide(&u.span_end, TS_MAX);
             out["work_unit"] = json!({
                 "rule": WORK_UNIT_RULE,
                 "sessions": u.sessions,
-                "joined_gaps_min": u.joined_gaps_min,
-                "span_start": u.span_start,
-                "span_end": u.span_end,
+                // Rounded like every other float in this module (`round2`): an
+                // unrounded gap serializes as up to 17 characters (e.g. a real
+                // 331-second gap is "5.516666666666667"), roughly 3x the token
+                // cost of the rounded value, for precision nobody reads.
+                "joined_gaps_min": u.joined_gaps_min.iter().copied().map(round2).collect::<Vec<_>>(),
+                "span_start": elide_middle(&u.span_start, TS_MAX),
+                "span_end": elide_middle(&u.span_end, TS_MAX),
                 "session_ids": u.session_ids
                     .iter()
                     .map(|s| short_id(s))
                     .collect::<Vec<_>>(),
                 "dropped": u.dropped,
             });
+            // Fold into the same `truncated` disclosure every other cut in this
+            // file uses: only ever flip it to `true`, never back to `false`,
+            // so an earlier cut (a sampled type map, a capped id) can never be
+            // masked by this one not firing.
+            if span_start_cut || span_end_cut {
+                out["truncated"] = json!(true);
+            }
         }
         out
     })
@@ -433,7 +465,7 @@ pub fn struggle_areas(s: &Session, ranked: &[FileScore], meta: &SessionMeta, n: 
                     "class": f.class, "edits": f.edits,
                     "breakdown": f.breakdown,
                     "findings": kept.iter()
-                        .map(|f| compact_finding(f, finding_session(s, &f.idxs)))
+                        .map(|f| compact_finding(f, finding_session(s, meta, &f.idxs)))
                         .collect::<Vec<_>>()
                 });
                 // Same disclosure contract as `file_story`'s `elided` count:
@@ -587,7 +619,7 @@ pub fn blind_spots(s: &Session, meta: &SessionMeta) -> Value {
         let list = |v: &[&Finding]| -> Vec<Value> {
             v.iter()
                 .take(k)
-                .map(|f| compact_finding(f, finding_session(s, &f.idxs)))
+                .map(|f| compact_finding(f, finding_session(s, meta, &f.idxs)))
                 .collect()
         };
         json!({
@@ -761,6 +793,25 @@ mod tests {
             id: "abc".into(),
             identified_by: "explicit".into(),
             unit: None,
+        }
+    }
+
+    /// A `meta()` with a work unit attached. `finding_session` requires
+    /// BOTH a multi-transcript session table AND a caller-supplied unit
+    /// (item 3): tests that want a `session` key on a finding need this,
+    /// not `meta()`.
+    fn meta_with_unit() -> SessionMeta {
+        SessionMeta {
+            id: "abc".into(),
+            identified_by: "explicit".into(),
+            unit: Some(UnitMeta {
+                sessions: 2,
+                joined_gaps_min: vec![5.0],
+                span_start: "2026-01-01T00:00:00Z".into(),
+                span_end: "2026-01-01T01:00:00Z".into(),
+                session_ids: vec!["aaaaaaaa".into(), "bbbbbbbb".into()],
+                dropped: 0,
+            }),
         }
     }
 
@@ -967,12 +1018,15 @@ mod tests {
     /// actions, one from each transcript, so `finding_session` has something
     /// real to resolve. `Idx(0)` is transcript "aaaaaaaa", `Idx(1)` is
     /// "bbbbbbbb".
-    #[allow(clippy::field_reassign_with_default)]
     fn two_transcript_session() -> Session {
-        let mut a0 = Action::default();
-        a0.session_ix = 0;
-        let mut a1 = Action::default();
-        a1.session_ix = 1;
+        let a0 = Action {
+            session_ix: 0,
+            ..Default::default()
+        };
+        let a1 = Action {
+            session_ix: 1,
+            ..Default::default()
+        };
         Session {
             session_ids: vec!["aaaaaaaa".into(), "bbbbbbbb".into()],
             actions: vec![a0, a1],
@@ -983,14 +1037,18 @@ mod tests {
     #[test]
     fn finding_session_resolves_a_finding_to_the_transcript_its_evidence_came_from() {
         let s = two_transcript_session();
+        let m = meta_with_unit();
         assert_eq!(
-            finding_session(&s, &[Idx(1)]),
+            finding_session(&s, &m, &[Idx(1)]),
             Some("bbbbbbbb".to_string()),
             "idx 1's action has session_ix 1, which is session_ids[1]"
         );
-        assert_eq!(finding_session(&s, &[Idx(0)]), Some("aaaaaaaa".to_string()));
         assert_eq!(
-            finding_session(&s, &[]),
+            finding_session(&s, &m, &[Idx(0)]),
+            Some("aaaaaaaa".to_string())
+        );
+        assert_eq!(
+            finding_session(&s, &m, &[]),
             None,
             "no evidence idxs, nothing to resolve"
         );
@@ -1004,34 +1062,76 @@ mod tests {
             actions: vec![Action::default()],
             ..Session::default()
         };
-        assert_eq!(finding_session(&s, &[Idx(0)]), None);
+        assert_eq!(finding_session(&s, &meta_with_unit(), &[Idx(0)]), None);
+    }
+
+    #[test]
+    fn finding_session_is_none_without_a_work_unit_even_with_two_transcripts() {
+        // Item 3 (T7 review): the two conditions are independent. A caller
+        // can pass a merged, multi-transcript `Session` (`session_ids.len()
+        // >= 2`) while leaving `unit: None`; this is exactly what
+        // `sumcp-mcp/src/server.rs` does today. Without this check that
+        // caller would get `session` keys on findings with no `work_unit`
+        // block on the payload to explain them, breaking the schema's
+        // guarantee that `session` implies `work_unit`.
+        let s = two_transcript_session();
+        assert_eq!(
+            finding_session(&s, &meta(), &[Idx(1)]),
+            None,
+            "two transcripts but no work unit supplied: nothing to disclose"
+        );
+    }
+
+    fn churn_finding_at(idx: Idx, file: &str) -> Finding {
+        Finding {
+            kind: crate::model::FindingKind::Churn,
+            tier: crate::model::Tier::T1,
+            exact: true,
+            confidence: crate::model::Confidence::High,
+            idxs: vec![idx],
+            file: Some(file.to_string()),
+            note: None,
+            nums: Default::default(),
+        }
     }
 
     #[test]
     fn struggle_areas_stamps_a_finding_with_the_transcript_it_came_from() {
         let s = two_transcript_session();
         let file = "/a.ts";
-        let finding = Finding {
-            kind: crate::model::FindingKind::Churn,
-            tier: crate::model::Tier::T1,
-            exact: true,
-            confidence: crate::model::Confidence::High,
-            idxs: vec![Idx(1)],
-            file: Some(file.to_string()),
-            note: None,
-            nums: Default::default(),
-        };
         let ranked = vec![FileScore {
             class: crate::file_class::classify(file),
             edits: 1,
             file: file.into(),
             breakdown: [("churn".to_string(), 1u64)].into_iter().collect(),
-            findings: vec![finding],
+            findings: vec![churn_finding_at(Idx(1), file)],
         }];
-        let p = struggle_areas(&s, &ranked, &meta(), 5);
+        let p = struggle_areas(&s, &ranked, &meta_with_unit(), 5);
         assert_eq!(
             p["files"][0]["findings"][0]["session"], "bbbbbbbb",
             "the finding's one proving idx lands on transcript 1"
+        );
+    }
+
+    #[test]
+    fn struggle_areas_omits_session_when_no_work_unit_even_with_two_transcripts() {
+        // Item 3 test (as requested): a merged two-transcript `Session` with
+        // `unit: None` must produce no `session` key on any finding. Same
+        // setup as the test above, `meta()` instead of `meta_with_unit()`.
+        let s = two_transcript_session();
+        let file = "/a.ts";
+        let ranked = vec![FileScore {
+            class: crate::file_class::classify(file),
+            edits: 1,
+            file: file.into(),
+            breakdown: [("churn".to_string(), 1u64)].into_iter().collect(),
+            findings: vec![churn_finding_at(Idx(1), file)],
+        }];
+        let p = struggle_areas(&s, &ranked, &meta(), 5);
+        assert!(
+            p["files"][0]["findings"][0].get("session").is_none(),
+            "no work_unit supplied, so no session key may appear: {}",
+            p["files"][0]["findings"][0]
         );
     }
 
@@ -1287,6 +1387,30 @@ mod tests {
     }
 
     #[test]
+    fn blind_spots_stamps_a_finding_with_the_transcript_it_came_from() {
+        // Direct mirror of
+        // `struggle_areas_stamps_a_finding_with_the_transcript_it_came_from`
+        // (item 5, T7 review): `blind_spots`' stamping went untested even
+        // though `blind_spots` is the riskiest judgment call in the change.
+        // `blind_spots` computes its own findings via `score::all_findings`
+        // rather than taking them from the caller, so this session is built
+        // with `ingest_str` (for a real `SecretsFileTouched` finding) and
+        // then hand-stamped as transcript 1 of 2, the same way a real
+        // work-unit merge would number a second transcript's actions.
+        let raw = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:01Z","message":{"content":[{"type":"tool_use","id":"r1","name":"Read","input":{"file_path":"/repo/.env"}}]}}"#;
+        let mut s = crate::ingest::ingest_str(raw, crate::model::Lane::Main);
+        for a in &mut s.actions {
+            a.session_ix = 1;
+        }
+        s.session_ids = vec!["aaaaaaaa".into(), "bbbbbbbb".into()];
+        let p = blind_spots(&s, &meta_with_unit());
+        assert_eq!(
+            p["secrets_file_touched"][0]["session"], "bbbbbbbb",
+            "the finding's one proving idx lands on transcript 1"
+        );
+    }
+
+    #[test]
     fn blind_spots_holds_its_cap_with_thousands_of_findings() {
         let s = blind_spot_storm(2000);
         let p = blind_spots(&s, &meta());
@@ -1389,6 +1513,46 @@ mod tests {
         assert!(
             v.get("work_unit").is_none(),
             "a single-transcript analysis has no grouping to disclose"
+        );
+    }
+
+    #[test]
+    fn session_overview_holds_its_cap_with_a_full_work_unit() {
+        // Item 4 (T7 review): both adversarial cap tests above pass
+        // `unit: None`, so the largest possible `work_unit` block
+        // (`MAX_WORK_UNIT_SESSIONS` transcript ids, one fewer gaps) never
+        // actually met the cap by construction, only by arithmetic in a
+        // reviewer's head. Built with realistic-length uuids and messy,
+        // unrounded gap values so item 6's rounding is exercised for real
+        // rather than on the fixture's already-tidy numbers.
+        let sessions = crate::work_unit::MAX_WORK_UNIT_SESSIONS;
+        let s = Session::default();
+        let m = SessionMeta {
+            id: "abc".into(),
+            identified_by: "explicit".into(),
+            unit: Some(UnitMeta {
+                sessions,
+                joined_gaps_min: (0..sessions - 1)
+                    .map(|i| (i as f64 + 1.0) * 5.516_666_666_666_667)
+                    .collect(),
+                span_start: "2026-01-01T00:00:00Z".into(),
+                span_end: "2026-01-05T00:00:00Z".into(),
+                session_ids: (0..sessions)
+                    .map(|i| format!("{i:08x}-aaaa-bbbb-cccc-dddddddddddd"))
+                    .collect(),
+                dropped: 0,
+            }),
+        };
+        let p = session_overview(&s, &[], &m);
+        assert!(
+            est_tokens(&p) <= CAP_OVERVIEW,
+            "over cap: ~{} tokens",
+            est_tokens(&p)
+        );
+        assert_eq!(p["work_unit"]["sessions"], sessions as u64);
+        assert_eq!(
+            p["work_unit"]["session_ids"].as_array().unwrap().len(),
+            sessions
         );
     }
 }
