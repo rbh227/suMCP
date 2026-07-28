@@ -41,6 +41,21 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: cargo package -p sumcp-core -p sumcp-cli -p sumcp-mcp --no-verify --allow-dirty
 
+  # The differential recount gate: a second, deliberately naive count of every
+  # countable quantity that must agree with the analyzer exactly. CI runs it
+  # against committed fixtures only; the full-archive run stays local, because
+  # the archive holds unredacted transcripts and must never be committed.
+  recount:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release binary
+        run: cargo build --release -p sumcp-cli
+      - name: Differential recount against fixtures
+        run: python3 scripts/recount.py --fixtures
+
   # Native Windows. `cargo check` from a Mac proves it compiles; only this job
   # proves it WORKS, by running the same suite as every other platform. Kept
   # separate from the `test` matrix because Windows skips two things the others
