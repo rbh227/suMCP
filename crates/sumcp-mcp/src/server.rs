@@ -281,7 +281,7 @@ impl ServerHandler for SumcpServer {
 
         // Error detail is caller-visible: session id + error kind only —
         // never the absolute path (it leaks the home dir / username).
-        let session = self.store.load(&resolved.path).map_err(|e| {
+        let loaded = self.store.load(&resolved.path).map_err(|e| {
             ErrorData::internal_error(
                 format!(
                     "could not read transcript for session '{}': {}",
@@ -294,30 +294,31 @@ impl ServerHandler for SumcpServer {
         let meta = SessionMeta {
             id: resolved.id,
             identified_by: resolved.identified_by.into(),
-            // Wiring the real work-unit grouping into the MCP server is a
-            // later task; `session_overview` already knows how to render one
-            // once it is populated (see `SessionMeta::unit`'s doc).
-            unit: None,
+            // `loaded` now covers the whole work unit the caller's transcript
+            // belongs to (see `store.rs`), so this is the real grouping
+            // rather than a permanent `None`.
+            unit: loaded.meta_unit.clone(),
         };
-        let ranked = rank(&session);
+        let session = &loaded.session;
+        let ranked = rank(session);
 
         let payload = match request.name.as_ref() {
-            "session_overview" => payloads::session_overview(&session, &ranked, &meta),
+            "session_overview" => payloads::session_overview(session, &ranked, &meta),
             "struggle_areas" => {
                 let n = args.get("n").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
-                payloads::struggle_areas(&session, &ranked, &meta, n)
+                payloads::struggle_areas(session, &ranked, &meta, n)
             }
             "file_story" => {
                 let path = args.get("path").and_then(|v| v.as_str()).ok_or_else(|| {
                     ErrorData::invalid_params("file_story requires a 'path' string", None)
                 })?;
-                payloads::file_story(&session, path, &meta)
+                payloads::file_story(session, path, &meta)
             }
-            "blind_spots" => payloads::blind_spots(&session, &meta),
-            "context_health" => payloads::context_health(&session, &meta),
+            "blind_spots" => payloads::blind_spots(session, &meta),
+            "context_health" => payloads::context_health(session, &meta),
             "evidence" => {
                 let idxs = parse_idxs(&args).map_err(|msg| ErrorData::invalid_params(msg, None))?;
-                payloads::evidence(&session, &idxs, &meta)
+                payloads::evidence(session, &idxs, &meta)
             }
             other => {
                 return Err(ErrorData::invalid_params(
@@ -350,6 +351,91 @@ mod tests {
 
     fn meta_map(v: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
         serde_json::from_value(v).unwrap()
+    }
+
+    impl SumcpServer {
+        /// Test-only mirror of `call_tool`. The real `call_tool` takes a
+        /// `RequestContext<RoleServer>`, which rmcp only builds through a live
+        /// connection, so it is awkward to construct by hand in a unit test.
+        /// This helper walks the SAME steps `call_tool` does (resolve the
+        /// session, load it through the store, dispatch to the right
+        /// `payloads::` function) but hands back the parsed `serde_json::Value`
+        /// directly instead of wrapping it in rmcp's `CallToolResult`. Every
+        /// test in this module that needs to inspect an actual payload should
+        /// go through this rather than reaching into `payloads::` itself, so
+        /// the test exercises the real resolve-then-load path.
+        async fn call_tool_for_test(
+            &self,
+            name: &str,
+            args: &serde_json::Map<String, serde_json::Value>,
+        ) -> Result<serde_json::Value, String> {
+            let resolved = self
+                .resolve(args, None)
+                .await
+                .map_err(|e| format!("identify failed: {e:?}"))?;
+            let loaded = self
+                .store
+                .load(&resolved.path)
+                .map_err(|e| format!("load failed: {}", e.kind()))?;
+            let meta = SessionMeta {
+                id: resolved.id,
+                identified_by: resolved.identified_by.into(),
+                unit: loaded.meta_unit.clone(),
+            };
+            let ranked = rank(&loaded.session);
+            let payload = match name {
+                "session_overview" => payloads::session_overview(&loaded.session, &ranked, &meta),
+                "struggle_areas" => {
+                    let n = args.get("n").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
+                    payloads::struggle_areas(&loaded.session, &ranked, &meta, n)
+                }
+                "file_story" => {
+                    let path = args
+                        .get("path")
+                        .and_then(|v| v.as_str())
+                        .ok_or("file_story requires a 'path' string")?;
+                    payloads::file_story(&loaded.session, path, &meta)
+                }
+                "blind_spots" => payloads::blind_spots(&loaded.session, &meta),
+                "context_health" => payloads::context_health(&loaded.session, &meta),
+                "evidence" => {
+                    let idxs = parse_idxs(args)?;
+                    payloads::evidence(&loaded.session, &idxs, &meta)
+                }
+                other => return Err(format!("unknown tool '{other}'")),
+            };
+            Ok(payload)
+        }
+    }
+
+    #[tokio::test]
+    async fn tools_report_the_work_unit_not_one_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        let id_a = "aaaaaaaa-1111-2222-3333-444455556666";
+        let id_b = "bbbbbbbb-1111-2222-3333-444455556666";
+        let line = |sess: &str, ts: &str, path: &str| {
+            format!(
+                r#"{{"type":"assistant","timestamp":"{ts}","sessionId":"{sess}","message":{{"content":[{{"type":"tool_use","id":"e1","name":"Edit","input":{{"file_path":"{path}","old_string":"a","new_string":"b"}}}}]}}}}"#
+            )
+        };
+        std::fs::write(
+            dir.path().join(format!("{id_a}.jsonl")),
+            line(id_a, "2026-01-01T00:00:00Z", "/x.rs"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join(format!("{id_b}.jsonl")),
+            line(id_b, "2026-01-01T00:05:00Z", "/y.rs"),
+        )
+        .unwrap();
+
+        let args = meta_map(serde_json::json!({"session_id": id_b}));
+        let out = server(dir.path())
+            .call_tool_for_test("session_overview", &args)
+            .await
+            .expect("a payload");
+        assert_eq!(out["work_unit"]["sessions"], 2);
+        assert_eq!(out["totals"]["edits"], 2);
     }
 
     #[test]

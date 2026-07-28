@@ -1,60 +1,101 @@
-//! Memoized transcript loading (ADR A3) with resource caps (ADR A9(3)).
+//! Memoized work-unit loading (ADR A3) with resource caps (ADR A9(3)).
 //!
-//! A long-lived MCP server gets called many times while the transcript keeps
-//! growing on disk. Re-parsing 6 MB of JSONL on *every* call would be wasteful;
-//! holding a parsed model forever would go stale. The middle path: stat the
-//! file on each call and re-parse only when `(mtime, size)` changed. Stat is
-//! microseconds; parse is ~tens of ms — so calls are always fresh and almost
-//! always cheap.
+//! A long-lived MCP server gets called many times while the transcripts it
+//! is reading keep growing on disk, and the "unit" (the several transcripts
+//! making up one continuous stretch of work, see `sumcp_core::work_unit`)
+//! can also gain a brand-new sibling transcript at any moment. Re-parsing
+//! several MB of JSONL on *every* call would be wasteful; holding a parsed
+//! unit forever would go stale. The middle path: cheaply re-check whether the
+//! unit still looks the same on every call, and only redo the expensive
+//! parse-and-merge work when something has actually changed.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-// `Arc` = atomically reference-counted pointer. Handing out `Arc<Session>`
-// lets every caller share one parsed model without cloning the whole thing;
-// the model is dropped when the last holder lets go.
+// `Arc` = atomically reference-counted pointer. Handing out `Arc<LoadedUnit>`
+// lets every caller share one parsed unit without cloning the whole thing;
+// the unit is dropped when the last holder lets go.
 use std::sync::Arc;
-use std::time::SystemTime;
-use sumcp_core::assemble::{MAX_TRANSCRIPT_BYTES as CORE_MAX_BYTES, load_session};
+use sumcp_core::assemble::{MAX_TRANSCRIPT_BYTES as CORE_MAX_BYTES, load_work_unit};
 use sumcp_core::model::Session;
+use sumcp_core::payloads::{UnitMeta, unit_meta_from};
+use sumcp_core::work_unit::discover_work_unit;
 
-/// Cap on cached parsed sessions (T4.2). A long-lived server that outlives
-/// many sessions would otherwise hold every model it ever parsed; parsed
-/// models run to tens of MB each. Four covers the realistic concurrent case
-/// (a couple of open sessions plus one or two recently closed).
+/// Cap on cached parsed units (T4.2). A long-lived server that outlives many
+/// sessions would otherwise hold every unit it ever parsed; parsed units run
+/// to tens of MB each. Four covers the realistic concurrent case (a couple of
+/// open sessions plus one or two recently closed).
 const MAX_CACHE_ENTRIES: usize = 4;
 
-/// Stat a list of subagent paths into (path, mtime, size) fingerprints,
-/// skipping any that vanished (a vanished sub file forces a reload).
+/// What the store caches: a fully assembled work unit plus the grouping
+/// description its payloads need.
+#[derive(Debug)]
+pub struct LoadedUnit {
+    /// The merged session covering the whole unit.
+    pub session: Session,
+    /// The grouping, or `None` when the unit turned out to be one transcript.
+    pub meta_unit: Option<UnitMeta>,
+}
+
+/// Stat every path into a `(path, mtime-in-seconds, size)` fingerprint,
+/// dropping any that no longer exist, then sort so the result does not depend
+/// on what order `paths` was given in.
 ///
-/// Plain-language: for each sub-transcript path we merged, ask the filesystem
-/// "when was this last changed and how big is it now?". We keep only the ones
-/// that still exist. Comparing this list to the one we stored at parse time is
-/// how we decide whether a sub file changed under us: if a path disappeared or
-/// its (mtime, size) differs, the lists won't be equal and we re-parse.
-fn fingerprint_subs(paths: &[PathBuf]) -> Vec<(PathBuf, SystemTime, u64)> {
-    paths
+/// WHY NOT just the requested transcript's own `(mtime, size)`, the way this
+/// store used to key freshness: a work unit is several transcripts, and two
+/// different things can make an OLD unit stale. The newest member can simply
+/// grow while a session is live, but an OLDER member can also *appear* out
+/// of nowhere, when a second, concurrent Claude Code instance happens to
+/// write into the same stretch of time (this project's own corpus has a real
+/// 8-transcript unit where every join is exactly this: an overlap, not a
+/// continuation). Keying on the single requested file would miss that second
+/// case completely and keep serving a stale, too-small unit forever, which
+/// is exactly the case that motivated grouping transcripts into "lanes" in
+/// the first place. So every member's path, plus every subagent transcript
+/// merged into any member, all go into one key, and ANY of them changing (or
+/// a path from the list vanishing, which shortens the returned vector so the
+/// `==` check below fails) forces a re-parse.
+///
+/// A vanished path is silently dropped rather than treated as an error:
+/// dropping it is what makes the length mismatch, and hence the freshness
+/// check, work; a stat that merely fails is not this function's problem to
+/// diagnose.
+fn unit_key(paths: &[PathBuf]) -> Vec<(PathBuf, u64, u64)> {
+    let mut key: Vec<(PathBuf, u64, u64)> = paths
         .iter()
         .filter_map(|p| {
             let m = std::fs::metadata(p).ok()?;
-            Some((p.clone(), m.modified().ok()?, m.len()))
+            let mtime = m
+                .modified()
+                .ok()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()?
+                .as_secs();
+            Some((p.clone(), mtime, m.len()))
         })
-        .collect()
+        .collect();
+    key.sort();
+    key
 }
 
-/// What we remember about one transcript between calls.
+/// What one cache slot remembers between calls.
 struct CacheEntry {
-    /// File modification time at parse.
-    mtime: SystemTime,
-    /// File size in bytes at parse.
-    size: u64,
-    /// (path, mtime, size) for every subagent file merged into `session`.
-    /// Freshness requires ALL of these to be unchanged too, so an appended or
-    /// added subagent transcript re-parses.
-    subs: Vec<(PathBuf, SystemTime, u64)>,
-    /// The parsed model, shared out via `Arc::clone` (cheap: bumps a counter).
-    session: Arc<Session>,
-    /// Logical clock value of the last hit — the LRU eviction key. A counter,
+    /// The member paths `discover_work_unit` returned at the last parse,
+    /// oldest first, exactly as it returned them. Freshness needs this kept
+    /// separately from `key` (below) because it is the ONLY thing that can
+    /// notice a brand-new sibling transcript joining the unit: a new member's
+    /// path was never stated before, so it cannot show up as "changed" in a
+    /// re-stat of paths we already knew about. Comparing this list against a
+    /// fresh discovery on every call is what catches it.
+    member_paths: Vec<PathBuf>,
+    /// Freshness key (see `unit_key`) over every member path plus every
+    /// subagent transcript merged into any of them, at the last parse.
+    /// Re-stating the same paths and comparing catches any of them growing,
+    /// shrinking, or disappearing.
+    key: Vec<(PathBuf, u64, u64)>,
+    /// The parsed unit, shared out via `Arc::clone` (cheap: bumps a counter).
+    unit: Arc<LoadedUnit>,
+    /// Logical clock value of the last hit: the LRU eviction key. A counter,
     /// not wall time: it can't go backwards and never collides under the lock.
     last_used: u64,
 }
@@ -65,15 +106,19 @@ struct CacheEntry {
 struct Inner {
     /// Monotonic tick, bumped on every `load`.
     tick: u64,
-    /// Cache keyed by transcript path.
+    /// Cache keyed by the transcript path the caller actually asked for.
+    /// Two different requested paths that happen to resolve to the same
+    /// underlying work unit get two entries here, each holding an `Arc` to
+    /// logically-equivalent content (a little redundant, but simple), and the
+    /// LRU cap still bounds total memory either way.
     map: HashMap<PathBuf, CacheEntry>,
 }
 
-/// Cache of parsed sessions keyed by transcript path, LRU-capped at
-/// [`MAX_CACHE_ENTRIES`].
+/// Cache of parsed work units keyed by the requested transcript path,
+/// LRU-capped at [`MAX_CACHE_ENTRIES`].
 pub struct SessionStore {
     /// `Mutex` because rmcp may serve calls concurrently. The lock is held
-    /// across the parse — simpler, and a duplicate parse of the same file
+    /// across the parse (simpler), and a duplicate parse of the same unit
     /// would be wasted work, not a bug.
     cache: Mutex<Inner>,
 }
@@ -89,16 +134,19 @@ impl SessionStore {
         }
     }
 
-    /// Load `path`, re-parsing only if `(mtime, size)` changed since last time.
-    pub fn load(&self, path: &Path) -> std::io::Result<Arc<Session>> {
+    /// Load the work unit `path` belongs to, re-parsing only if something
+    /// about it actually changed since last time.
+    pub fn load(&self, path: &Path) -> std::io::Result<Arc<LoadedUnit>> {
         self.load_bounded(path, CORE_MAX_BYTES)
     }
 
     /// `load` with an injectable ceiling (tests use a tiny one; production
     /// always goes through [`SessionStore::load`]).
-    fn load_bounded(&self, path: &Path, max_bytes: u64) -> std::io::Result<Arc<Session>> {
+    fn load_bounded(&self, path: &Path, max_bytes: u64) -> std::io::Result<Arc<LoadedUnit>> {
         // Stat first: this is the cheap freshness probe (ADR A3) and the
-        // first A9(3) gate.
+        // first A9(3) gate, unchanged from before this store cared about
+        // whole units: it still only ever concerns the exact path we were
+        // asked for.
         let meta = std::fs::metadata(path)?;
         if !meta.is_file() {
             // Devices, FIFOs, directories: a `stat` size of 0 can hide an
@@ -108,58 +156,86 @@ impl SessionStore {
         if meta.len() > max_bytes {
             return Err(std::io::Error::other("transcript exceeds size ceiling"));
         }
-        let (mtime, size) = (meta.modified()?, meta.len());
+
+        // Second freshness probe, new in this version: find out which
+        // transcripts belong to this unit RIGHT NOW. `discover_work_unit`
+        // only reads a small head/tail slice of each candidate file to learn
+        // its time span, not the whole file, so this is far cheaper than
+        // actually parsing and merging the unit, but unlike the stat above,
+        // it has to run on every call regardless of whether anything looks
+        // unchanged, because the one thing we most need to catch (a brand
+        // new sibling transcript appearing) leaves every file we already
+        // knew about completely untouched.
+        let discovered = discover_work_unit(path);
+        let current_members: Vec<PathBuf> =
+            discovered.members.iter().map(|m| m.path.clone()).collect();
 
         // `.unwrap()` on a Mutex only fails if another thread panicked while
-        // holding the lock ("poisoning") — at that point crashing is honest.
+        // holding the lock ("poisoning"); at that point crashing is honest.
         let mut cache = self.cache.lock().unwrap();
         cache.tick += 1;
         let now = cache.tick;
 
         if let Some(entry) = cache.map.get_mut(path)
-            && entry.mtime == mtime
-            && entry.size == size
+            && entry.member_paths == current_members
         {
-            // Main file is unchanged. But a merged session also depends on its
-            // subagent transcripts, so re-stat every sub file we merged last
-            // time and compare fingerprints. `fingerprint_subs` drops any that
-            // vanished, so a deleted sub file shortens the fresh vector and the
-            // `==` below fails — forcing a reload. (A brand-new spawn appends a
-            // `tool_result` line to the main file, so main's mtime/size already
-            // catches it; this `subs` check is specifically for an *existing*
-            // sub file that grew.)
-            let cached_paths: Vec<PathBuf> = entry.subs.iter().map(|(p, _, _)| p.clone()).collect();
-            let subs_fresh = entry.subs == fingerprint_subs(&cached_paths);
-            if subs_fresh {
-                // Fresh enough: main and every merged sub unchanged. Touch the
-                // recency clock so a hot entry never looks evictable.
+            // The unit still has exactly the members it had last time.
+            // Re-stat every path we merged last time (members AND
+            // subagents); if all of them still match, nothing about the
+            // unit's content could have changed either.
+            let tracked: Vec<PathBuf> = entry.key.iter().map(|(p, _, _)| p.clone()).collect();
+            if unit_key(&tracked) == entry.key {
+                // Fresh enough. Touch the recency clock so a hot entry never
+                // looks evictable.
                 entry.last_used = now;
-                return Ok(Arc::clone(&entry.session));
+                return Ok(Arc::clone(&entry.unit));
             }
         }
 
-        // Miss or stale: assemble the main transcript with its subagents
-        // merged (`load_session` repeats the bounded read of the main file
-        // internally and reads/merges any discovered sub files), then remember
-        // both the parsed model and a fingerprint of every sub file we merged.
-        let assembled = load_session(path, max_bytes)
+        // Miss or stale: assemble the whole unit. `load_work_unit` repeats
+        // the cheap discovery we just did above internally, and then does
+        // the actually expensive part (reading and merging every member
+        // with its own subagents), so the small redundancy in discovery
+        // costs nothing worth engineering away.
+        let assembled = load_work_unit(path, max_bytes)
             .map_err(|e| std::io::Error::other(format!("assemble failed: {e}")))?;
-        let subs = fingerprint_subs(&assembled.subagent_paths);
-        let session = Arc::new(assembled.session);
+
+        let member_paths = assembled.member_paths.clone();
+        let all_paths: Vec<PathBuf> = assembled
+            .member_paths
+            .iter()
+            .chain(assembled.subagent_paths.iter())
+            .cloned()
+            .collect();
+        let key = unit_key(&all_paths);
+
+        // A unit of one (no sibling transcript ever joined) is reported
+        // exactly the way a single transcript always was: no grouping to
+        // disclose, so `meta_unit` stays `None` (see `LoadedUnit`'s doc and
+        // `finding_session` in `payloads`, which requires this to stay in
+        // lockstep with whether a `session` key may appear on a finding).
+        let meta_unit = if assembled.unit.members.len() > 1 {
+            Some(unit_meta_from(&assembled))
+        } else {
+            None
+        };
+        let unit = Arc::new(LoadedUnit {
+            session: assembled.session,
+            meta_unit,
+        });
 
         cache.map.insert(
             path.to_path_buf(),
             CacheEntry {
-                mtime,
-                size,
-                subs,
-                session: Arc::clone(&session),
+                member_paths,
+                key,
+                unit: Arc::clone(&unit),
                 last_used: now,
             },
         );
         // LRU eviction (T4.2): insert first, then trim. A stale re-parse of a
         // cached path replaces in place (no growth, no eviction), and the
-        // fresh entry can never be the victim — its `last_used` is the
+        // fresh entry can never be the victim: its `last_used` is the
         // current tick, strictly newest. With a cap of 4, a linear min-scan
         // beats carrying a linked-list LRU crate.
         if cache.map.len() > MAX_CACHE_ENTRIES
@@ -171,7 +247,7 @@ impl SessionStore {
         {
             cache.map.remove(&coldest);
         }
-        Ok(session)
+        Ok(unit)
     }
 }
 
@@ -180,11 +256,29 @@ mod tests {
     use super::*;
     use std::io::Write as _;
 
-    /// One minimal-but-valid transcript line (an Edit tool_use).
-    fn line(id: &str) -> String {
+    /// One minimal-but-valid transcript line (an Edit tool_use) at a given
+    /// timestamp.
+    fn line_at(id: &str, ts: &str) -> String {
         format!(
-            r#"{{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{{"content":[{{"type":"tool_use","id":"{id}","name":"Edit","input":{{"file_path":"/a.ts","new_string":"x"}}}}]}}}}"#
+            r#"{{"type":"assistant","timestamp":"{ts}","message":{{"content":[{{"type":"tool_use","id":"{id}","name":"Edit","input":{{"file_path":"/a.ts","new_string":"x"}}}}]}}}}"#
         )
+    }
+
+    /// Convenience for tests where the transcript is the only file in its
+    /// directory, so the exact timestamp cannot matter for grouping.
+    fn line(id: &str) -> String {
+        line_at(id, "2026-01-01T00:00:00Z")
+    }
+
+    /// A timestamp comfortably more than `WORK_UNIT_IDLE_GAP_SECS` (30 min)
+    /// away from every other timestamp this helper produces. Tests that put
+    /// several transcripts in the SAME directory use distinct `slot` values
+    /// so `discover_work_unit` never folds them into one work unit purely
+    /// because they happen to share a directory. These tests are about
+    /// cache-slot mechanics per requested path, not work-unit grouping, and
+    /// an accidental merge would silently change what they are testing.
+    fn spaced_ts(slot: u32) -> String {
+        format!("2026-01-01T{slot:02}:00:00Z")
     }
 
     #[test]
@@ -212,6 +306,7 @@ mod tests {
         let store = SessionStore::new();
         let a = store.load(&main).unwrap();
         let sub_actions = a
+            .session
             .actions
             .iter()
             .filter(|x| matches!(x.lane, sumcp_core::model::Lane::Sub(_)))
@@ -219,7 +314,6 @@ mod tests {
         assert_eq!(sub_actions, 1, "subagent edit merged via the store");
 
         // Grow the subagent file; the merged session must re-parse.
-        use std::io::Write as _;
         let mut f = std::fs::OpenOptions::new().append(true).open(&sib).unwrap();
         writeln!(f).unwrap();
         f.write_all(
@@ -230,6 +324,7 @@ mod tests {
 
         let b = store.load(&main).unwrap();
         let sub_actions_b = b
+            .session
             .actions
             .iter()
             .filter(|x| matches!(x.lane, sumcp_core::model::Lane::Sub(_)))
@@ -250,7 +345,7 @@ mod tests {
         let a = store.load(&path).unwrap();
         let b = store.load(&path).unwrap();
 
-        // Same allocation, not just equal content — proof no re-parse ran.
+        // Same allocation, not just equal content: proof no re-parse ran.
         assert!(Arc::ptr_eq(&a, &b));
     }
 
@@ -262,9 +357,9 @@ mod tests {
 
         let store = SessionStore::new();
         let before = store.load(&path).unwrap();
-        assert_eq!(before.actions.len(), 1);
+        assert_eq!(before.session.actions.len(), 1);
 
-        // Append a second line — size changes even if mtime granularity is
+        // Append a second line: size changes even if mtime granularity is
         // too coarse to notice the difference.
         let mut f = std::fs::OpenOptions::new()
             .append(true)
@@ -278,7 +373,11 @@ mod tests {
         // A fresh allocation proves the re-parse; the new count proves it
         // read the new content.
         assert!(!Arc::ptr_eq(&before, &after), "grown file must re-parse");
-        assert_eq!(after.actions.len(), 2, "new content must be visible");
+        assert_eq!(
+            after.session.actions.len(),
+            2,
+            "new content must be visible"
+        );
     }
 
     #[test]
@@ -286,23 +385,25 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = SessionStore::new();
 
-        // Fill the cache to the cap, oldest first.
+        // Fill the cache to the cap, oldest first. Each file gets its own
+        // hour slot (see `spaced_ts`) so none of them join into a shared
+        // work unit just because they sit in the same directory.
         let paths: Vec<PathBuf> = (0..MAX_CACHE_ENTRIES)
             .map(|i| {
                 let p = dir.path().join(format!("s{i}.jsonl"));
-                std::fs::write(&p, line(&format!("t{i}"))).unwrap();
+                std::fs::write(&p, line_at(&format!("t{i}"), &spaced_ts(i as u32))).unwrap();
                 store.load(&p).unwrap();
                 p
             })
             .collect();
 
-        // Touch the oldest so it becomes the most recent — the eviction
+        // Touch the oldest so it becomes the most recent: the eviction
         // victim must now be paths[1], not paths[0].
         let kept = store.load(&paths[0]).unwrap();
 
         // One past the cap forces an eviction.
         let extra = dir.path().join("extra.jsonl");
-        std::fs::write(&extra, line("tx")).unwrap();
+        std::fs::write(&extra, line_at("tx", &spaced_ts(10))).unwrap();
         store.load(&extra).unwrap();
 
         // The touched entry survived: same allocation proves a cache hit.
@@ -324,14 +425,14 @@ mod tests {
         let paths: Vec<PathBuf> = (0..MAX_CACHE_ENTRIES)
             .map(|i| {
                 let p = dir.path().join(format!("s{i}.jsonl"));
-                std::fs::write(&p, line(&format!("t{i}"))).unwrap();
+                std::fs::write(&p, line_at(&format!("t{i}"), &spaced_ts(i as u32))).unwrap();
                 store.load(&p).unwrap();
                 p
             })
             .collect();
 
-        // Grow an already-cached file: a stale re-parse, not a new path —
-        // nothing may be evicted for it.
+        // Grow an already-cached file. This is a stale re-parse, not a new
+        // path, so nothing may be evicted for it.
         let mut f = std::fs::OpenOptions::new()
             .append(true)
             .open(&paths[0])

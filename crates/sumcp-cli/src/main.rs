@@ -15,7 +15,7 @@ mod install;
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use sumcp_core::payloads::{SessionMeta, session_overview};
+use sumcp_core::payloads::{SessionMeta, session_overview, unit_meta_from};
 use sumcp_core::score::rank;
 
 /// Post-session forensics for Claude Code sessions.
@@ -132,32 +132,6 @@ fn stem_id(path: &Path) -> String {
     path.file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default()
-}
-
-/// Build the payload-facing description of a work unit from what assembly
-/// actually read. Kept next to the CLI because the MCP server builds the
-/// same thing from the same fields in Task 9; if a third caller appears,
-/// move this into `payloads`.
-fn unit_meta_from(a: &sumcp_core::assemble::AssembledUnit) -> sumcp_core::payloads::UnitMeta {
-    sumcp_core::payloads::UnitMeta {
-        sessions: a.unit.members.len(),
-        joined_gaps_min: a.unit.joined_gaps_min.clone(),
-        span_start: a
-            .unit
-            .members
-            .first()
-            .map(|m| m.span.first.clone())
-            .unwrap_or_default(),
-        span_end: a
-            .unit
-            .members
-            .iter()
-            .map(|m| m.span.last.clone())
-            .max()
-            .unwrap_or_default(),
-        session_ids: a.session.session_ids.clone(),
-        dropped: a.unit.dropped,
-    }
 }
 
 /// `~/.claude`, overridable via `SUMCP_CLAUDE_HOME` (tests point this at a

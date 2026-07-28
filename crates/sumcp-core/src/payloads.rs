@@ -5,6 +5,7 @@
 //! evidence; the connected agent narrates. Every payload carries the ADR A4
 //! provenance in `session.identified_by`.
 
+use crate::assemble::AssembledUnit;
 use crate::model::{Action, ActionKind, Finding, Idx, Session};
 use crate::report::Overview;
 use crate::score::FileScore;
@@ -93,6 +94,35 @@ pub struct UnitMeta {
     pub session_ids: Vec<String>,
     /// Members dropped by the size cap.
     pub dropped: u64,
+}
+
+/// Turn an assembled work unit into the `UnitMeta` a payload discloses.
+///
+/// Both binaries that can report on a work unit (the CLI's bare/`--work-unit`
+/// path and the MCP server's `SessionStore`) need to build a `UnitMeta` from
+/// an `AssembledUnit`, and the mapping is pure bookkeeping with no
+/// caller-specific logic, so it lives here once instead of being copied
+/// twice.
+pub fn unit_meta_from(a: &AssembledUnit) -> UnitMeta {
+    UnitMeta {
+        sessions: a.unit.members.len(),
+        joined_gaps_min: a.unit.joined_gaps_min.clone(),
+        span_start: a
+            .unit
+            .members
+            .first()
+            .map(|m| m.span.first.clone())
+            .unwrap_or_default(),
+        span_end: a
+            .unit
+            .members
+            .iter()
+            .map(|m| m.span.last.clone())
+            .max()
+            .unwrap_or_default(),
+        session_ids: a.session.session_ids.clone(),
+        dropped: a.unit.dropped,
+    }
 }
 
 /// Approximate token count of a serialized payload.
