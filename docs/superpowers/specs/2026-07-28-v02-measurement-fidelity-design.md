@@ -179,6 +179,17 @@ subagent children, is up to 520 files of I/O. The observed maximum unit size is
 - `MAX_WORK_UNIT_SESSIONS = 16`, comfortably above the observed maximum, and
   truncation is disclosed via a new honesty counter
   `flags.work_unit_sessions_dropped`, mirroring `subagent_files_missing`.
+
+  Amended 2026-07-28, post-review adjudication: the counter shipped as
+  `work_unit.dropped`, inside the disclosure block, not as a `flags` entry.
+  The implementation put every statement about the grouping in the one block
+  a consumer already has to read to understand the grouping, which is the
+  better location; what was wrong was that this text still promised a flag
+  that never existed (claude review). The cap also became target-aware:
+  when the caller explicitly names a transcript the newest-16 trim would
+  discard, that transcript is retained and one more of the remaining oldest
+  is dropped instead, so an explicit request can never silently lose its
+  own unit (codex adversarial review).
 - The existing per-transcript byte cap (ADR A9(3)) applies per transcript and
   is unchanged.
 - Total merged actions are already capped downstream by the payload shrink loop
@@ -299,7 +310,24 @@ The contract went v0 to v1 on 2026-07-26. This is v2. Changes:
 - **Changed** `session` object in `session_overview`: `id` becomes the work
   unit's newest session, and `started` becomes the unit's span start. Both
   documented as unit-scoped.
+
+  Amended 2026-07-28, post-review adjudication: `id` shipped as the
+  transcript the caller actually asked about (the resolved target path's
+  stem), not the unit's newest member. That is deliberate provenance: the
+  id answers "which transcript did you resolve my request to", and the
+  unit's membership is fully stated in `work_unit.session_ids`, so
+  rewriting the id to the newest member would discard information without
+  adding any. `started` is unit-scoped as specified.
 - **Added** `flags.work_unit_sessions_dropped`.
+
+  Amended 2026-07-28, post-review adjudication: shipped as
+  `work_unit.dropped` (see §4.4's amendment), joined by two more exclusion
+  disclosures the review process forced into existence:
+  `work_unit.members_unreadable` (discovered members that failed to load)
+  and `work_unit.siblings_unplaced` (same-directory transcripts whose time
+  span could not be read, membership unknown). Every count in the block
+  describes the analyzed members only, so `sessions == session_ids.len()`
+  and `joined_gaps_min` is one shorter, even under a partial load.
 - **Unchanged**: every tool remains read-only, every finding still carries
   `idxs`, all caps still enforced by construction.
 
@@ -312,7 +340,7 @@ The contract went v0 to v1 on 2026-07-26. This is v2. Changes:
 
 | case | behaviour |
 |---|---|
-| sibling transcript unreadable or oversized | excluded from the unit, counted in `work_unit_sessions_dropped`, analysis proceeds |
+| sibling transcript unreadable or oversized | excluded from the unit, counted (amended 2026-07-28: as `work_unit.members_unreadable` when it was discovered but failed to load, or `work_unit.siblings_unplaced` when its time span could not even be read; `dropped` stays the cap's counter), analysis proceeds |
 | transcript with no timestamps | forms its own single-transcript unit, never silently attached |
 | unit exceeds `MAX_WORK_UNIT_SESSIONS` | keep the newest 16, disclose the drop |
 | project directory unreadable | fall back to single-transcript analysis, warn on stderr |

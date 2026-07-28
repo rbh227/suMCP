@@ -35,13 +35,16 @@ in one project directory: transcripts join when one begins within 30 minutes
 of the running end of the unit so far, or overlaps it (a concurrent Claude
 Code instance becomes a parallel lane, reported as a negative gap). The rule
 is **T1 and exact**: it rests only on each transcript's first and last
-timestamps, it is declared rather than fitted (grouping was measured to be
-almost insensitive to the threshold across a 5-to-120-minute range), and
-every payload computed over a unit discloses the grouping in a `work_unit`
-block (member ids, gaps, span) so a consumer can verify it by hand. Bare
-`sumcp` and `--work-unit` report the whole unit; `--file` stays
-single-transcript and prints a stderr note when the named transcript is part
-of a larger unit.
+timestamps, and it is declared rather than fitted (grouping was measured to
+be almost insensitive to the threshold across a 5-to-120-minute range). The
+`session_overview` payload disclosed the grouping in a `work_unit` block
+(member ids, gaps, span, and counts of anything discovered but excluded) so
+a consumer can verify it by hand; the other payloads deliberately do not
+repeat the block (they are token-budgeted; see docs/payload-schema.md), and
+findings there carry a short `session` id resolving them to their
+originating transcript instead. Bare `sumcp` and `--work-unit` report the
+whole unit; `--file` stays single-transcript and prints a stderr note when
+the named transcript is part of a larger unit.
 
 ## What "approval latency" is, precisely
 

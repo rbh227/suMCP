@@ -45,9 +45,14 @@ unit showed at most 88 of them. See
 
 ### Changed
 - **BREAKING: payload contract v1 to v2.** Every payload's `v` is now `2`.
-  Payloads computed over a unit carry a `work_unit` block (rule, member ids,
-  gaps, span, drop count), and findings carry a `session` key resolving them
-  to their originating transcript whenever a `work_unit` block explains it.
+  `session_overview` carries a `work_unit` block (rule, member ids, gaps,
+  span, and disclosure counts: `dropped` for the size cap,
+  `members_unreadable` for discovered members that failed to load,
+  `siblings_unplaced` for transcripts that could not be placed in time), and
+  findings in `struggle_areas` and `blind_spots` carry a `session` key
+  resolving them to their originating transcript. Every count in the block
+  describes the analyzed members, so its internal invariants hold even when
+  a member could not be read.
 - Adjacency findings (rework, reverts, loops, failure attribution) key on
   (transcript, lane) rather than lane alone, so a merged unit can never pair
   two actions from different transcripts as if they were consecutive.
