@@ -382,8 +382,17 @@ assumed:
 avoided. Instead, one test analyzes a multi-transcript fixture and asserts
 completion under a deliberately generous ceiling. The purpose is to catch an
 algorithmic regression, such as an accidental O(n^2) merge, not to police tens
-of milliseconds. The real numbers above are recorded here and re-measured by
-hand when the implementation lands, with the result written into this section.
+of milliseconds. The guard lives in `crates/sumcp-core/tests/perf_guard.rs`:
+16 members and 6400 actions must assemble in under 10 seconds, and complete in
+about 0.2 s on this machine.
+
+**Measured after the implementation landed (2026-07-28, this machine, release
+build).** The worst-case unit on disk is now 14 transcripts and 23.8 MB of
+main-transcript bytes (`fef3b271`, the SplatAgent project). A full
+`--work-unit` analysis of it, subagents included, completes in **0.23 to
+0.27 s** wall time warm (0.46 s on a cold first run) with a peak RSS of
+**21 to 33 MB** across three runs. Both sit inside the budget above: under
+500 ms and under 100 MB for a unit of this size.
 
 ---
 
