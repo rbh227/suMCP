@@ -289,13 +289,13 @@ pub fn discover_subagent_paths(main_path: &Path, spawns: &[Spawn]) -> Vec<PathBu
 
 /// True for a regular file named `agent-*.jsonl`.
 ///
-/// `pub(crate)` because `work_unit::discover_work_unit` also needs this exact
-/// shape, to skip a legacy-layout subagent sibling when it enumerates a
-/// project directory (see the comment there). Sharing the one predicate
-/// keeps the naming convention defined in a single place; two independent
-/// copies of "what a subagent filename looks like" would drift the moment
-/// one of them changed.
-pub(crate) fn is_agent_jsonl(p: &Path) -> bool {
+/// `pub` because two other places need this exact shape and copies would
+/// drift the moment one changed: `work_unit::discover_work_unit` skips a
+/// legacy-layout subagent sibling when it enumerates a project directory
+/// (see the comment there), and the MCP store's cache freshness fingerprints
+/// the legacy subagent siblings as a subagent SOURCE (a new one appearing
+/// must bust the cache even though the member list is unchanged).
+pub fn is_agent_jsonl(p: &Path) -> bool {
     p.is_file()
         && p.file_name()
             .and_then(|n| n.to_str())

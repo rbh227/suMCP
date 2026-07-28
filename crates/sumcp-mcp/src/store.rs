@@ -37,9 +37,9 @@ pub struct LoadedUnit {
     pub meta_unit: Option<UnitMeta>,
 }
 
-/// Stat every path into a `(path, mtime-in-seconds, size)` fingerprint,
-/// dropping any that no longer exist, then sort so the result does not depend
-/// on what order `paths` was given in.
+/// Stat every path into a `(path, mtime-in-seconds, size, openable)`
+/// fingerprint, dropping any that no longer exist, then sort so the result
+/// does not depend on what order `paths` was given in.
 ///
 /// WHY NOT just the requested transcript's own `(mtime, size)`, the way this
 /// store used to key freshness: a work unit is several transcripts, and two
@@ -51,17 +51,25 @@ pub struct LoadedUnit {
 /// continuation). Keying on the single requested file would miss that second
 /// case completely and keep serving a stale, too-small unit forever, which
 /// is exactly the case that motivated grouping transcripts into "lanes" in
-/// the first place. So every member's path, plus every subagent transcript
-/// merged into any member, all go into one key, and ANY of them changing (or
-/// a path from the list vanishing, which shortens the returned vector so the
-/// `==` check below fails) forces a re-parse.
+/// the first place. So every member's path (LOADED OR NOT — see `load`'s
+/// caller for why unloaded members must be tracked too), plus every subagent
+/// transcript merged into any member, all go into one key, and ANY of them
+/// changing (or a path from the list vanishing, which shortens the returned
+/// vector so the `==` check below fails) forces a re-parse.
+///
+/// The `openable` bool is a one-`open`-no-read probe. `stat` alone cannot
+/// see a permissions change (chmod does not touch mtime or size), so a
+/// member that failed to load and then became readable would otherwise look
+/// unchanged forever and the cache would keep serving the unit WITHOUT it
+/// (codex adversarial review, 2026-07-28). The open flipping failed-to-ok
+/// (or back) changes the key and forces the re-parse that picks it up.
 ///
 /// A vanished path is silently dropped rather than treated as an error:
 /// dropping it is what makes the length mismatch, and hence the freshness
 /// check, work; a stat that merely fails is not this function's problem to
 /// diagnose.
-fn unit_key(paths: &[PathBuf]) -> Vec<(PathBuf, u64, u64)> {
-    let mut key: Vec<(PathBuf, u64, u64)> = paths
+fn unit_key(paths: &[PathBuf]) -> Vec<(PathBuf, u64, u64, bool)> {
+    let mut key: Vec<(PathBuf, u64, u64, bool)> = paths
         .iter()
         .filter_map(|p| {
             let m = std::fs::metadata(p).ok()?;
@@ -71,12 +79,43 @@ fn unit_key(paths: &[PathBuf]) -> Vec<(PathBuf, u64, u64)> {
                 .duration_since(std::time::UNIX_EPOCH)
                 .ok()?
                 .as_secs();
-            Some((p.clone(), mtime, m.len()))
+            Some((p.clone(), mtime, m.len(), std::fs::File::open(p).is_ok()))
         })
         .collect();
     key.sort();
     key
 }
+
+/// Fingerprint every place a member's SUBAGENT transcripts can appear, so a
+/// subagent file materializing after the last parse busts the cache even
+/// though no already-tracked file changed and the member list is identical.
+///
+/// Two on-disk layouts, two sources (see `locate::discover_subagent_paths`):
+/// - 2.1.x: each member's namespaced `<stem>/subagents/` directory. That
+///   directory lives one level below the project dir, so a file appearing in
+///   it does not change the project dir's own listing (`dir_fingerprint`),
+///   and its path was never in the unit key. Fingerprinting the directory's
+///   listing itself is what notices the new file.
+/// - legacy: `agent-*.jsonl` siblings in the project dir. Those DO appear in
+///   the project-dir listing, but the hit path refreshes `dir_fp` on every
+///   hit, so a change there was observed and then immediately forgotten.
+///   Tracking the agent-sibling subset separately keeps it load-bearing.
+fn subagent_sources_fp(dir_fp: &[(PathBuf, u64, u64, bool)], members: &[PathBuf]) -> SubFp {
+    let mut fp: SubFp = dir_fp
+        .iter()
+        .filter(|(p, _, _, _)| sumcp_core::locate::is_agent_jsonl(p))
+        .cloned()
+        .collect();
+    for m in members {
+        fp.extend(dir_fingerprint(&sumcp_core::locate::subagents_dir(m)));
+    }
+    fp.sort();
+    fp
+}
+
+/// The type `subagent_sources_fp` produces; an alias so the field, the
+/// function, and the comparison all name the same shape.
+type SubFp = Vec<(PathBuf, u64, u64, bool)>;
 
 /// Fingerprint a directory's own LISTING, with no file ever opened: every
 /// entry's path, mtime-in-seconds and size, via the cheap `stat`-style
@@ -108,8 +147,18 @@ fn unit_key(paths: &[PathBuf]) -> Vec<(PathBuf, u64, u64)> {
 /// unnecessary discovery pass, never a missed change, so it costs no
 /// correctness: this fingerprint is strictly MORE sensitive than the
 /// member-list check it gates, not less.
-fn dir_fingerprint(dir: &Path) -> Vec<(PathBuf, u64, u64)> {
-    let mut fp: Vec<(PathBuf, u64, u64)> = std::fs::read_dir(dir)
+///
+/// The trailing bool is the same one-`open`-no-read probe `unit_key` uses,
+/// and it exists for the one change a `stat` cannot see: permissions. A
+/// transcript sitting here under mode 000 has no readable time span, so
+/// discovery treats it as unplaced rather than a member; `chmod` back to
+/// readable touches neither mtime nor size, so without this bit the listing
+/// would look identical, discovery would never re-run, and the file would
+/// stay out of its unit forever. (On Unix the bit is `true` for directories
+/// too, since opening a directory succeeds; that is harmless, because the
+/// fingerprint is compared for equality, never interpreted.)
+fn dir_fingerprint(dir: &Path) -> Vec<(PathBuf, u64, u64, bool)> {
+    let mut fp: Vec<(PathBuf, u64, u64, bool)> = std::fs::read_dir(dir)
         .map(|entries| {
             entries
                 .flatten()
@@ -121,7 +170,9 @@ fn dir_fingerprint(dir: &Path) -> Vec<(PathBuf, u64, u64)> {
                         .duration_since(std::time::UNIX_EPOCH)
                         .ok()?
                         .as_secs();
-                    Some((entry.path(), mtime, meta.len()))
+                    let path = entry.path();
+                    let openable = std::fs::File::open(&path).is_ok();
+                    Some((path, mtime, meta.len(), openable))
                 })
                 .collect()
         })
@@ -143,11 +194,19 @@ struct CacheEntry {
     /// what catches it; `dir_fp` (below) is what lets most calls skip
     /// paying for that fresh discovery at all.
     member_paths: Vec<PathBuf>,
-    /// Freshness key (see `unit_key`) over every member path plus every
-    /// subagent transcript merged into any of them, at the last parse.
-    /// Re-stating the same paths and comparing catches any of them growing,
-    /// shrinking, or disappearing.
-    key: Vec<(PathBuf, u64, u64)>,
+    /// Freshness key (see `unit_key`) over every discovered member path
+    /// (loaded or not) plus every subagent transcript merged into any of
+    /// them, at the last parse. Re-stating the same paths and comparing
+    /// catches any of them growing, shrinking, disappearing, or flipping
+    /// between openable and not.
+    key: Vec<(PathBuf, u64, u64, bool)>,
+    /// Fingerprint (see `subagent_sources_fp`) of every place a member's
+    /// subagent transcripts can appear, at the last parse. This is what
+    /// notices a subagent file that materializes AFTER the last parse: its
+    /// path is in neither `key` (never merged) nor `member_paths` (not a
+    /// member), and for the namespaced 2.1.x layout not even in the project
+    /// directory's own listing.
+    sub_fp: SubFp,
     /// Fingerprint (see `dir_fingerprint`) of the requested path's own
     /// directory, taken at the last parse. Comparing this to a fresh
     /// fingerprint is a cheap stand-in for re-running `discover_work_unit`:
@@ -155,7 +214,7 @@ struct CacheEntry {
     /// not possibly return anything different, so there is no need to pay
     /// for the head/tail read of every candidate transcript in it just to
     /// confirm that.
-    dir_fp: Vec<(PathBuf, u64, u64)>,
+    dir_fp: Vec<(PathBuf, u64, u64, bool)>,
     /// The parsed unit, shared out via `Arc::clone` (cheap: bumps a counter).
     unit: Arc<LoadedUnit>,
     /// Logical clock value of the last hit: the LRU eviction key. A counter,
@@ -259,15 +318,21 @@ impl SessionStore {
             && entry.member_paths == current_members
         {
             // The unit still has exactly the members it had last time.
-            // Re-stat every path we merged last time (members AND
-            // subagents); if all of them still match, nothing about the
-            // unit's content could have changed either.
-            let tracked: Vec<PathBuf> = entry.key.iter().map(|(p, _, _)| p.clone()).collect();
-            if unit_key(&tracked) == entry.key {
+            // Re-stat every path we tracked last time (every discovered
+            // member AND every merged subagent), re-fingerprint every place
+            // a subagent could appear, and only if all of it matches can
+            // nothing about the unit's content have changed.
+            let tracked: Vec<PathBuf> = entry.key.iter().map(|(p, _, _, _)| p.clone()).collect();
+            if unit_key(&tracked) == entry.key
+                && subagent_sources_fp(&dir_fp, &current_members) == entry.sub_fp
+            {
                 // Fresh enough. Touch the recency clock so a hot entry never
                 // looks evictable, and refresh the directory fingerprint (it
                 // may have changed even when nothing about the unit's own
-                // content did, e.g. an unrelated file appearing).
+                // content did, e.g. an unrelated file appearing; the parts
+                // of the listing that MATTER, the legacy agent siblings, are
+                // tracked in `sub_fp` and were just compared above, so this
+                // refresh can no longer forget a change it should act on).
                 entry.last_used = now;
                 entry.dir_fp = dir_fp;
                 return Ok(Arc::clone(&entry.unit));
@@ -304,13 +369,19 @@ impl SessionStore {
             .iter()
             .map(|m| m.path.clone())
             .collect();
-        let all_paths: Vec<PathBuf> = assembled
-            .member_paths
+        // Track every DISCOVERED member, not just the ones that loaded
+        // (`assembled.member_paths`). A member that failed to load must stay
+        // in the key so that its file changing, or becoming openable at all,
+        // forces the re-parse that finally includes it; keying only the
+        // loaded files made such an omission permanent until some already
+        // tracked file happened to change.
+        let all_paths: Vec<PathBuf> = member_paths
             .iter()
             .chain(assembled.subagent_paths.iter())
             .cloned()
             .collect();
         let key = unit_key(&all_paths);
+        let sub_fp = subagent_sources_fp(&dir_fp, &member_paths);
 
         // A unit of one (no sibling transcript ever joined, nothing
         // excluded) is reported exactly the way a single transcript always
@@ -330,6 +401,7 @@ impl SessionStore {
             CacheEntry {
                 member_paths,
                 key,
+                sub_fp,
                 dir_fp,
                 unit: Arc::clone(&unit),
                 last_used: now,
@@ -486,6 +558,101 @@ mod tests {
         assert!(
             Arc::ptr_eq(&a, &b),
             "a work unit with an unreadable member must still cache-hit on an unchanged reload"
+        );
+    }
+
+    #[test]
+    fn a_subagent_appearing_after_the_first_load_busts_the_cache() {
+        // A main transcript records a spawn whose child transcript does not
+        // exist yet (Claude Code writes the spawn record before the subagent
+        // file lands, so this ordering is real). The first load counts it
+        // missing. The file then appears WITHOUT the main transcript
+        // changing: its path was never merged (not in the unit key), it is
+        // not a member (member list unchanged), so before the fix the cache
+        // kept serving the unit without it until some tracked file happened
+        // to change.
+        let dir = tempfile::tempdir().unwrap();
+        let uuid = "5717bbbb-1111-2222-3333-444455556666";
+        let main = dir.path().join(format!("{uuid}.jsonl"));
+        std::fs::write(
+            &main,
+            format!(
+                "{}\n{}",
+                r#"{"type":"assistant","timestamp":"2026-01-01T00:00:01Z","message":{"content":[{"type":"tool_use","id":"a1","name":"Agent","input":{"subagent_type":"x"}}]}}"#,
+                r#"{"type":"user","timestamp":"2026-01-01T00:00:02Z","message":{"content":[{"type":"tool_result","tool_use_id":"a1","is_error":false}]},"toolUseResult":{"agentId":"late"}}"#,
+            ),
+        )
+        .unwrap();
+
+        let store = SessionStore::new();
+        let a = store.load(&main).unwrap();
+        assert_eq!(
+            a.session.subagent_files_missing, 1,
+            "spawned but no transcript on disk yet"
+        );
+
+        // The legacy sibling lands; the main transcript is untouched.
+        std::fs::write(
+            dir.path().join("agent-late.jsonl"),
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:03Z","message":{"content":[{"type":"tool_use","id":"e1","name":"Edit","input":{"file_path":"/late.rs","new_string":"x"}}]}}"#,
+        )
+        .unwrap();
+
+        let b = store.load(&main).unwrap();
+        let sub_actions = b
+            .session
+            .actions
+            .iter()
+            .filter(|x| matches!(x.lane, sumcp_core::model::Lane::Sub(_)))
+            .count();
+        assert_eq!(
+            sub_actions, 1,
+            "the late subagent transcript is picked up without the main file changing"
+        );
+        assert_eq!(b.session.subagent_files_missing, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_member_becoming_readable_busts_the_cache() {
+        // chmod changes neither mtime nor size, so a stat-only key cannot
+        // see a member recover from a permissions error: the cache would
+        // serve the unit without it forever. The openable probe in
+        // `unit_key` is what catches the flip. Unix-only for the same
+        // reason the symlink security tests are: permission bits.
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let readable = dir
+            .path()
+            .join("cccc0001-1111-2222-3333-444455556666.jsonl");
+        std::fs::write(&readable, line_at("t0", "2026-01-01T00:00:00Z")).unwrap();
+        let locked = dir
+            .path()
+            .join("cccc0002-1111-2222-3333-444455556666.jsonl");
+        std::fs::write(&locked, line_at("t1", "2026-01-01T00:05:00Z")).unwrap();
+        // Under mode 000 the file's time span cannot be read, so discovery
+        // treats it as an unplaced sibling rather than a member. The chmod
+        // back to readable is exactly the change a stat cannot see, which
+        // is why `dir_fingerprint` carries the openable probe: the flipped
+        // bit forces a fresh discovery pass, which now places the file,
+        // grows the member list, and triggers the full re-parse.
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let store = SessionStore::new();
+        let a = store.load(&readable).unwrap();
+        assert_eq!(
+            a.session.actions.len(),
+            1,
+            "the locked member cannot be read, let alone merged"
+        );
+
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let b = store.load(&readable).unwrap();
+        assert_eq!(
+            b.session.actions.len(),
+            2,
+            "the recovered member's action is merged after it becomes readable"
         );
     }
 
