@@ -101,6 +101,12 @@ fn action_loops(s: &Session) -> Vec<Finding> {
 pub(crate) struct Segment<'a> {
     /// Line number of the user message that opened this segment.
     pub user_line_no: Option<usize>,
+    /// Which transcript this segment belongs to. Every action in `actions`
+    /// has this same `session_ix` (that is the whole point of a "segment" —
+    /// see the invariant documented on `segments()` below). Also lets a
+    /// consumer disambiguate `user_line_no`: once two transcripts are merged
+    /// into one `Session`, "line 40" alone does not say which file it was.
+    pub session_ix: u16,
     /// The segment's main-lane actions, in total order.
     pub actions: Vec<&'a Action>,
 }
@@ -124,10 +130,6 @@ pub(crate) struct Segment<'a> {
 /// the session does", which the compiler enforces for us.
 pub(crate) fn segments(s: &Session) -> Vec<Segment<'_>> {
     let mut out: Vec<Segment<'_>> = Vec::new();
-    let mut current = Segment {
-        user_line_no: None,
-        actions: Vec::new(),
-    };
 
     // Group `user_texts` by transcript (`session_ix`) so each transcript's
     // messages are walked independently, in their own source order, with
@@ -148,13 +150,50 @@ pub(crate) fn segments(s: &Session) -> Vec<Segment<'_>> {
     // transcript's own message stream has already been walked past.
     let mut next_unconsumed: Vec<usize> = vec![0; by_session.len()];
 
+    // Rust-learning note: this is the "grouping while iterating" part that
+    // looks like magic at first glance. `s.actions` holds every transcript's
+    // main-lane actions interleaved together in one global order (sorted by
+    // timestamp during merge, so transcript A's and transcript B's actions
+    // can alternate arbitrarily). But a `Segment` must never mix two
+    // transcripts (see the doc comment above this function). The fix is to
+    // stop keeping ONE "currently open" segment and instead keep one PER
+    // TRANSCRIPT, in `open`, so that pushing action `a` only ever touches
+    // the segment that already belongs to `a.session_ix` — an action from
+    // transcript B can arrive in between two transcript-A actions without
+    // ever being able to land inside transcript A's open segment.
+    //
+    // `open` is a plain `Vec`, scanned linearly by `session_ix`, for the
+    // same reason `by_session` above is: a work unit holds at most 16
+    // transcripts (see `Action::session_ix`'s doc), so the scan costs
+    // nothing, and a `HashMap` would make the final flush loop's order
+    // nondeterministic, which is exactly what this codebase avoids in any
+    // path that shapes output (see `action_loops`'s `BTreeSet`, not
+    // `HashSet`, for the identical reasoning).
+    let mut open: Vec<Segment<'_>> = Vec::new();
+
     for a in s.actions.iter().filter(|a| {
         // Deliberately `.lane`, not `.lane_key()`: this asks "is this a
         // main-agent action", which is a meaningful question in any
         // transcript, not "is this the same lane as some other action".
         a.lane == crate::model::Lane::Main
     }) {
-        // Every user message from a's OWN transcript, at or before this
+        // Find this action's transcript's own in-progress segment, creating
+        // an empty one (no boundary crossed yet, no actions yet) the first
+        // time we ever see this session_ix — exactly how the single shared
+        // `current` used to start out before its very first action.
+        let slot = match open.iter().position(|seg| seg.session_ix == a.session_ix) {
+            Some(i) => i,
+            None => {
+                open.push(Segment {
+                    user_line_no: None,
+                    session_ix: a.session_ix,
+                    actions: Vec::new(),
+                });
+                open.len() - 1
+            }
+        };
+
+        // Every user message from a's OWN transcript, strictly before this
         // action's line, opens a fresh segment (the LAST such message wins
         // when several are adjacent). A message from any OTHER transcript is
         // never even consulted, no matter what its line_no is.
@@ -169,19 +208,32 @@ pub(crate) fn segments(s: &Session) -> Vec<Segment<'_>> {
             }
         }
         if let Some(line) = crossed {
-            // close the running segment (if it saw any actions) and start anew
-            if !current.actions.is_empty() || current.user_line_no.is_some() {
-                out.push(current);
+            // Close out THIS TRANSCRIPT's running segment (if it saw any
+            // actions, or already had a boundary of its own) and start a
+            // fresh one in its slot, still for the same transcript. Other
+            // transcripts' open segments are untouched by this.
+            let finished = std::mem::replace(
+                &mut open[slot],
+                Segment {
+                    user_line_no: Some(line),
+                    session_ix: a.session_ix,
+                    actions: Vec::new(),
+                },
+            );
+            if !finished.actions.is_empty() || finished.user_line_no.is_some() {
+                out.push(finished);
             }
-            current = Segment {
-                user_line_no: Some(line),
-                actions: Vec::new(),
-            };
         }
-        current.actions.push(a);
+        open[slot].actions.push(a);
     }
-    if !current.actions.is_empty() || current.user_line_no.is_some() {
-        out.push(current);
+    // Flush every transcript's still-open segment. For a single-transcript
+    // session (session_ix 0 everywhere, the only case that exists today)
+    // `open` has exactly one slot, so this is exactly the old single
+    // `if !current.actions.is_empty() ...` flush — output is unchanged.
+    for seg in open {
+        if !seg.actions.is_empty() || seg.user_line_no.is_some() {
+            out.push(seg);
+        }
     }
     out
 }
@@ -222,8 +274,16 @@ fn opening_move(s: &Session) -> Vec<Finding> {
             );
             nums.insert("first_edit_index".into(), first_edit as f64);
 
+            // Include the transcript index alongside the line number: once
+            // several transcripts are merged into one Session, "line 40"
+            // alone is ambiguous (every transcript has its own line 40).
             let opened_by = match seg.user_line_no {
-                Some(l) => format!("segment opened by user message at line {l}"),
+                Some(l) => {
+                    format!(
+                        "segment opened by user message at line {l} (transcript {})",
+                        seg.session_ix
+                    )
+                }
                 None => "segment precedes any user message".to_string(),
             };
             let idxs: Vec<Idx> = window.iter().take(first_edit + 1).map(|a| a.idx).collect();
@@ -382,16 +442,21 @@ fn pushback_between(
 /// from a totally unrelated transcript as "evidence" here. Subagent actions
 /// live in other files entirely, so they compare by timestamp instead,
 /// *strictly* between, so timestamp ties stay excluded per the
-/// order-uncertain contract (SPEC decision 2).
+/// order-uncertain contract (SPEC decision 2) — but ALSO gated to
+/// `push.session_ix`: timestamps stay globally meaningful across merged
+/// transcripts (that comparison is well defined), but well defined is not
+/// the same as wanted. If two transcripts in a work unit overlap in
+/// wall-clock time, an ungated comparison would let a subagent Read spawned
+/// by an unrelated transcript fall inside this window and count as
+/// evidence, suppressing a genuine Flip. `merge_sessions` never rewrites
+/// `session_ix`, so a sub-lane action still carries its own transcript's
+/// index once assembly stamps it, and this gate relies on that.
 fn evidence_between(s: &Session, push: &crate::model::UserText, later: &Action) -> bool {
     s.actions.iter().any(|a| {
         matches!(a.kind, ActionKind::Read | ActionKind::Bash)
+            && a.session_ix == push.session_ix
             && match a.lane {
-                crate::model::Lane::Main => {
-                    a.session_ix == push.session_ix
-                        && a.line_no > push.line_no
-                        && a.line_no < later.line_no
-                }
+                crate::model::Lane::Main => a.line_no > push.line_no && a.line_no < later.line_no,
                 crate::model::Lane::Sub(_) => {
                     // ISO-8601 timestamps of equal format compare correctly
                     // as strings; ties are excluded by the strict `<`/`>`.
@@ -1036,6 +1101,128 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn flip_still_fires_when_edits_and_pushback_are_all_session_one() {
+        // Every delivered test for this file so far places its edits and
+        // pushback at session_ix 0. A wrong implementation that filters on
+        // the LITERAL `u.session_ix == 0` (instead of comparing against the
+        // edits' own session_ix, whatever it is) would pass all of those.
+        // The merge step stamps real indices starting from 0 upward, so
+        // that wrong version would break the moment a work unit's SECOND
+        // transcript needed this exact detection. This test is the same
+        // shape as `pushback_in_the_same_transcript_still_creates_a_flip`
+        // above, moved entirely to session 1, to pin down that the scoping
+        // compares against the actual session_ix rather than a hardcoded 0.
+        use crate::model::UserText;
+        let mut first = Action::default();
+        first.idx = Idx(0);
+        first.effective_ts = "2026-01-01T00:00:01Z".into();
+        first.lane = Lane::Main;
+        first.session_ix = 1;
+        first.line_no = 1;
+        first.kind = ActionKind::Edit;
+        first.file_path = Some("/a.rs".into());
+        first.edit_old = Some("foo".into());
+        first.edit_new = Some("bar".into());
+
+        let mut second = Action::default();
+        second.idx = Idx(1);
+        second.effective_ts = "2026-01-01T00:00:03Z".into();
+        second.lane = Lane::Main;
+        second.session_ix = 1;
+        second.line_no = 3;
+        second.kind = ActionKind::Edit;
+        second.file_path = Some("/a.rs".into());
+        second.edit_old = Some("bar".into());
+        second.edit_new = Some("foo".into());
+
+        let mut s = Session::default();
+        s.actions = vec![first, second];
+        s.user_texts = vec![UserText {
+            effective_ts: "2026-01-01T00:00:02Z".into(),
+            line_no: 2,
+            text: "no, revert that".into(),
+            session_ix: 1, // same transcript as the edits, but not 0
+        }];
+        s.session_ids = vec!["sess-0".into(), "sess-1".into()];
+
+        let findings = reverts_and_flips(&s);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(
+            findings[0].kind,
+            FindingKind::Flip,
+            "same-transcript pushback must still produce a Flip even when \
+             the transcript is not session_ix 0"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn foreign_transcript_read_does_not_suppress_a_flip() {
+        // The main-arm gate in `evidence_between` (`a.session_ix ==
+        // push.session_ix`) has no test pinning it: every other test in this
+        // file that exercises evidence-suppression uses zero Read/Bash
+        // actions from a foreign transcript. Here a session-1 Read sits
+        // between the session-0 pushback and the session-0 reverting edit,
+        // at a line number that numerically falls in range. Without the
+        // gate this foreign Read would count as "evidence gathered" and
+        // wrongly downgrade the Flip to a TrueRevert.
+        use crate::model::UserText;
+        let mut first = Action::default();
+        first.idx = Idx(0);
+        first.effective_ts = "2026-01-01T00:00:01Z".into();
+        first.lane = Lane::Main;
+        first.session_ix = 0;
+        first.line_no = 1;
+        first.kind = ActionKind::Edit;
+        first.file_path = Some("/a.rs".into());
+        first.edit_old = Some("foo".into());
+        first.edit_new = Some("bar".into());
+
+        // Foreign-transcript Read: session_ix 1, line_no 2 -- numerically
+        // between the pushback (line 2... see below) and the revert (line
+        // 4), but from a DIFFERENT transcript than the pushback and edits.
+        let mut foreign_read = Action::default();
+        foreign_read.idx = Idx(1);
+        foreign_read.effective_ts = "2026-01-01T00:00:02500Z".into();
+        foreign_read.lane = Lane::Main;
+        foreign_read.session_ix = 1;
+        foreign_read.line_no = 3;
+        foreign_read.kind = ActionKind::Read;
+        foreign_read.file_path = Some("/unrelated.rs".into());
+
+        let mut second = Action::default();
+        second.idx = Idx(2);
+        second.effective_ts = "2026-01-01T00:00:04Z".into();
+        second.lane = Lane::Main;
+        second.session_ix = 0;
+        second.line_no = 4;
+        second.kind = ActionKind::Edit;
+        second.file_path = Some("/a.rs".into());
+        second.edit_old = Some("bar".into());
+        second.edit_new = Some("foo".into());
+
+        let mut s = Session::default();
+        s.actions = vec![first, foreign_read, second];
+        s.user_texts = vec![UserText {
+            effective_ts: "2026-01-01T00:00:02Z".into(),
+            line_no: 2,
+            text: "no, revert that".into(),
+            session_ix: 0,
+        }];
+        s.session_ids = vec!["sess-0".into(), "sess-1".into()];
+
+        let findings = reverts_and_flips(&s);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(
+            findings[0].kind,
+            FindingKind::Flip,
+            "a Read from an unrelated merged transcript must not count as \
+             evidence and suppress this Flip"
+        );
+    }
+
+    #[test]
     fn segments_do_not_draw_boundaries_from_another_transcripts_user_message() {
         // Two session-0 main actions at line_no 1 and 10. A session-1 user
         // message at line_no 5 numerically falls between them, but it
@@ -1087,5 +1274,95 @@ mod tests {
             "no same-transcript boundary was crossed"
         );
         assert_eq!(segs[0].actions.len(), 2);
+    }
+
+    #[test]
+    fn opening_move_segments_never_mix_two_transcripts() {
+        // Two transcripts interleaved by timestamp, with no user messages
+        // (so the only thing separating their segments is `session_ix`).
+        // Transcript 0 dives straight into an Edit; transcript 1 reads
+        // first, then edits. Globally (ignoring session_ix) the very FIRST
+        // action overall is transcript 1's Read, at t1 -- before
+        // transcript 0's Edit at t2. If actions from both transcripts were
+        // pushed into one shared segment (the bug this test pins down),
+        // that shared segment's opening move would read "read-first",
+        // laundering transcript 0's real patch-first opening into a false
+        // negative -- and manufacturing a patch-first accusation is exactly
+        // as possible depending on which transcript happens to go first.
+        use crate::model::{Action, ActionKind, Idx};
+        let mk = |idx: u32, session_ix: u16, ts: &str, kind: ActionKind| Action {
+            idx: Idx(idx),
+            effective_ts: ts.into(),
+            ts_inherited: false,
+            lane: Lane::Main,
+            session_ix,
+            line_no: idx as usize,
+            kind,
+            file_path: None,
+            is_error: None,
+            write_len: None,
+            write_lines: None,
+            read_total_lines: None,
+            input_hash: None,
+            error: None,
+            hunks: vec![],
+            command: None,
+            user_modified: false,
+            edit_old: None,
+            edit_new: None,
+            approval_latency_s: None,
+        };
+        let actions = vec![
+            mk(0, 1, "2026-01-01T00:00:01Z", ActionKind::Read), // t1: transcript 1 reads first
+            mk(1, 0, "2026-01-01T00:00:02Z", ActionKind::Edit), // t2: transcript 0's FIRST action is an edit
+            mk(2, 1, "2026-01-01T00:00:03Z", ActionKind::Read), // t3
+            mk(3, 0, "2026-01-01T00:00:04Z", ActionKind::Read), // t4
+            mk(4, 1, "2026-01-01T00:00:05Z", ActionKind::Edit), // t5: transcript 1's edit, after its own read
+            mk(5, 0, "2026-01-01T00:00:06Z", ActionKind::Read), // t6
+            mk(6, 1, "2026-01-01T00:00:07Z", ActionKind::Read), // t7
+            mk(7, 0, "2026-01-01T00:00:08Z", ActionKind::Read), // t8
+            mk(8, 1, "2026-01-01T00:00:09Z", ActionKind::Read), // t9
+            mk(9, 0, "2026-01-01T00:00:10Z", ActionKind::Read), // t10
+        ];
+        let s = Session {
+            actions,
+            session_ids: vec!["sess-0".into(), "sess-1".into()],
+            ..Session::default()
+        };
+
+        let findings = opening_move(&s);
+        assert_eq!(findings.len(), 2, "one opening-move finding per transcript");
+
+        // Identify each finding by the transcript its FIRST cited action
+        // actually belongs to -- not by scanning note text -- so this
+        // cannot pass by an accident of wording.
+        let session_of = |f: &Finding| -> u16 {
+            s.actions
+                .iter()
+                .find(|a| a.idx == f.idxs[0])
+                .expect("cited action exists")
+                .session_ix
+        };
+        let t0 = findings
+            .iter()
+            .find(|f| session_of(f) == 0)
+            .expect("transcript 0 has its own opening-move finding");
+        let t1 = findings
+            .iter()
+            .find(|f| session_of(f) == 1)
+            .expect("transcript 1 has its own opening-move finding");
+
+        assert!(
+            t0.note.as_ref().unwrap().contains("patch-first"),
+            "transcript 0 dove straight into an Edit and must stay \
+             patch-first even though transcript 1's Read sorts earlier \
+             globally, got: {:?}",
+            t0.note
+        );
+        assert!(
+            t1.note.as_ref().unwrap().contains("read-first"),
+            "transcript 1 genuinely read before its own edit, got: {:?}",
+            t1.note
+        );
     }
 }

@@ -453,7 +453,7 @@ fn timeline_section(
         let ord = s
             .actions
             .iter()
-            .position(|a| a.line_no >= ut.line_no)
+            .position(|a| a.session_ix == ut.session_ix && a.line_no >= ut.line_no)
             .unwrap_or(n - 1);
         let redacted = crate::redact::redact(&ut.text);
         let excerpt: String = redacted.chars().take(80).collect();
