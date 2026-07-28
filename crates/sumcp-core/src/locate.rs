@@ -152,12 +152,8 @@ fn scan_timestamps(chunk: &str) -> Vec<String> {
 
 /// The time span a transcript covers, or `None` if it has no timestamps.
 ///
-/// Reads at most `SPAN_PROBE_BYTES` from each end rather than the whole file.
-/// The head buffer and the tail buffer are both ordinary locals: they are
-/// both still alive at once in the moment just before the function returns
-/// (that is the peak), and both go out of scope together when it does. So
-/// peak memory here is 512 KB regardless of file size, but the two buffers
-/// are not dropped one before the other; they drop together, at return.
+/// Reads at most `SPAN_PROBE_BYTES` from each end of the file rather than
+/// the whole file, keeping memory use bounded regardless of transcript size.
 pub fn transcript_span(path: &Path) -> Option<TranscriptSpan> {
     let meta = std::fs::metadata(path).ok()?;
     if !meta.is_file() {
@@ -176,9 +172,15 @@ pub fn transcript_span(path: &Path) -> Option<TranscriptSpan> {
 /// either touching real disk I/O (which cannot tell you how many bytes were
 /// read) or pulling in a mocking crate (which this project does not depend
 /// on). Taking the "seam" out into its own function that accepts a generic
-/// `R: Read + Seek` lets a test hand in something that LOOKS like a file to
-/// this function but that also counts bytes on the side. See
-/// `CountingReader` in the test module below.
+/// `R: Read + Seek` lets a test hand in something that looks like a file to
+/// this function but also counts bytes on the side. See `CountingReader` in
+/// the test module below.
+///
+/// The head buffer and the tail buffer are both ordinary locals: they are
+/// both still alive at once in the moment just before the function returns
+/// (that is the peak), and both go out of scope together when it does. So
+/// peak memory here is 512 KB regardless of file size, and the two buffers
+/// are not dropped one before the other; they drop together at return.
 fn transcript_span_from_reader<R: std::io::Read + std::io::Seek>(
     f: &mut R,
     len: u64,
