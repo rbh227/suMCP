@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/sumcp-core", "crates/sumcp-cli", "crates/sumcp-mcp"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 # Minimum supported Rust version, verified in both directions rather than
 # guessed: 1.88.0 checks the whole workspace clean, and 1.87.0 fails in
