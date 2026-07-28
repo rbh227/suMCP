@@ -356,10 +356,119 @@ mod tests {
         // The NEWEST are kept: the last member is s19, not s15.
         let last = units[0].members.last().unwrap().path.clone();
         assert!(last.ends_with("s19.jsonl"), "kept the newest, got {last:?}");
+        // `joined_gaps_min` is always one shorter than `members` (there is no
+        // gap before the first member). The cap trims both from the front by
+        // the same count, so the invariant must still hold after trimming.
+        assert_eq!(
+            units[0].joined_gaps_min.len(),
+            units[0].members.len() - 1,
+            "joined_gaps_min must stay one shorter than members after the cap trims"
+        );
     }
 
     #[test]
     fn empty_input_produces_no_units() {
         assert!(group_spans(vec![]).is_empty());
+    }
+
+    // These anchors are independently known values (computable by hand or by
+    // any other correct calendar implementation), not values read off this
+    // function. That is the whole point: if `to_epoch_secs` disagreed with
+    // any of them, that would mean a real bug in the arithmetic, not a stale
+    // test.
+    //
+    // Why these particular dates:
+    //   - 1970-01-01 is the epoch itself: the simplest possible check, and it
+    //     pins down the 719_468 rebasing constant.
+    //   - 2000-01-01 and 2000-03-01 straddle March 1st in the year 2000.
+    //     2000 is a century year (divisible by 100) but ALSO divisible by
+    //     400, so unlike 1900 or 2100 it IS a leap year. Getting this pair
+    //     right proves the era/century correction (the `/100` and the era
+    //     split) is doing the right thing, not just "divisible by 4".
+    //   - 2024-01-01 is a plain leap year, unremarkable on its own, but it
+    //     sets up the next two anchors.
+    //   - 2024-02-29 and 2024-03-01 are the day of, and the day after, a real
+    //     leap day. The two together prove the leap day is counted exactly
+    //     once: if it were dropped, the gap between these two anchors would
+    //     be 0 seconds instead of 86_400; if it were double-counted, some
+    //     other anchor pair would be off by a day instead.
+    //   - 1969-12-31T23:59:59Z is one second before the epoch, exercising the
+    //     negative-era path (`era = ... / 400` for `y2 < 0`), which uses a
+    //     different floor-rounding rule than the positive case because plain
+    //     integer division truncates toward zero instead of flooring.
+    #[test]
+    fn to_epoch_secs_anchors_against_independently_known_values() {
+        assert_eq!(super::to_epoch_secs("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(
+            super::to_epoch_secs("2000-01-01T00:00:00Z"),
+            Some(946_684_800)
+        );
+        assert_eq!(
+            super::to_epoch_secs("2000-03-01T00:00:00Z"),
+            Some(951_868_800)
+        );
+        assert_eq!(
+            super::to_epoch_secs("2024-01-01T00:00:00Z"),
+            Some(1_704_067_200)
+        );
+        assert_eq!(
+            super::to_epoch_secs("2024-02-29T00:00:00Z"),
+            Some(1_709_164_800)
+        );
+        assert_eq!(
+            super::to_epoch_secs("2024-03-01T00:00:00Z"),
+            Some(1_709_251_200)
+        );
+        assert_eq!(super::to_epoch_secs("1969-12-31T23:59:59Z"), Some(-1));
+    }
+
+    #[test]
+    fn month_boundaries_have_the_right_day_counts() {
+        // Consecutive month starts a month apart should differ by exactly
+        // that month's length in seconds. A single anchor could hide an
+        // off-by-one in the `doy` formula that only shows up for specific
+        // month lengths; comparing adjacent month-starts catches it directly
+        // because the difference IS the month length.
+        let mar1 = super::to_epoch_secs("2026-03-01T00:00:00Z").unwrap();
+        let apr1 = super::to_epoch_secs("2026-04-01T00:00:00Z").unwrap();
+        let may1 = super::to_epoch_secs("2026-05-01T00:00:00Z").unwrap();
+        assert_eq!(apr1 - mar1, 31 * 86_400, "March has 31 days");
+        assert_eq!(may1 - apr1, 30 * 86_400, "April has 30 days");
+    }
+
+    #[test]
+    fn a_gap_across_a_year_boundary_still_joins() {
+        // The first transcript ends just before midnight on New Year's Eve,
+        // the second starts 15 minutes into the new year. This exercises the
+        // epoch conversion as `group_spans` actually uses it (via
+        // `secs_between`), not just in isolation: a bug in the year-boundary
+        // arithmetic would show up here as a wrongly split unit.
+        let units = group_spans(vec![
+            m("a", "2025-12-31T23:00:00Z", "2025-12-31T23:50:00Z"),
+            m("b", "2026-01-01T00:05:00Z", "2026-01-01T01:00:00Z"),
+        ]);
+        assert_eq!(
+            units.len(),
+            1,
+            "a 15 minute gap across the year boundary must join"
+        );
+        assert_eq!(units[0].members.len(), 2);
+    }
+
+    #[test]
+    fn a_gap_of_exactly_the_idle_threshold_joins() {
+        // The join rule is "less than or EQUAL TO" WORK_UNIT_IDLE_GAP_SECS.
+        // The other tests use 29 and 31 minutes, which straddle 30 minutes
+        // without ever testing the boundary value itself.
+        let units = group_spans(vec![
+            m("a", "2026-01-01T00:00:00Z", "2026-01-01T01:00:00Z"),
+            m("b", "2026-01-01T01:30:00Z", "2026-01-01T02:00:00Z"),
+        ]);
+        assert_eq!(
+            secs_between("2026-01-01T01:00:00Z", "2026-01-01T01:30:00Z"),
+            Some(WORK_UNIT_IDLE_GAP_SECS)
+        );
+        assert_eq!(units.len(), 1, "a gap exactly at the threshold must join");
+        assert_eq!(units[0].members.len(), 2);
     }
 }
