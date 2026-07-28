@@ -63,6 +63,24 @@ fn first_session_id(raw: &str) -> Option<String> {
 /// a failure to read the MAIN file is an error; subagent failures are counted
 /// in `subagent_files_missing`, never fatal.
 pub fn load_session(main_path: &Path, max_bytes: u64) -> std::io::Result<Assembled> {
+    load_session_excluding(main_path, max_bytes, &std::collections::HashSet::new())
+}
+
+/// [`load_session`], skipping any subagent file in `exclude`.
+///
+/// `exclude` exists for the work-unit loop: in the legacy layout a subagent
+/// transcript is `<dir>/agent-<agentId>.jsonl`, a SIBLING shared by every
+/// main transcript in the project directory, so two members whose spawns
+/// happen to name the same agentId would each independently resolve to and
+/// merge the same file, double-counting every action inside it. The unit
+/// loop passes the files already merged by earlier members; an excluded
+/// candidate is not "missing" (its content is in the unit, under the member
+/// that got there first), so it is filtered out before the attempted count.
+fn load_session_excluding(
+    main_path: &Path,
+    max_bytes: u64,
+    exclude: &std::collections::HashSet<PathBuf>,
+) -> std::io::Result<Assembled> {
     let raw = read_bounded(main_path, max_bytes)
         .ok_or_else(|| std::io::Error::other("main transcript unreadable or over size ceiling"))?;
     let main = ingest_str(&raw, Lane::Main);
@@ -74,14 +92,28 @@ pub fn load_session(main_path: &Path, max_bytes: u64) -> std::io::Result<Assembl
         .unwrap_or_default()
         .to_string();
 
-    let candidates = discover_subagent_paths(main_path, &main.spawns);
+    let all_candidates = discover_subagent_paths(main_path, &main.spawns);
+    let excluded = all_candidates
+        .iter()
+        .filter(|p| exclude.contains(*p))
+        .count();
+    let candidates: Vec<PathBuf> = all_candidates
+        .into_iter()
+        .filter(|p| !exclude.contains(p))
+        .collect();
     // How many subagent transcripts we set out to analyze. In the legacy layout
     // discovery resolves one sibling per spawn, so `spawns.len()` is the natural
     // expectation. In the 2.1.x layout discovery lists the namespaced directory,
     // which can hold MORE files than the main transcript has spawns (e.g. a
     // rejected wrong-session file). Taking the max of the two makes every file
     // we looked at but could not merge count as missing, in either layout.
-    let attempted = main.spawns.len().max(candidates.len());
+    // Excluded candidates come off the expectation: their content is already
+    // in the unit under an earlier member, which is the opposite of missing.
+    let attempted = main
+        .spawns
+        .len()
+        .max(candidates.len() + excluded)
+        .saturating_sub(excluded);
     let is_2_1_x = crate::locate::subagents_dir(main_path).is_dir();
 
     let mut subs: Vec<Session> = Vec::new();
@@ -176,11 +208,18 @@ pub fn load_work_unit(main_path: &Path, max_bytes: u64) -> std::io::Result<Assem
     let mut member_paths: Vec<PathBuf> = Vec::new();
     let mut subagent_paths: Vec<PathBuf> = Vec::new();
     let mut members_missing = 0u64;
+    // Subagent files merged by earlier members. In the legacy layout a
+    // subagent file is a sibling shared by the whole directory, so two
+    // members whose spawns name the same agentId would BOTH merge it and
+    // the unit would double-count every action inside; each member is told
+    // what the members before it already took.
+    let mut merged_subagents: std::collections::HashSet<PathBuf> = Default::default();
 
     for member in &unit.members {
-        // `load_session` does the per-transcript work: read the main file,
-        // find and merge its subagents. Its raw buffer is freed on return.
-        match load_session(&member.path, max_bytes) {
+        // Per-transcript work: read the main file, find and merge its
+        // subagents (minus the already-merged). Its raw buffer is freed on
+        // return.
+        match load_session_excluding(&member.path, max_bytes, &merged_subagents) {
             Ok(assembled) => {
                 let id = member
                     .path
@@ -190,6 +229,7 @@ pub fn load_work_unit(main_path: &Path, max_bytes: u64) -> std::io::Result<Assem
                     .to_string();
                 parts.push((id, assembled.session));
                 member_paths.push(member.path.clone());
+                merged_subagents.extend(assembled.subagent_paths.iter().cloned());
                 subagent_paths.extend(assembled.subagent_paths);
             }
             Err(_) => members_missing += 1,
@@ -498,6 +538,26 @@ mod tests {
             out.subagent_paths.len(),
             1,
             "the shared subagent file must be listed once, not once per member"
+        );
+        // The list being deduped is not enough: before the fix, each member's
+        // `load_session` had ALREADY merged the shared file's actions into
+        // its own session by the time the paths were deduped, so the one
+        // Edit inside it appeared in the unit twice while the path list said
+        // one file. The exclusion set threaded through the member loop is
+        // what keeps the ACTIONS single too.
+        let sub_edits = out
+            .session
+            .actions
+            .iter()
+            .filter(|a| matches!(a.lane, Lane::Sub(_)))
+            .count();
+        assert_eq!(
+            sub_edits, 1,
+            "the shared subagent's action merges exactly once, not once per member"
+        );
+        assert_eq!(
+            out.session.subagent_files_missing, 0,
+            "a candidate excluded as already-merged is not 'missing'"
         );
     }
 
