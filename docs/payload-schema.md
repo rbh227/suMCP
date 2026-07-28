@@ -1,4 +1,4 @@
-# suMCP payload schema v1 (T0.1, frozen at Checkpoint A; bumped 2026-07-26)
+# suMCP payload schema v2 (T0.1, frozen at Checkpoint A; bumped 2026-07-27)
 
 The contract for what the six MCP tools return. Canonical examples live in
 `fixtures/mock-payloads/` and are enforced by `scripts/check_payloads.py`
@@ -13,10 +13,11 @@ connected agent narrates.
 
 | field | contents |
 |---|---|
-| `v` | payload schema version, `1` |
+| `v` | payload schema version, `2` |
 | `session.id` | session uuid |
 | `session.identified_by` | **provenance, ADR A4**: `tool_use_id` (verified self-identification), `explicit` (caller passed session_id), or `cli_latest` (CLI-only recency mode). MCP never emits a guess. |
 | `truncated` | `true` whenever any cap trimmed content |
+| `work_unit` | **present only when several transcripts were merged into one report** (T7); see the dedicated section below. Absent for a single-transcript analysis. |
 
 ## Finding shape
 
@@ -40,6 +41,21 @@ Every finding-like object (anything with a `kind`) carries:
   re-grounding); present keys per kind: opening_move
   `edit_fraction_first10`+`first_edit_index`, churn `relative_churn`,
   action_loop `repeats`, review_burden `loc`+`band_hi`. Absent when empty.
+- `session`: **conditional, T7**, an 8-character short transcript id, present
+  only in `struggle_areas` and `blind_spots` findings, and only when the
+  report merges several transcripts (`work_unit` is present). Resolved from
+  the finding's first proving `idx`: the action at that index carries which
+  transcript it came from, and this is the same value short-formed. Absent
+  for a single-transcript analysis, because there is only one transcript and
+  naming it would be noise, not signal.
+
+Ranked entries (`struggle_areas`' per-file objects, `session_overview`'s
+`top_struggles`) never carry a `session` key, even inside a work unit: a
+ranked file spans the whole unit by construction (it is edited across
+however many transcripts touched it), so stamping it with one transcript id
+would assert something false about where its evidence came from. `session`
+only ever answers "which transcript backs this specific finding", never
+"which transcript backs this file".
 
 ## Tools, caps, truncation rules
 
@@ -61,7 +77,7 @@ section at the bottom for the exact shrink order and disclosure fields.
 ## Error payload (fail-closed, ADR A4)
 
 ```json
-{"v":1,"error":"ambiguous_session","message":"...","candidates":[{"id":"...","mtime":"...","cwd_match":true}],"hint":"pass session_id"}
+{"v":2,"error":"ambiguous_session","message":"...","candidates":[{"id":"...","mtime":"...","cwd_match":true}],"hint":"pass session_id"}
 ```
 
 Emitted when self-identification cannot verify the caller and no explicit
@@ -213,3 +229,66 @@ before. Full method and tables in
 `docs/validation/2026-07-22-predictive-validity.md`, and the file-class
 measurement study is forward-referenced at
 `docs/validation/2026-07-26-file-class-measurement.md`.
+
+## 2026-07-27 BREAKING: `v` goes 1 to 2, work-unit grouping disclosed (T7)
+
+suMCP can now merge several transcripts of one continuous stretch of work
+(same project, joined when a transcript overlaps the previous or starts
+within 30 minutes of its end) into a single report. This version makes that
+grouping visible instead of silently folding several transcripts' evidence
+into one payload with no way to tell they were ever separate. Every
+payload's `v` becomes `2`.
+
+### `work_unit` (new, `session_overview` only)
+
+Present only when the report covers more than one transcript; absent
+entirely for a single-transcript analysis.
+
+```json
+"work_unit":{
+  "rule":"same project; joined when a transcript overlaps the previous or starts within 30 min of its end",
+  "sessions":3,
+  "joined_gaps_min":[5.5,-12.0],
+  "span_start":"2026-01-01T09:00:00Z",
+  "span_end":"2026-01-01T19:15:00Z",
+  "session_ids":["aaaaaaaa","bbbbbbbb","cccccccc"],
+  "dropped":0
+}
+```
+
+| field | contents |
+|---|---|
+| `rule` | the grouping rule, printed verbatim (same auditability promise as `ranking_rule`: a reader checks the grouping by hand, never by trusting an opaque decision) |
+| `sessions` | how many transcripts were merged into this report |
+| `joined_gaps_min` | one entry per transcript after the first: the gap in minutes between the running span's end and that transcript joining. **A negative value means the transcript overlapped the running span instead of following it**, which is how a reader spots a concurrent Claude Code instance rather than a continuation. Always `sessions - 1` entries. |
+| `span_start` / `span_end` | first and last timestamp across the whole merged unit |
+| `session_ids` | transcript ids, oldest first, each shortened to its first 8 characters (`short_id`): long enough to identify a transcript, short enough to hold the token cap, and it leaks neither the home directory nor the username the way a full path would |
+| `dropped` | how many transcripts the unit's size cap discarded (oldest first); `0` when everything merged in |
+
+### `session` (new, conditional, on findings only)
+
+Every finding rendered by `struggle_areas` and `blind_spots` gains an
+optional `session` key: the 8-character short id of the transcript its
+evidence came from, resolved from the finding's first proving `idx` (the
+action at that index carries a `session_ix` into the work unit's transcript
+table). Present only when `work_unit` is present: a single-transcript
+report has nothing to disambiguate, so the key is omitted rather than always
+printing the one transcript id.
+
+Ranked entries never carry `session`, in `struggle_areas`' files or
+`session_overview`'s `top_struggles`: a ranked file spans the whole work unit
+by construction (edited across however many transcripts touched it), so one
+transcript id on it would misstate where its evidence came from. `session`
+answers "which transcript backs this finding", never "which transcript backs
+this file".
+
+### A single-transcript payload is unaffected
+
+For a session with zero or one transcript, `work_unit` is never emitted and
+no finding ever gains a `session` key. The **only** difference from a v1
+payload is the `v` field itself, every other byte is identical. This is
+checked directly: `crates/sumcp-core/src/payloads.rs`'s
+`session_overview_omits_the_work_unit_block_for_one_transcript` and
+`struggle_areas_echoes_the_ranking_rule_and_breakdown` tests assert the
+absence of `work_unit` and `session` respectively on a single-transcript
+session.

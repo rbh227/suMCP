@@ -1,4 +1,4 @@
-{"v":1,
+{"v":2,
 "session":{"id":"5717aaaa-1111-2222-3333-444455556666","project":"/Users/dev/Desktop/example-app","identified_by":"tool_use_id","started":"2026-06-23T14:02:11Z","duration_min":142,"cc_version":"2.1.183"},
 "totals":{"actions":412,"file_ops":183,"lines_written":4812,"file_ops_unconfirmed":3,"edits":180,"writes":6,"reads":97,"bash":80,"files_touched":58,"user_messages":31,"interrupts":2},
 "tokens":{"output":1382497,"input_uncached":41210,"cache_read":30549612,"cache_creation":700558,"cache_hit_ratio":0.94},

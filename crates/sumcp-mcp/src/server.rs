@@ -142,11 +142,11 @@ fn identify_error_result(err: IdentifyError) -> CallToolResult {
     let payload = match err {
         IdentifyError::Ambiguous(candidates) => identify::ambiguous_payload(&candidates),
         IdentifyError::InvalidId(raw) => serde_json::json!({
-            "v": 1, "error": "invalid_session_id",
+            "v": 2, "error": "invalid_session_id",
             "message": format!("'{raw}' is not a valid session id (36-char UUID expected)")
         }),
         IdentifyError::NotFound(id) => serde_json::json!({
-            "v": 1, "error": "session_not_found",
+            "v": 2, "error": "session_not_found",
             "message": format!("no transcript for session '{id}' in this project")
         }),
     };
@@ -294,6 +294,10 @@ impl ServerHandler for SumcpServer {
         let meta = SessionMeta {
             id: resolved.id,
             identified_by: resolved.identified_by.into(),
+            // Wiring the real work-unit grouping into the MCP server is a
+            // later task; `session_overview` already knows how to render one
+            // once it is populated (see `SessionMeta::unit`'s doc).
+            unit: None,
         };
         let ranked = rank(&session);
 
@@ -301,7 +305,7 @@ impl ServerHandler for SumcpServer {
             "session_overview" => payloads::session_overview(&session, &ranked, &meta),
             "struggle_areas" => {
                 let n = args.get("n").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
-                payloads::struggle_areas(&ranked, &meta, n)
+                payloads::struggle_areas(&session, &ranked, &meta, n)
             }
             "file_story" => {
                 let path = args.get("path").and_then(|v| v.as_str()).ok_or_else(|| {

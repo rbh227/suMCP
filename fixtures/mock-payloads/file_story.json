@@ -1,4 +1,4 @@
-{"v":1,
+{"v":2,
 "session":{"id":"5717aaaa-1111-2222-3333-444455556666","identified_by":"tool_use_id"},
 "file":"src/store/DataStore.ts",
 "events":[

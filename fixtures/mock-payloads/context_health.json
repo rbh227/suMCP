@@ -1,4 +1,4 @@
-{"v":1,
+{"v":2,
 "session":{"id":"5717aaaa-1111-2222-3333-444455556666","identified_by":"tool_use_id"},
 "cache_hit_ratio":0.94,
 "window_fill":[{"turn":10,"pct":0.18},{"turn":40,"pct":0.42},{"turn":80,"pct":0.61},{"turn":120,"pct":0.77},{"turn":151,"pct":0.83}],

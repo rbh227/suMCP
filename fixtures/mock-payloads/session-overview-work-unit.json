@@ -1,0 +1,20 @@
+{"v":2,
+"session":{"id":"bbbbbbbb-2222-3333-4444-555566667777","identified_by":"explicit","started":"2026-01-01T09:00:00Z","duration_min":615},
+"totals":{"actions":540,"file_ops":210,"lines_written":5210,"file_ops_unconfirmed":4,"edits":198,"writes":12,"reads":140,"bash":92,"files_touched":61,"interrupts":3},
+"tokens":{"output":1520000,"cache_read":31000000,"cache_hit_ratio":0.93},
+"patch_first_segment_share":0.3,
+"top_struggles":[
+ {"file":"src/store/DataStore.ts","class":"code","edits":24,"breakdown":{"churn":24,"rework":9,"failure_loops":3,"re_read":4,"fumbles":1}},
+ {"file":"src/App.tsx","class":"code","edits":17,"breakdown":{"churn":17,"rework":6,"failure_loops":1,"re_read":5,"fumbles":0}},
+ {"file":"src/ui/DetailPanel.tsx","class":"code","edits":10,"breakdown":{"churn":10,"rework":4,"failure_loops":1,"re_read":0,"fumbles":1}}],
+"top_struggles_total":3,
+"flags":{"unknown_event_types":{},"unknown_event_types_total":0,"parse_errors":0,"untimestamped_lines":0,"subagent_files_missing":0},
+"truncated":false,
+"work_unit":{
+ "rule":"same project; joined when a transcript overlaps the previous or starts within 30 min of its end",
+ "sessions":3,
+ "joined_gaps_min":[5.5,-12.0],
+ "span_start":"2026-01-01T09:00:00Z",
+ "span_end":"2026-01-01T19:15:00Z",
+ "session_ids":["aaaaaaaa","bbbbbbbb","cccccccc"],
+ "dropped":0}}

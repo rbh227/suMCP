@@ -235,7 +235,7 @@ fn six_tools_answer_the_frozen_contract_over_stdio() {
     let sid = serde_json::json!({"session_id": SESSION_ID});
     let (overview, err) = rpc.tool("session_overview", sid.clone());
     assert!(!err);
-    assert_eq!(overview["v"], 1);
+    assert_eq!(overview["v"], 2);
     assert_eq!(overview["session"]["identified_by"], "explicit");
     assert!(overview["truncated"].is_boolean());
     cap_ok("session_overview", &overview, 1000);
@@ -299,7 +299,7 @@ fn subagent_actions_merge_and_dereference_over_stdio() {
     // --- session_overview: merge succeeded, no missing subagent files ---
     let (overview, err) = rpc.tool("session_overview", sid.clone());
     assert!(!err, "overview must not error: {overview}");
-    assert_eq!(overview["v"], 1);
+    assert_eq!(overview["v"], 2);
     // The one Agent spawn's child transcript was discovered, validated, and
     // merged — so the honesty counter reads zero.
     assert_eq!(

@@ -954,6 +954,7 @@ mod tests {
         SessionMeta {
             id: "sess-1".into(),
             identified_by: "explicit".into(),
+            unit: None,
         }
     }
 

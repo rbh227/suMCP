@@ -150,7 +150,7 @@ pub fn recent_candidates(project_dir: &Path) -> Vec<Candidate> {
 /// The fail-closed error payload (frozen shape, `docs/payload-schema.md`).
 pub fn ambiguous_payload(candidates: &[Candidate]) -> serde_json::Value {
     serde_json::json!({
-        "v": 1,
+        "v": 2,
         "error": "ambiguous_session",
         "message": "Could not verify the calling session (own tool_use id not found after bounded retry). Refusing to guess.",
         "candidates": candidates,
@@ -298,7 +298,7 @@ mod tests {
         write_transcript(dir.path(), ID_A, "{}");
         write_transcript(dir.path(), ID_B, "{}");
         let p = ambiguous_payload(&recent_candidates(dir.path()));
-        assert_eq!(p["v"], 1);
+        assert_eq!(p["v"], 2);
         assert_eq!(p["error"], "ambiguous_session");
         assert!(p["message"].is_string() && p["hint"].is_string());
         let cands = p["candidates"].as_array().unwrap();

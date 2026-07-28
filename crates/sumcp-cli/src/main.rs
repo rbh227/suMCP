@@ -221,6 +221,9 @@ fn main() -> ExitCode {
     let meta = SessionMeta {
         id: stem_id(&path),
         identified_by: target.identified_by.into(),
+        // The CLI reads one transcript file at a time, so there is never a
+        // work unit to disclose here (see `SessionMeta::unit`'s doc).
+        unit: None,
     };
 
     if args.html {

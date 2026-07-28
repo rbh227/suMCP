@@ -94,10 +94,39 @@ def check_overview_top_struggles(payload) -> list[str]:
     return errors
 
 
+def check_work_unit(payload) -> list[str]:
+    """`work_unit` discloses a multi-transcript grouping (v2, T7). Every field
+    must be checkable by hand, the same promise `ranking_rule` already makes:
+    `sessions` says how many transcripts, `joined_gaps_min` has one entry per
+    transcript after the first (a negative gap means overlap, not a gap), and
+    `session_ids` lists exactly that many short (8-char) ids."""
+    errors = []
+    wu = payload["work_unit"]
+    sessions = wu.get("sessions")
+    if not (isinstance(sessions, int) and not isinstance(sessions, bool) and sessions > 0):
+        errors.append("work_unit.sessions must be a positive integer")
+        return errors  # the two length checks below need a real count to check against
+    gaps = wu.get("joined_gaps_min")
+    if not (isinstance(gaps, list) and len(gaps) == sessions - 1):
+        errors.append(
+            f"work_unit.joined_gaps_min must have exactly sessions-1 "
+            f"({sessions - 1}) entries, got {gaps!r}"
+        )
+    ids = wu.get("session_ids")
+    if not (isinstance(ids, list) and len(ids) == sessions):
+        errors.append(f"work_unit.session_ids must have exactly sessions ({sessions}) entries")
+    elif not all(isinstance(i, str) and len(i) == 8 for i in ids):
+        errors.append("work_unit.session_ids entries must each be an 8-character short id")
+    rule = wu.get("rule")
+    if not (isinstance(rule, str) and rule.strip()):
+        errors.append("work_unit.rule must be a non-empty string (auditable by hand)")
+    return errors
+
+
 def check_success(name, payload) -> list[str]:
     errors = []
-    if payload.get("v") != 1:
-        errors.append("missing/wrong schema version 'v' (expected 1)")
+    if payload.get("v") != 2:
+        errors.append("missing/wrong schema version 'v' (expected 2)")
     session = payload.get("session", {})
     if not session.get("id"):
         errors.append("session.id missing")
@@ -123,6 +152,8 @@ def check_success(name, payload) -> list[str]:
                     errors.append(f"ranked file missing '{field}'")
     if name == "session_overview":
         errors += check_overview_top_struggles(payload)
+    if "work_unit" in payload:
+        errors += check_work_unit(payload)
     for f in iter_findings(payload):
         errors += check_finding(f)
     return errors
@@ -130,7 +161,7 @@ def check_success(name, payload) -> list[str]:
 
 def check_error(payload) -> list[str]:
     errors = []
-    if payload.get("v") != 1:
+    if payload.get("v") != 2:
         errors.append("error payload missing 'v'")
     if payload.get("error") != "ambiguous_session":
         errors.append("error must be 'ambiguous_session'")
@@ -175,6 +206,26 @@ def main() -> int:
                 print(f"   - {e}")
         else:
             print(f"ok   {tool} (~{len(path.read_text()) / CHARS_PER_TOKEN:.0f}/{cap} tokens)")
+
+    # A `session_overview` shape, but for a merged multi-transcript work unit
+    # (T7): exercises `check_work_unit` the same way the six checks above
+    # exercise the rest of the contract.
+    wu_path = MOCK_DIR / "session-overview-work-unit.json"
+    if not wu_path.exists():
+        print(f"FAIL session-overview-work-unit: {wu_path.relative_to(ROOT)} does not exist")
+        failures += 1
+    else:
+        errors = check(wu_path, "session_overview", CAPS_TOKENS["session_overview"])
+        if errors:
+            failures += 1
+            print("FAIL session-overview-work-unit:")
+            for e in errors:
+                print(f"   - {e}")
+        else:
+            print(
+                "ok   session-overview-work-unit "
+                f"(~{len(wu_path.read_text()) / CHARS_PER_TOKEN:.0f}/{CAPS_TOKENS['session_overview']} tokens)"
+            )
 
     err_path = MOCK_DIR / "error_ambiguous_session.json"
     if not err_path.exists():
