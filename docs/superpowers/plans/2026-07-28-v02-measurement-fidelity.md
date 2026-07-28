@@ -776,7 +776,7 @@ For each site the compiler names, add `session_ix: 0,` to `Action` literals and 
 - [ ] **Step 5: Run the whole suite**
 
 Run: `cargo test 2>&1 | tail -5`
-Expected: PASS. Count unchanged from the 155 baseline plus the 2 new tests.
+Expected: PASS. Count unchanged from the 271 baseline (verified 2026-07-28) plus the 2 new tests.
 
 - [ ] **Step 6: Commit**
 
@@ -2001,7 +2001,7 @@ WHY THIS EXISTS
 ---------------
 Every existing Rust test asserts against fixtures the same code path produced,
 so a systematic scope error is invisible: the code and the fixture share the
-bug. That is exactly how a 3x undercount survived 155 green tests. This is a
+bug. That is exactly how a 3x undercount survived 271 green tests. This is a
 second, deliberately naive implementation whose only job is to disagree.
 
 DELIBERATELY NAIVE. It must not import from, or mirror the structure of, the
@@ -2216,7 +2216,7 @@ A second, deliberately naive implementation that walks raw JSONL and must
 agree with the analyzer exactly. Every existing Rust test asserts against
 fixtures the same code path produced, so a systematic scope error is invisible
 to them: code and fixture share the bug. That is how a 3x undercount survived
-155 green tests.
+271 green tests.
 
 It must never share helpers with the Rust code. The value is entirely in the
 two implementations being written differently. Proven able to fail by
@@ -2606,6 +2606,6 @@ behaviour on transcripts written before the field existed."
 
 Tasks 1 through 9 are strictly sequential; each depends on the one before. Task 10 depends on Task 8 (it shells out to `--work-unit`). Tasks 11, 12, and 13 can run in any order after 10, and Task 13 is independent enough to run at any point.
 
-**Checkpoint after Task 6:** the core can assemble a unit but nothing surfaces it. Run the full suite and confirm 155-plus tests green before continuing.
+**Checkpoint after Task 6:** the core can assemble a unit but nothing surfaces it. Run the full suite and confirm 271-plus tests green before continuing.
 
 **Checkpoint after Task 10:** this is the real gate. If `python3 scripts/recount.py` disagrees on the archive, stop and investigate. A disagreement here is the harness doing its job, and adjusting the recount to match the product would defeat the entire purpose of the task.

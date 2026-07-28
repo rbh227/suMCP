@@ -104,8 +104,9 @@ the lane-scoping regression test in §10.
    reports that transcript alone, unchanged.
 7. Any work-unit-side failure degrades gracefully: an unreadable sibling
    transcript reduces the unit rather than failing the analysis, and is counted.
-8. All 155 existing tests stay green, with payload-contract assertions updated
-   in lockstep across `check_payloads.py` and `docs/payload-schema.md`.
+8. All 271 existing tests stay green (count verified 2026-07-28), with
+   payload-contract assertions updated in lockstep across `check_payloads.py`
+   and `docs/payload-schema.md`.
 
 ---
 
@@ -216,7 +217,7 @@ independent recount, exactly.**
 Every existing test asserts against fixtures produced by the same code path it
 tests. A systematic scope error, which is exactly what this whole spec is
 about, is invisible to that design: the code and the fixture agree because they
-share the bug. Nothing in 155 green tests caught a 3x undercount.
+share the bug. Nothing in 271 green tests caught a 3x undercount.
 
 ### 5.3 The harness
 
