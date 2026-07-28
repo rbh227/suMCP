@@ -162,7 +162,19 @@ fn to_epoch_secs(ts: &str) -> Option<i64> {
 /// so far, or begins within `WORK_UNIT_IDLE_GAP_SECS` of its end. If a
 /// timestamp cannot be parsed, we start a new unit rather than guess: a gap
 /// we cannot measure is not the same as a gap of zero.
-pub fn group_spans(mut items: Vec<Member>) -> Vec<WorkUnit> {
+pub fn group_spans(items: Vec<Member>) -> Vec<WorkUnit> {
+    let mut units = group_uncapped(items);
+    for unit in units.iter_mut() {
+        cap_unit(unit, None);
+    }
+    units
+}
+
+/// The grouping itself, before the size cap. Split out so that
+/// `discover_work_unit` can locate the caller's unit FIRST and then cap it
+/// while retaining the requested member; capping before the lookup could
+/// discard exactly the transcript the caller named (see `cap_unit`).
+fn group_uncapped(mut items: Vec<Member>) -> Vec<WorkUnit> {
     if items.is_empty() {
         return Vec::new();
     }
@@ -223,25 +235,47 @@ pub fn group_spans(mut items: Vec<Member>) -> Vec<WorkUnit> {
         }
     }
 
-    // Apply the cap: keep the NEWEST members, disclose the rest. Trimming
-    // from the front is right because members are oldest-first, and the
-    // newest transcript is the one the user just finished and most wants
-    // described.
-    for unit in units.iter_mut() {
-        if unit.members.len() > MAX_WORK_UNIT_SESSIONS {
-            let excess = unit.members.len() - MAX_WORK_UNIT_SESSIONS;
-            unit.members.drain(0..excess);
-            // `joined_gaps_min` is one shorter than `members` (there is no
-            // gap before the first member), so trimming the same count from
-            // its front keeps the two aligned. `min` guards the case where
-            // fewer gaps exist than `excess` (which should not happen given
-            // the invariant, but costs nothing to guard).
-            let gap_excess = excess.min(unit.joined_gaps_min.len());
-            unit.joined_gaps_min.drain(0..gap_excess);
-            unit.dropped = excess as u64;
-        }
-    }
     units
+}
+
+/// Enforce `MAX_WORK_UNIT_SESSIONS` on one unit, keeping the newest members
+/// and disclosing the drop.
+///
+/// `retain`, when given, is a member that must SURVIVE the cap no matter how
+/// old it is: the transcript the caller explicitly asked to analyze. Without
+/// it, a unit of 17-plus members would silently shed its oldest, and a later
+/// lookup for that exact transcript would miss, collapsing the analysis to a
+/// single-member fallback with `dropped: 0` (codex adversarial review,
+/// 2026-07-28). With it, the requested member is kept alongside the newest
+/// `MAX - 1` others and the drop count still tells the truth.
+fn cap_unit(unit: &mut WorkUnit, retain: Option<&Path>) {
+    if unit.members.len() <= MAX_WORK_UNIT_SESSIONS {
+        return;
+    }
+    let excess = unit.members.len() - MAX_WORK_UNIT_SESSIONS;
+    // If the caller's transcript sits inside the slice the trim would drop,
+    // pull it out first and put it back at the front afterwards (members are
+    // oldest-first and it is older than everything the trim keeps).
+    let rescued = retain
+        .and_then(|p| unit.members.iter().position(|m| m.path == p))
+        .filter(|&ix| ix < excess)
+        .map(|ix| unit.members.remove(ix));
+    if let Some(target) = rescued {
+        // One slot of the newest window goes to the rescued member, so one
+        // more of the remaining oldest is dropped: the total dropped count
+        // is unchanged and stays honest.
+        unit.members.drain(0..excess);
+        unit.members.insert(0, target);
+    } else {
+        unit.members.drain(0..excess);
+    }
+    // Recompute rather than trim: after a rescue the kept members are no
+    // longer consecutive, so the original pairwise gap entries would not
+    // describe them. `gaps_between` measures the gaps that exist between
+    // the members actually kept (a rescue shows up as one large positive
+    // gap, which is exactly what a reader should see).
+    unit.joined_gaps_min = gaps_between(&unit.members);
+    unit.dropped = excess as u64;
 }
 
 /// Find the work unit containing `main_path`, by scanning its project
@@ -323,8 +357,15 @@ pub fn discover_work_unit(main_path: &Path) -> WorkUnit {
         }
     }
 
-    for mut unit in group_spans(items) {
+    // Group first, cap second: the lookup must run against the UNCAPPED
+    // units, because a generic newest-first cap could have already discarded
+    // `main_path` from its unit, making this loop miss it and fall back to a
+    // single-member unit with `dropped: 0` — silently omitting the rest of
+    // the caller's stretch of work. Capping afterwards, with `main_path`
+    // retained, keeps both the analysis and the disclosure honest.
+    for mut unit in group_uncapped(items) {
         if unit.members.iter().any(|mm| mm.path == main_path) {
+            cap_unit(&mut unit, Some(main_path));
             unit.unplaced = unplaced;
             return unit;
         }
@@ -483,6 +524,65 @@ mod tests {
             unit.members.iter().map(|m| &m.path).collect::<Vec<_>>()
         );
         assert_eq!(unit.members[0].path, main);
+    }
+
+    #[test]
+    fn requesting_a_member_the_cap_would_drop_keeps_it_and_its_unit() {
+        // 20 transcripts, one continuous unit. The generic cap keeps the
+        // newest 16, so members 0..4 would be discarded — and before the
+        // fix, explicitly analyzing member 0 then MISSED its own unit in
+        // the lookup and collapsed to a single-member fallback with
+        // dropped: 0, silently omitting the other 19 transcripts.
+        let td = tempfile::tempdir().unwrap();
+        let mut paths = Vec::new();
+        for i in 0..20u32 {
+            let p = td
+                .path()
+                .join(format!("cap{i:04}-1111-2222-3333-444455556666.jsonl"));
+            // Each transcript spans 30 minutes and starts 10 minutes after
+            // the previous one ends: all 20 join one unit.
+            let (start_h, start_m) = ((i * 40) / 60, (i * 40) % 60);
+            let (end_h, end_m) = ((i * 40 + 30) / 60, (i * 40 + 30) % 60);
+            std::fs::write(
+                &p,
+                format!(
+                    "{{\"type\":\"assistant\",\"timestamp\":\"2026-01-01T{start_h:02}:{start_m:02}:00Z\"}}\n\
+                     {{\"type\":\"assistant\",\"timestamp\":\"2026-01-01T{end_h:02}:{end_m:02}:00Z\"}}\n"
+                ),
+            )
+            .unwrap();
+            paths.push(p);
+        }
+
+        let unit = discover_work_unit(&paths[0]);
+        assert_eq!(unit.members.len(), MAX_WORK_UNIT_SESSIONS);
+        assert!(
+            unit.members.iter().any(|m| m.path == paths[0]),
+            "the requested transcript survives the cap"
+        );
+        assert_eq!(unit.dropped, 4, "the drop count still tells the truth");
+        assert_eq!(
+            unit.joined_gaps_min.len(),
+            unit.members.len() - 1,
+            "gaps recomputed over the kept members keep the invariant"
+        );
+        // The rescued member is the oldest kept, so the first gap spans the
+        // dropped stretch and must be large and positive, never negative.
+        assert!(
+            unit.joined_gaps_min[0] > WORK_UNIT_IDLE_GAP_SECS as f64 / 60.0,
+            "the rescue is visible as one large gap, got {:?}",
+            unit.joined_gaps_min[0]
+        );
+
+        // A member inside the newest-16 window behaves exactly as before.
+        let unit = discover_work_unit(&paths[19]);
+        assert_eq!(unit.members.len(), MAX_WORK_UNIT_SESSIONS);
+        assert_eq!(unit.dropped, 4);
+        assert!(unit.members.iter().any(|m| m.path == paths[19]));
+        assert!(
+            !unit.members.iter().any(|m| m.path == paths[0]),
+            "no rescue happened, so the oldest member is dropped as usual"
+        );
     }
 
     #[test]
