@@ -4,7 +4,7 @@
 
 use crate::ingest::ingest_str;
 use crate::locate::{discover_subagent_paths, is_within_or_root};
-use crate::merge::merge_sessions;
+use crate::merge::{merge_sessions, merge_work_unit};
 use crate::model::{Lane, Session};
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
@@ -137,6 +137,74 @@ pub fn load_session(main_path: &Path, max_bytes: u64) -> std::io::Result<Assembl
     })
 }
 
+/// The outcome of assembling a whole work unit.
+pub struct AssembledUnit {
+    /// The merged session covering every transcript in the unit.
+    pub session: Session,
+    /// Main transcripts actually read, oldest first.
+    pub member_paths: Vec<PathBuf>,
+    /// Every subagent transcript read, across all members. The MCP store keys
+    /// cache freshness on these plus `member_paths`.
+    pub subagent_paths: Vec<PathBuf>,
+    /// The grouping decision, for disclosure in payloads.
+    pub unit: crate::work_unit::WorkUnit,
+}
+
+/// Turn a main transcript path into a merged session covering its whole work
+/// unit: every transcript in the same continuous stretch of work, each with
+/// its own subagents, all in one total order.
+///
+/// MEMORY: members are loaded one at a time and each one's raw text is dropped
+/// by `load_session` before the next is opened, so peak memory is one raw
+/// transcript plus the accumulated parsed actions, never the sum of all raw
+/// bytes. At the largest observed unit that is the difference between about
+/// 8 MB and 27 MB of live buffers.
+///
+/// A member that cannot be read is skipped and counted, exactly as an
+/// unreadable subagent transcript is. Only a unit with no readable member at
+/// all is an error.
+pub fn load_work_unit(main_path: &Path, max_bytes: u64) -> std::io::Result<AssembledUnit> {
+    let unit = crate::work_unit::discover_work_unit(main_path);
+
+    let mut parts: Vec<(String, Session)> = Vec::new();
+    let mut member_paths: Vec<PathBuf> = Vec::new();
+    let mut subagent_paths: Vec<PathBuf> = Vec::new();
+    let mut members_missing = 0u64;
+
+    for member in &unit.members {
+        // `load_session` does the per-transcript work: read the main file,
+        // find and merge its subagents. Its raw buffer is freed on return.
+        match load_session(&member.path, max_bytes) {
+            Ok(assembled) => {
+                let id = member
+                    .path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                parts.push((id, assembled.session));
+                member_paths.push(member.path.clone());
+                subagent_paths.extend(assembled.subagent_paths);
+            }
+            Err(_) => members_missing += 1,
+        }
+    }
+
+    if parts.is_empty() {
+        return Err(std::io::Error::other(
+            "no readable transcript in the work unit",
+        ));
+    }
+
+    let session = merge_work_unit(parts, members_missing, unit.dropped);
+    Ok(AssembledUnit {
+        session,
+        member_paths,
+        subagent_paths,
+        unit,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,5 +306,95 @@ mod tests {
         let a = load_session(&main, MAX_TRANSCRIPT_BYTES).unwrap();
         assert_eq!(a.session.subagent_files_missing, 0);
         assert!(a.subagent_paths.is_empty());
+    }
+
+    /// One main-transcript Edit at a given time, in a given session.
+    fn main_edit_line(session: &str, ts: &str, path: &str) -> String {
+        format!(
+            r#"{{"type":"assistant","timestamp":"{ts}","sessionId":"{session}","message":{{"content":[{{"type":"tool_use","id":"e1","name":"Edit","input":{{"file_path":"{path}","old_string":"a","new_string":"b"}}}}]}}}}"#
+        )
+    }
+
+    #[test]
+    fn load_work_unit_merges_adjacent_transcripts() {
+        let td = tempfile::tempdir().unwrap();
+        let id_a = "aaaaaaaa-1111-2222-3333-444455556666";
+        let id_b = "bbbbbbbb-1111-2222-3333-444455556666";
+        // b starts 5 minutes after a ends, so they are one stretch of work.
+        std::fs::write(
+            td.path().join(format!("{id_a}.jsonl")),
+            main_edit_line(id_a, "2026-01-01T00:00:00Z", "/x.rs"),
+        )
+        .unwrap();
+        let b_path = td.path().join(format!("{id_b}.jsonl"));
+        std::fs::write(
+            &b_path,
+            main_edit_line(id_b, "2026-01-01T00:05:00Z", "/y.rs"),
+        )
+        .unwrap();
+
+        let a = load_work_unit(&b_path, MAX_TRANSCRIPT_BYTES).unwrap();
+        assert_eq!(a.unit.members.len(), 2, "both transcripts in the unit");
+        assert_eq!(a.session.actions.len(), 2, "both edits merged");
+        assert_eq!(a.session.session_ids.len(), 2);
+        // Oldest first, and the earlier edit sorts first.
+        assert_eq!(a.session.actions[0].file_path.as_deref(), Some("/x.rs"));
+        assert_eq!(a.session.actions[0].session_ix, 0);
+        assert_eq!(a.session.actions[1].session_ix, 1);
+    }
+
+    #[test]
+    fn load_work_unit_leaves_a_distant_transcript_out() {
+        let td = tempfile::tempdir().unwrap();
+        let id_a = "aaaaaaaa-1111-2222-3333-444455556666";
+        let id_b = "bbbbbbbb-1111-2222-3333-444455556666";
+        std::fs::write(
+            td.path().join(format!("{id_a}.jsonl")),
+            main_edit_line(id_a, "2026-01-01T00:00:00Z", "/x.rs"),
+        )
+        .unwrap();
+        // 10 hours later: a different stretch of work.
+        let b_path = td.path().join(format!("{id_b}.jsonl"));
+        std::fs::write(
+            &b_path,
+            main_edit_line(id_b, "2026-01-01T10:00:00Z", "/y.rs"),
+        )
+        .unwrap();
+
+        let a = load_work_unit(&b_path, MAX_TRANSCRIPT_BYTES).unwrap();
+        assert_eq!(a.unit.members.len(), 1);
+        assert_eq!(a.session.actions.len(), 1);
+        assert_eq!(a.session.actions[0].file_path.as_deref(), Some("/y.rs"));
+    }
+
+    #[test]
+    fn load_work_unit_survives_an_unreadable_member() {
+        let td = tempfile::tempdir().unwrap();
+        let id_a = "aaaaaaaa-1111-2222-3333-444455556666";
+        let id_b = "bbbbbbbb-1111-2222-3333-444455556666";
+        let a_path = td.path().join(format!("{id_a}.jsonl"));
+        // `a`'s file_path is padded so its line is strictly longer than
+        // `b`'s below. With equal-length lines a ceiling of "a_len - 1"
+        // would exclude BOTH members instead of just `a`, since they would
+        // be the same size; the padding is what lets one ceiling value
+        // admit one member but not the other.
+        std::fs::write(
+            &a_path,
+            main_edit_line(id_a, "2026-01-01T00:00:00Z", "/a-longer-file-path.rs"),
+        )
+        .unwrap();
+        let b_path = td.path().join(format!("{id_b}.jsonl"));
+        std::fs::write(
+            &b_path,
+            main_edit_line(id_b, "2026-01-01T00:05:00Z", "/y.rs"),
+        )
+        .unwrap();
+
+        // Pick a ceiling strictly between the two sizes: admits b, not a.
+        let a_len = std::fs::metadata(&a_path).unwrap().len();
+        let ceiling = a_len - 1;
+        let out = load_work_unit(&b_path, ceiling).unwrap();
+        assert_eq!(out.session.actions.len(), 1, "only the readable member");
+        assert_eq!(out.unit.members.len(), 2, "the unit still knows about both");
     }
 }
