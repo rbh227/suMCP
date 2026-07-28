@@ -196,6 +196,19 @@ pub fn load_work_unit(main_path: &Path, max_bytes: u64) -> std::io::Result<Assem
         ));
     }
 
+    // Dedupe subagent paths across members, preserving order. In the legacy
+    // layout a subagent path is `<dir>/agent-<agentId>.jsonl`, a SIBLING of
+    // every main transcript in the same project directory, not namespaced
+    // to any one of them. Two different members whose spawns happen to name
+    // the same agentId (an id collision across transcripts, unlikely but
+    // possible) would each independently resolve to and merge that same
+    // sibling file, and both would push its path here. `HashSet::insert`
+    // returns `true` only the first time a given path is seen, so `retain`
+    // keeps just that first occurrence and drops every later repeat, in the
+    // order the paths were already in (oldest member first).
+    let mut seen_subagents = std::collections::HashSet::new();
+    subagent_paths.retain(|p| seen_subagents.insert(p.clone()));
+
     let session = merge_work_unit(parts, members_missing, unit.dropped);
     Ok(AssembledUnit {
         session,
@@ -396,6 +409,46 @@ mod tests {
         let out = load_work_unit(&b_path, ceiling).unwrap();
         assert_eq!(out.session.actions.len(), 1, "only the readable member");
         assert_eq!(out.unit.members.len(), 2, "the unit still knows about both");
+    }
+
+    #[test]
+    fn subagent_paths_across_members_are_deduped() {
+        // Two members share an agent id: in the legacy layout a subagent
+        // path is `<dir>/agent-<agentId>.jsonl`, shared by every member in
+        // the same project directory, so both members independently
+        // resolve to and merge the SAME subagent file into their own
+        // session. Without a dedup, the aggregated `subagent_paths` --
+        // consumed by the MCP store to build its cache-freshness key --
+        // would list that one file twice.
+        let td = tempfile::tempdir().unwrap();
+        let id_a = "aaaaaaaa-1111-2222-3333-444455556666";
+        let id_b = "bbbbbbbb-1111-2222-3333-444455556666";
+        std::fs::write(
+            td.path().join(format!("{id_a}.jsonl")),
+            agent_spawn_lines("a1", "shared"),
+        )
+        .unwrap();
+        let b_path = td.path().join(format!("{id_b}.jsonl"));
+        // b's spawn/result sit a few minutes after a's, well inside the
+        // idle-gap window, so the two mains join into one work unit.
+        std::fs::write(
+            &b_path,
+            format!(
+                "{}\n{}",
+                r#"{"type":"assistant","timestamp":"2026-01-01T00:05:01Z","message":{"content":[{"type":"tool_use","id":"a2","name":"Agent","input":{"subagent_type":"x"}}]}}"#,
+                r#"{"type":"user","timestamp":"2026-01-01T00:05:02Z","message":{"content":[{"type":"tool_result","tool_use_id":"a2","is_error":false}]},"toolUseResult":{"agentId":"shared"}}"#,
+            ),
+        )
+        .unwrap();
+        std::fs::write(td.path().join("agent-shared.jsonl"), sub_edit_line(id_a)).unwrap();
+
+        let out = load_work_unit(&b_path, MAX_TRANSCRIPT_BYTES).unwrap();
+        assert_eq!(out.unit.members.len(), 2, "both mains join one unit");
+        assert_eq!(
+            out.subagent_paths.len(),
+            1,
+            "the shared subagent file must be listed once, not once per member"
+        );
     }
 
     #[test]

@@ -47,11 +47,17 @@ Every finding-like object (anything with a `kind`) carries:
   action_loop `repeats`, review_burden `loc`+`band_hi`. Absent when empty.
 - `session`: **conditional, T7**, an 8-character short transcript id, present
   only in `struggle_areas` and `blind_spots` findings, and only when the
-  report merges several transcripts (`work_unit` is present). Resolved from
-  the finding's first proving `idx`: the action at that index carries which
-  transcript it came from, and this is the same value short-formed. Absent
-  for a single-transcript analysis, because there is only one transcript and
-  naming it would be noise, not signal.
+  underlying session merges several transcripts. Resolved from the finding's
+  first proving `idx`: the action at that index carries which transcript it
+  came from, and this is the same value short-formed. Absent for a
+  single-transcript analysis, because there is only one transcript and
+  naming it would be noise, not signal. Neither `struggle_areas` nor
+  `blind_spots` ever renders a `work_unit` block of its own (see the
+  Envelope section above): `session` here is a bare transcript id with no
+  grouping explanation in the same document. A client that needs to
+  interpret it, for instance to learn how many transcripts were merged or
+  the gaps between them, has to read `session_overview`, the only payload
+  that carries `work_unit`.
 
 Ranked entries (`struggle_areas`' per-file objects, `session_overview`'s
 `top_struggles`) never carry a `session` key, even inside a work unit: a
@@ -275,17 +281,35 @@ Every finding rendered by `struggle_areas` and `blind_spots` gains an
 optional `session` key: the 8-character short id of the transcript its
 evidence came from, resolved from the finding's first proving `idx` (the
 action at that index carries a `session_ix` into the work unit's transcript
-table). Present only when `work_unit` is present: a single-transcript
-report has nothing to disambiguate, so the key is omitted rather than always
-printing the one transcript id.
+table). Present only when the underlying session merges several
+transcripts: a single-transcript report has nothing to disambiguate, so the
+key is omitted rather than always printing the one transcript id.
+
+**Neither `struggle_areas` nor `blind_spots` ever carries a `work_unit`
+block alongside this key.** That block is rendered only by
+`session_overview` (see the Envelope section above), and this is a
+deliberate choice, not an oversight: payloads are token-budgeted, and
+`session_overview` is documented as the starting point for a session, so
+duplicating the grouping block into every payload that can carry a
+`session` id would spend that budget restating a rule a reader can look up
+once. So `session` here is a bare short id with no explanation of the
+grouping in the same document; it answers only "which transcript did this
+finding's evidence come from", nothing about how many transcripts were
+merged or how. A client that wants that context, or the full-length session
+id, must read `session_overview`, the only payload that documents the
+grouping. Do not reimplement or duplicate the `work_unit` block into
+`struggle_areas` or `blind_spots` to "fill this gap"; read
+`session_overview` instead.
 
 This is enforced by construction, not just by convention: `finding_session`
 (the one function that produces a `session` value) returns `None` unless
 BOTH the session table has two or more entries AND the caller supplied a
 work unit (`meta.unit.is_some()`). A caller that passes a merged
 multi-transcript `Session` while leaving the work unit unset gets no
-`session` keys at all, so a `session` key can never appear on a payload that
-has no `work_unit` block to explain it.
+`session` keys at all. That construction governs *whether a `session` key
+may appear at all*; it says nothing about a `work_unit` block accompanying
+it in the same payload, because no such block ever does, in any payload
+other than `session_overview`.
 
 Ranked entries never carry `session`, in `struggle_areas`' files or
 `session_overview`'s `top_struggles`: a ranked file spans the whole work unit

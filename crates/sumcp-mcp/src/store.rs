@@ -78,21 +78,84 @@ fn unit_key(paths: &[PathBuf]) -> Vec<(PathBuf, u64, u64)> {
     key
 }
 
+/// Fingerprint a directory's own LISTING, with no file ever opened: every
+/// entry's path, mtime-in-seconds and size, via the cheap `stat`-style
+/// `DirEntry::metadata` (not a read of the file's bytes), sorted so the
+/// result does not depend on what order the OS handed entries back in.
+///
+/// PLAIN-LANGUAGE VERSION OF WHY THIS IS ENOUGH: the expensive thing this
+/// lets most calls skip, `discover_work_unit`, decides which transcripts
+/// belong to a work unit by looking at exactly two things about this
+/// directory: which `.jsonl` files are sitting in it, and what each one's
+/// content says (its first and last timestamp, read from the file itself).
+/// A directory listing already tells us the first half directly (a file
+/// appearing or disappearing changes the list of entries here). For the
+/// second half, it does not need to read the content itself, because a
+/// file's `mtime` and `size` only change when its content changes. So if
+/// every entry's path, `mtime` and `size` are BYTE-FOR-BYTE the same as the
+/// last time we looked, nothing that `discover_work_unit` could possibly
+/// see has changed either, and re-running it would necessarily produce the
+/// exact same members. That is what lets a listing (cheap: one `stat` per
+/// entry) stand in for actually opening and scanning every transcript
+/// (expensive: a 256 KiB head read plus a 256 KiB tail read out of each).
+///
+/// This is deliberately coarser than `discover_work_unit` in one direction:
+/// it fingerprints EVERY entry in the directory, including ones
+/// `discover_work_unit` would itself ignore (non-`.jsonl` files, legacy
+/// `agent-*.jsonl` subagent siblings). An unrelated file appearing changes
+/// the fingerprint and forces a fresh discovery pass even though the work
+/// unit's membership could not have changed. That costs an occasional
+/// unnecessary discovery pass, never a missed change, so it costs no
+/// correctness: this fingerprint is strictly MORE sensitive than the
+/// member-list check it gates, not less.
+fn dir_fingerprint(dir: &Path) -> Vec<(PathBuf, u64, u64)> {
+    let mut fp: Vec<(PathBuf, u64, u64)> = std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter_map(|entry| {
+                    let meta = entry.metadata().ok()?;
+                    let mtime = meta
+                        .modified()
+                        .ok()?
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .ok()?
+                        .as_secs();
+                    Some((entry.path(), mtime, meta.len()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    fp.sort();
+    fp
+}
+
 /// What one cache slot remembers between calls.
 struct CacheEntry {
     /// The member paths `discover_work_unit` returned at the last parse,
-    /// oldest first, exactly as it returned them. Freshness needs this kept
-    /// separately from `key` (below) because it is the ONLY thing that can
-    /// notice a brand-new sibling transcript joining the unit: a new member's
-    /// path was never stated before, so it cannot show up as "changed" in a
-    /// re-stat of paths we already knew about. Comparing this list against a
-    /// fresh discovery on every call is what catches it.
+    /// oldest first, exactly as it returned them (readable or not: see
+    /// `load_bounded`'s doc on why this must include unreadable members
+    /// too). Freshness needs this kept separately from `key` (below)
+    /// because it is the ONLY thing that can notice a brand-new sibling
+    /// transcript joining the unit: a new member's path was never stated
+    /// before, so it cannot show up as "changed" in a re-stat of paths we
+    /// already knew about. Comparing this list against a fresh discovery is
+    /// what catches it; `dir_fp` (below) is what lets most calls skip
+    /// paying for that fresh discovery at all.
     member_paths: Vec<PathBuf>,
     /// Freshness key (see `unit_key`) over every member path plus every
     /// subagent transcript merged into any of them, at the last parse.
     /// Re-stating the same paths and comparing catches any of them growing,
     /// shrinking, or disappearing.
     key: Vec<(PathBuf, u64, u64)>,
+    /// Fingerprint (see `dir_fingerprint`) of the requested path's own
+    /// directory, taken at the last parse. Comparing this to a fresh
+    /// fingerprint is a cheap stand-in for re-running `discover_work_unit`:
+    /// if the directory's listing has not changed at all, discovery could
+    /// not possibly return anything different, so there is no need to pay
+    /// for the head/tail read of every candidate transcript in it just to
+    /// confirm that.
+    dir_fp: Vec<(PathBuf, u64, u64)>,
     /// The parsed unit, shared out via `Arc::clone` (cheap: bumps a counter).
     unit: Arc<LoadedUnit>,
     /// Logical clock value of the last hit: the LRU eviction key. A counter,
@@ -158,23 +221,39 @@ impl SessionStore {
         }
 
         // Second freshness probe, new in this version: find out which
-        // transcripts belong to this unit RIGHT NOW. `discover_work_unit`
-        // only reads a small head/tail slice of each candidate file to learn
-        // its time span, not the whole file, so this is far cheaper than
-        // actually parsing and merging the unit, but unlike the stat above,
-        // it has to run on every call regardless of whether anything looks
-        // unchanged, because the one thing we most need to catch (a brand
-        // new sibling transcript appearing) leaves every file we already
-        // knew about completely untouched.
-        let discovered = discover_work_unit(path);
-        let current_members: Vec<PathBuf> =
-            discovered.members.iter().map(|m| m.path.clone()).collect();
+        // transcripts belong to this unit RIGHT NOW, cheaply. The thing
+        // that answers this authoritatively, `discover_work_unit`, reads a
+        // 256 KiB head AND a 256 KiB tail out of EVERY candidate transcript
+        // in the directory to learn its time span; on this project's own
+        // 82-transcript corpus that is on the order of 40 MB read and
+        // scanned, on every single call, which is not "small" at all. A
+        // directory-listing fingerprint (`dir_fingerprint`, see its doc for
+        // why a listing is enough) stands in for it: no file is ever
+        // opened, just one cheap `stat`-style call per directory entry. Only
+        // when that fingerprint has actually changed since the last parse
+        // do we pay for the real thing.
+        let dir_fp = path.parent().map(dir_fingerprint).unwrap_or_default();
 
         // `.unwrap()` on a Mutex only fails if another thread panicked while
         // holding the lock ("poisoning"); at that point crashing is honest.
         let mut cache = self.cache.lock().unwrap();
         cache.tick += 1;
         let now = cache.tick;
+
+        // If the directory looks exactly like it did at the last parse, a
+        // fresh `discover_work_unit` call could not possibly return
+        // anything different, so reuse the member list we already have
+        // instead of re-deriving it. Otherwise (first call for this path,
+        // or something in the directory actually changed) pay for the real
+        // discovery pass.
+        let current_members: Vec<PathBuf> = match cache.map.get(path) {
+            Some(entry) if entry.dir_fp == dir_fp => entry.member_paths.clone(),
+            _ => discover_work_unit(path)
+                .members
+                .iter()
+                .map(|m| m.path.clone())
+                .collect(),
+        };
 
         if let Some(entry) = cache.map.get_mut(path)
             && entry.member_paths == current_members
@@ -186,21 +265,45 @@ impl SessionStore {
             let tracked: Vec<PathBuf> = entry.key.iter().map(|(p, _, _)| p.clone()).collect();
             if unit_key(&tracked) == entry.key {
                 // Fresh enough. Touch the recency clock so a hot entry never
-                // looks evictable.
+                // looks evictable, and refresh the directory fingerprint (it
+                // may have changed even when nothing about the unit's own
+                // content did, e.g. an unrelated file appearing).
                 entry.last_used = now;
+                entry.dir_fp = dir_fp;
                 return Ok(Arc::clone(&entry.unit));
             }
         }
 
-        // Miss or stale: assemble the whole unit. `load_work_unit` repeats
-        // the cheap discovery we just did above internally, and then does
-        // the actually expensive part (reading and merging every member
-        // with its own subagents), so the small redundancy in discovery
-        // costs nothing worth engineering away.
+        // Miss or stale: assemble the whole unit. `load_work_unit` runs (or,
+        // when the fast path above already ran `discover_work_unit`,
+        // re-runs) that same discovery internally, and then does the
+        // actually expensive part (reading and merging every member with
+        // its own subagents), so the small possible redundancy in
+        // discovery costs nothing worth engineering away.
         let assembled = load_work_unit(path, max_bytes)
             .map_err(|e| std::io::Error::other(format!("assemble failed: {e}")))?;
 
-        let member_paths = assembled.member_paths.clone();
+        // Cache the FULL discovered member list, readable or not, not just
+        // the members that actually loaded. `current_members` (computed
+        // above) is always equivalent to `discover_work_unit(...).members`,
+        // which lists every discovered member regardless of readability; an
+        // unreadable member (over the size ceiling, a permissions error, or
+        // deleted between discovery and read -- all disclosed, expected
+        // conditions, never fatal to the unit) is skipped by
+        // `load_work_unit`, so `assembled.member_paths` only contains the
+        // members that loaded successfully. Caching THAT list here would
+        // make it permanently shorter than `current_members` whenever any
+        // member is unreadable, so the equality check above could never
+        // match again and every call would re-discover, re-parse and
+        // re-merge the whole unit. `assembled.unit.members` is the same
+        // source `current_members` is built from, so the two stay
+        // comparable.
+        let member_paths: Vec<PathBuf> = assembled
+            .unit
+            .members
+            .iter()
+            .map(|m| m.path.clone())
+            .collect();
         let all_paths: Vec<PathBuf> = assembled
             .member_paths
             .iter()
@@ -229,6 +332,7 @@ impl SessionStore {
             CacheEntry {
                 member_paths,
                 key,
+                dir_fp,
                 unit: Arc::clone(&unit),
                 last_used: now,
             },
@@ -332,6 +436,58 @@ mod tests {
         assert_eq!(
             sub_actions_b, 2,
             "appended subagent action picked up (freshness over sub files)"
+        );
+    }
+
+    #[test]
+    fn cache_hits_when_a_work_unit_member_is_unreadable() {
+        // Reproduces the bug: a work unit with one readable member and one
+        // member that fails to load (here, over the injected size ceiling,
+        // the same disclosed condition `load_work_unit_survives_an_unreadable_member`
+        // in assemble.rs covers) must still cache-hit on an unchanged
+        // second `load`. Before the fix, `CacheEntry::member_paths` was
+        // built from `assembled.member_paths` (only the members that loaded
+        // successfully), while the comparison list on the next call is
+        // built from `discover_work_unit(...).members` (every discovered
+        // member, readable or not). Those two lists could never be equal
+        // whenever any member failed to load, so the cache-hit check never
+        // matched and every call re-discovered, re-parsed and re-merged the
+        // whole unit.
+        let dir = tempfile::tempdir().unwrap();
+        let readable = dir
+            .path()
+            .join("aaaaaaaa-1111-2222-3333-444455556666.jsonl");
+        std::fs::write(&readable, line_at("t0", "2026-01-01T00:00:00Z")).unwrap();
+
+        // Same shape, plus padding, so this file is bigger than `readable`.
+        // The padding sits after the timestamped line so `transcript_span`'s
+        // head/tail scan still finds a timestamp and this file still counts
+        // as a discovered member; it is `load_session`'s OWN size ceiling
+        // (not `transcript_span`, which has none) that will refuse to read it.
+        let unreadable = dir
+            .path()
+            .join("bbbbbbbb-1111-2222-3333-444455556666.jsonl");
+        std::fs::write(
+            &unreadable,
+            format!(
+                "{}\n{}",
+                line_at("t1", "2026-01-01T00:05:00Z"),
+                "x".repeat(4096)
+            ),
+        )
+        .unwrap();
+
+        // A ceiling that admits `readable` but not `unreadable`.
+        let ceiling = std::fs::metadata(&readable).unwrap().len() + 100;
+        assert!(std::fs::metadata(&unreadable).unwrap().len() > ceiling);
+
+        let store = SessionStore::new();
+        let a = store.load_bounded(&readable, ceiling).unwrap();
+        let b = store.load_bounded(&readable, ceiling).unwrap();
+
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "a work unit with an unreadable member must still cache-hit on an unchanged reload"
         );
     }
 
