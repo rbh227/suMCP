@@ -213,8 +213,9 @@ All read-only; all return compact JSON evidence, never narration.
 </p>
 
 `locate → ingest → model → signals → rank → Report`. suMCP parses transcripts
-permissively (a bad line never fails a file), merges any subagent transcripts
-into one totally-ordered timeline, then runs pure functions that look for
+permissively (a bad line never fails a file), merges every transcript in the
+work unit plus their subagent transcripts into one totally-ordered timeline,
+then runs pure functions that look for
 edit-shape churn, rework, re-reads, failure loops, reverts, and comprehension
 signals. Every finding carries a **tier**, an **exact-vs-heuristic** flag, a
 **confidence**, and the action indices that prove it. Findings explain and cite;
