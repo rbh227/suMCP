@@ -19,6 +19,7 @@ pub mod report;
 pub mod review;
 pub mod score;
 pub mod signals;
+pub mod work_unit;
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
