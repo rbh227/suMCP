@@ -2238,6 +2238,13 @@ the archive holds unredacted transcripts."
 - Consumes: everything above.
 - Produces: no API.
 
+**Adjudicated before execution (2026-07-28).** The ceiling below is loose on
+purpose and that was a decision, not an oversight. A reviewer may flag it as an
+assertion that cannot fail; the answer is that a timing assertion tight enough
+to police milliseconds is flaky on shared CI runners and gets deleted after the
+third spurious failure, so this targets algorithmic regressions only. Do not
+tighten it without raising it as a plan change.
+
 - [ ] **Step 1: Write the guard test**
 
 Create `crates/sumcp-core/tests/perf_guard.rs`:

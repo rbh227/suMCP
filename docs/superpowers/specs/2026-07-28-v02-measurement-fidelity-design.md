@@ -288,8 +288,14 @@ says.
 The contract went v0 to v1 on 2026-07-26. This is v2. Changes:
 
 - **Added** `work_unit` object (§4.3) to `session_overview`.
-- **Added** `session` field on findings and on ranked entries, carrying the
-  8-character originating session stem. This is the drill-down.
+- **Added** `session` field on findings, carrying the 8-character originating
+  session stem. This is the drill-down.
+
+  Amended 2026-07-28, before implementation: an earlier draft of this line put
+  the field on ranked entries too, which contradicted success criterion 4
+  above. Findings only is correct. A ranked file spans the whole work unit by
+  construction, so stamping it with a single session id would assert something
+  false about where its evidence came from.
 - **Changed** `session` object in `session_overview`: `id` becomes the work
   unit's newest session, and `started` becomes the unit's span start. Both
   documented as unit-scoped.
