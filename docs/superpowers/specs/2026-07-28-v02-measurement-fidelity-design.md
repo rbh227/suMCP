@@ -81,7 +81,7 @@ merge as parallel lanes, never chain as a sequence. The extreme case in this
 corpus is a unit of 8 transcripts on 2026-07-20 whose every join is an overlap,
 with gaps of -63.9 to -13.5 minutes. This is almost certainly the 4-session
 concurrency pileup recorded at Checkpoint D, and it is the natural fixture for
-the lane-scoping regression test in §9.
+the lane-scoping regression test in §10.
 
 ---
 
@@ -314,7 +314,73 @@ The contract went v0 to v1 on 2026-07-26. This is v2. Changes:
 
 ---
 
-## 9. Testing
+## 9. Performance budget
+
+Work units multiply I/O, so cost is a first-class requirement rather than an
+afterthought. Measured on this machine, 2026-07-28, release build, warm cache.
+
+**Baseline today.** The largest single session (`e88269ab`: 7.2 MB main plus
+7.7 MB of subagent transcripts, 15 MB total) analyzes in **60 to 90 ms** with
+**18.9 MB peak RSS**. That is roughly 250 MB/s and memory at about 1.3x input.
+
+**Worst case after this change.** Grouping the whole corpus at 30 minutes
+yields 34 work units. The largest is 27 MB across 8 transcripts and 58 files;
+the median is 2.4 MB. Running all 8 transcripts of that worst unit as separate
+processes takes **348 ms**, which includes 8 process startups and 8 JSON
+serializations that a single work-unit run does not pay.
+
+**Budget.** These are ceilings, not targets, and they are checked rather than
+assumed:
+
+| quantity | budget | basis |
+|---|---|---|
+| median work unit, end to end | under 100 ms | median unit is 2.4 MB; today's throughput gives ~30 ms |
+| worst observed unit (27 MB, 58 files) | under 500 ms | measured 348 ms as 8 separate processes, which is a pessimistic proxy |
+| peak RSS, worst unit | under 100 MB | 1.3x of 27 MB is ~35 MB, leaving generous headroom |
+| new runtime dependencies | zero | see below |
+
+**Rules that keep it cheap.**
+
+1. **No new dependencies.** The workspace is `serde`, `serde_json`, `clap`,
+   `rmcp`, `tokio`, and nothing else. Work-unit grouping is interval arithmetic
+   over timestamps and needs no crate. Parallel file reads, if ever needed, use
+   `std::thread`, not a runtime.
+2. **One raw buffer at a time.** `assemble.rs` currently does
+   `read_to_string` per file, which is correct for one transcript but would
+   hold 27 MB of raw JSON simultaneously if a work unit read everything up
+   front. Files are parsed one at a time and each raw `String` is dropped
+   before the next is read, so peak memory is (largest single file) plus
+   (accumulated parsed actions), not (sum of all raw bytes).
+3. **The merge stays O(n log n).** Total ordering across k lanes is a single
+   sort of the concatenated actions by `(timestamp, lane, line_no)`, never a
+   pairwise merge loop. The existing `merge_sessions` already has this shape;
+   generalizing the lane identity must not change it.
+4. **Grouping reads timestamps, not whole files.** Deciding which transcripts
+   belong to a unit needs only each file's first and last timestamp. Reading
+   8 MB to learn a start time would make discovery cost as much as analysis.
+   The first timestamp is near the head of the file, and the last is found by
+   reading a bounded tail, reusing the bounded-read helper `identify.rs`
+   already uses for its tail scan.
+5. **Do not build a parse cache yet.** There is an obvious optimization
+   available: every transcript in a work unit except the newest is finished and
+   immutable, so it could be parsed once and cached by `(path, mtime, size)`,
+   leaving only the live tail to re-parse. That would make a repeated debrief
+   nearly free. It is deliberately **not** in scope: the measured worst case is
+   348 ms, which does not justify a cache and its invalidation bugs. This
+   paragraph is the named seam, to be built only if the budget above is
+   actually exceeded. The MCP server's existing `SessionStore` LRU (capped at
+   4) is where it would go.
+
+**Regression guard.** Micro-timing assertions in CI are flaky and will be
+avoided. Instead, one test analyzes a multi-transcript fixture and asserts
+completion under a deliberately generous ceiling. The purpose is to catch an
+algorithmic regression, such as an accidental O(n^2) merge, not to police tens
+of milliseconds. The real numbers above are recorded here and re-measured by
+hand when the implementation lands, with the result written into this section.
+
+---
+
+## 10. Testing
 
 Red-first where the behaviour is new, per the process note in T4.1-verify.
 
@@ -333,7 +399,7 @@ Red-first where the behaviour is new, per the process note in T4.1-verify.
 
 ---
 
-## 10. Non-goals
+## 11. Non-goals
 
 - Exact content evidence from `file-history`. Sub-project 2.
 - Any new detector, threshold change to the review floor, or change to the
@@ -349,7 +415,7 @@ Red-first where the behaviour is new, per the process note in T4.1-verify.
 
 ---
 
-## 11. Decisions on the two softest points
+## 12. Decisions on the two softest points
 
 **Debrief timing.** The concern was that the Stop hook fires at the end of
 transcript 3 of 7, so a work-unit debrief would describe a partial stretch and
