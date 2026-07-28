@@ -278,6 +278,11 @@ pub fn ingest_str(raw: &str, default_lane: Lane) -> Session {
                 effective_ts: p.effective_ts,
                 ts_inherited: p.ts_inherited,
                 lane: p.lane,
+                // A bare `ingest_str` call parses one transcript in
+                // isolation, so every action it produces belongs to "the
+                // only transcript there is": index 0. Task 6 (assembly) is
+                // what rewrites this when several transcripts get merged.
+                session_ix: 0,
                 line_no: p.line_no,
                 kind: p.kind,
                 file_path: p.file_path,
@@ -325,6 +330,12 @@ pub fn ingest_str(raw: &str, default_lane: Lane) -> Session {
         interrupts,
         auto_accept,
         spawns,
+        // A single `ingest_str` call has no idea what its own transcript id
+        // is (that lives outside the raw JSONL text it was handed), so it
+        // cannot fill this in. It leaves the table empty; the merge/assembly
+        // step (a later task) is the one place that knows every transcript's
+        // real id and stamps this table in.
+        session_ids: Vec::new(),
         subagent_files_missing: 0,
     }
 }

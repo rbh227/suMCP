@@ -89,6 +89,16 @@ pub struct Action {
     pub ts_inherited: bool,
     /// Main or subagent lane.
     pub lane: Lane,
+    /// Which transcript of the work unit this action came from: an index into
+    /// [`Session::session_ids`].
+    ///
+    /// WHY AN INDEX AND NOT A STRING: a work unit holds at most 16 sessions
+    /// but tens of thousands of actions. A `String` here would mean one heap
+    /// allocation and about 24 bytes per action; a `u16` is 2 bytes and no
+    /// allocation. Payloads look the real id up in the table when they need
+    /// to print it. `0` for a single-transcript analysis.
+    #[serde(default)]
+    pub session_ix: u16,
     /// Original 0-based line number in its source transcript (the total-order tiebreak).
     pub line_no: usize,
     /// What the action did.
@@ -127,6 +137,58 @@ pub struct Action {
     /// Seconds from proposing this Edit/Write to its result — the approval
     /// latency heuristic (execution ≈ instant, so this ≈ human decision time).
     pub approval_latency_s: Option<f64>,
+}
+
+impl Action {
+    /// The identity an adjacency comparison must use.
+    ///
+    /// Returns the pair (originating transcript, lane within it). Two actions
+    /// belong to the same lane only when BOTH match. Every comparison that
+    /// asks "were these two actions produced by the same agent in sequence"
+    /// must use this rather than `.lane`, or a work unit will let a finding
+    /// span two different transcripts.
+    pub fn lane_key(&self) -> (u16, &Lane) {
+        (self.session_ix, &self.lane)
+    }
+}
+
+// This `Default` impl is `#[cfg(test)]`-only on purpose: it exists so unit
+// tests can build a throwaway `Action` and only override the two or three
+// fields the test actually cares about, instead of spelling out all twenty
+// fields every time. It is NOT part of the public API a library consumer
+// sees, because "give me a plausible-looking blank action" is a testing
+// convenience, not a real operation any caller outside this crate needs.
+// Gating it like this keeps the crate's real surface smaller than it would
+// be if every helper we wrote for our own tests leaked out to consumers.
+#[cfg(test)]
+impl Default for Action {
+    fn default() -> Self {
+        Action {
+            idx: Idx(0),
+            effective_ts: String::new(),
+            ts_inherited: false,
+            lane: Lane::Main,
+            session_ix: 0,
+            line_no: 0,
+            // `ActionKind` has no meaningful "default" action kind, so this
+            // is a placeholder every real test overwrites explicitly before
+            // asserting anything that depends on what kind of action it is.
+            kind: ActionKind::Other(String::new()),
+            file_path: None,
+            is_error: None,
+            write_len: None,
+            write_lines: None,
+            read_total_lines: None,
+            input_hash: None,
+            error: None,
+            hunks: vec![],
+            command: None,
+            user_modified: false,
+            edit_old: None,
+            edit_new: None,
+            approval_latency_s: None,
+        }
+    }
 }
 
 /// Token accounting, summed once per `message.id` (dedup layer a).
@@ -298,6 +360,19 @@ pub struct Session {
     /// MAIN transcript), post-dedup. Used by assembly to find and merge the
     /// child transcripts; carried through the merge as provenance.
     pub spawns: Vec<Spawn>,
+    /// The transcript ids making up this session, oldest first. An action's
+    /// `session_ix` indexes into this. A single-transcript analysis has
+    /// exactly one entry, so `session_ids[0]` is always the id being reported.
+    ///
+    /// NOTE: a bare `ingest_str` call does not know its own transcript id, so
+    /// it leaves this empty (see `ingest.rs`); the merge step (a later task)
+    /// fills it in once several transcripts are assembled into one work unit.
+    /// Anything reading `session_ids` must tolerate an empty table, and
+    /// `Action::lane_key` deliberately never indexes into it (it just returns
+    /// the raw `u16`), so an empty table can never cause an out-of-bounds
+    /// lookup.
+    #[serde(default)]
+    pub session_ids: Vec<String>,
     /// Subagent spawns whose transcript could not be turned into analyzed
     /// actions (file not found / unreadable / oversized / parsed to zero
     /// actions / over the file-count cap). Honest scope disclosure, surfaced
@@ -336,5 +411,44 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(t.cache_hit_ratio(), Some(0.9));
+    }
+
+    // Both tests below build an `Action` with `::default()` and then
+    // overwrite a couple of fields by hand, one at a time, rather than
+    // spelling out a full struct literal. Clippy's `field_reassign_with_default`
+    // lint would rather we write `Action { lane: ..., session_ix: ...,
+    // ..Default::default() }` in one go. Here that would bury the exact two
+    // fields the test cares about inside a longer literal, so the
+    // field-by-field version is kept for readability and the lint is
+    // silenced explicitly instead.
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn lane_key_separates_the_main_lanes_of_two_sessions() {
+        // WHY THIS EXISTS: `Lane::Main == Lane::Main` is true across two
+        // different transcripts. Every adjacency-based finding (true_revert,
+        // flip, failure proximity) compares lanes, so without the session tag
+        // an edit in session 0 would read as the same lane as one in session 1
+        // and a revert could fire across a boundary it must never cross.
+        let mut a = Action::default();
+        a.lane = Lane::Main;
+        a.session_ix = 0;
+        let mut b = Action::default();
+        b.lane = Lane::Main;
+        b.session_ix = 1;
+
+        assert_eq!(a.lane, b.lane, "the lanes alone are equal");
+        assert_ne!(a.lane_key(), b.lane_key(), "the lane keys must differ");
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn lane_key_matches_within_one_session() {
+        let mut a = Action::default();
+        a.lane = Lane::Sub("x".into());
+        a.session_ix = 2;
+        let mut b = Action::default();
+        b.lane = Lane::Sub("x".into());
+        b.session_ix = 2;
+        assert_eq!(a.lane_key(), b.lane_key());
     }
 }

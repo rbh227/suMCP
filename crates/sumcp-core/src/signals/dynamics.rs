@@ -560,6 +560,7 @@ mod tests {
             effective_ts: ts.into(),
             ts_inherited: false,
             lane,
+            session_ix: 0,
             line_no: line,
             kind: ActionKind::Edit,
             file_path: Some("/a".into()),
@@ -597,6 +598,7 @@ mod tests {
             interrupts: 0,
             auto_accept: false,
             spawns: vec![],
+            session_ids: vec![],
             subagent_files_missing: 0,
         };
         assert!(
@@ -626,6 +628,7 @@ mod tests {
             effective_ts: ts.into(),
             ts_inherited: false,
             lane: Lane::Sub("x".into()),
+            session_ix: 0,
             line_no: line,
             kind: ActionKind::Edit,
             file_path: Some("/a".into()),
@@ -666,6 +669,7 @@ mod tests {
             interrupts: 0,
             auto_accept: false,
             spawns: vec![],
+            session_ids: vec![],
             subagent_files_missing: 0,
         };
         let f = reverts_and_flips(&s);
