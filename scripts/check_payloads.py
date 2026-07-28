@@ -120,6 +120,14 @@ def check_work_unit(payload) -> list[str]:
     rule = wu.get("rule")
     if not (isinstance(rule, str) and rule.strip()):
         errors.append("work_unit.rule must be a non-empty string (auditable by hand)")
+    # The exclusion disclosures. `sessions`/`session_ids`/`joined_gaps_min`
+    # describe only the ANALYZED members, so the block must also say what was
+    # discovered but not analyzed; both counts are always present (usually 0)
+    # so a partial load is visible rather than silently shaped like a full one.
+    for k in ("members_unreadable", "siblings_unplaced"):
+        v = wu.get(k)
+        if not (isinstance(v, int) and not isinstance(v, bool) and v >= 0):
+            errors.append(f"work_unit.{k} must be a non-negative integer, got {v!r}")
     return errors
 
 

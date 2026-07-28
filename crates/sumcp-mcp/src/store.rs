@@ -312,16 +312,14 @@ impl SessionStore {
             .collect();
         let key = unit_key(&all_paths);
 
-        // A unit of one (no sibling transcript ever joined) is reported
-        // exactly the way a single transcript always was: no grouping to
-        // disclose, so `meta_unit` stays `None` (see `LoadedUnit`'s doc and
+        // A unit of one (no sibling transcript ever joined, nothing
+        // excluded) is reported exactly the way a single transcript always
+        // was: no grouping to disclose. `unit_meta_from` itself makes that
+        // call and returns `None`, so this store and the CLI cannot drift
+        // apart on when the block appears (see `LoadedUnit`'s doc and
         // `finding_session` in `payloads`, which requires this to stay in
         // lockstep with whether a `session` key may appear on a finding).
-        let meta_unit = if assembled.unit.members.len() > 1 {
-            Some(unit_meta_from(&assembled))
-        } else {
-            None
-        };
+        let meta_unit = unit_meta_from(&assembled);
         let unit = Arc::new(LoadedUnit {
             session: assembled.session,
             meta_unit,

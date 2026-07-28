@@ -95,17 +95,7 @@ pub fn merge_sessions(main: Session, subs: Vec<Session>, files_missing: u64) -> 
 /// (signals/dynamics.rs) only matches user messages whose `session_ix`
 /// equals the edit's `session_ix`, so transcripts after the first would
 /// silently lose all pushback/Flip detection, with no error anywhere.
-pub fn merge_work_unit(
-    parts: Vec<(String, Session)>,
-    files_missing: u64,
-    // Not stored: the caller surfaces this in payload flags directly. Kept
-    // as a parameter (rather than dropped from the signature) because the
-    // caller's dropped-transcript count belongs conceptually next to
-    // `files_missing` here, even though this function has nothing to do
-    // with it. Underscore-prefixed so clippy doesn't warn about it being
-    // unused.
-    _dropped: u64,
-) -> Session {
+pub fn merge_work_unit(parts: Vec<(String, Session)>) -> Session {
     let mut actions: Vec<Action> = Vec::new();
     let mut user_texts = Vec::new();
     let mut session_ids: Vec<String> = Vec::new();
@@ -117,7 +107,11 @@ pub fn merge_work_unit(
     let mut interrupts = 0u64;
     let mut auto_accept = false;
     let mut spawns = Vec::new();
-    let mut subagent_files_missing = files_missing;
+    // Strictly the sum of the parts' own subagent-missing counts. A work-unit
+    // MEMBER that failed to load is a different kind of gap (it is not a
+    // subagent spawn) and is disclosed as `work_unit.members_unreadable`
+    // instead of being folded in here, where its meaning would be misstated.
+    let mut subagent_files_missing = 0u64;
 
     for (ix, (id, part)) in parts.into_iter().enumerate() {
         // `ix` is this transcript's slot in `session_ids` (parts arrive
@@ -422,11 +416,7 @@ mod tests {
         let a = one(Lane::Main, "2026-01-01T00:00:03Z", 1, "/a");
         let b = one(Lane::Main, "2026-01-01T00:00:01Z", 1, "/b");
 
-        let merged = merge_work_unit(
-            vec![("sess-a".to_string(), a), ("sess-b".to_string(), b)],
-            0,
-            0,
-        );
+        let merged = merge_work_unit(vec![("sess-a".to_string(), a), ("sess-b".to_string(), b)]);
 
         // The table records both transcripts, in the order given.
         assert_eq!(merged.session_ids, vec!["sess-a", "sess-b"]);
@@ -466,7 +456,7 @@ mod tests {
         b.interrupts = 4;
         b.subagent_files_missing = 2;
 
-        let merged = merge_work_unit(vec![("a".to_string(), a), ("b".to_string(), b)], 0, 0);
+        let merged = merge_work_unit(vec![("a".to_string(), a), ("b".to_string(), b)]);
         assert_eq!(merged.tokens.input, 15);
         assert_eq!(merged.tokens.output, 27);
         assert_eq!(merged.tokens.cache_read, 33);
@@ -504,7 +494,7 @@ mod tests {
         }];
         b.auto_accept = true;
 
-        let merged = merge_work_unit(vec![("a".into(), a), ("b".into(), b)], 0, 0);
+        let merged = merge_work_unit(vec![("a".into(), a), ("b".into(), b)]);
         assert_eq!(merged.user_texts.len(), 2);
         assert!(
             merged.auto_accept,
@@ -532,7 +522,7 @@ mod tests {
             is_human: true,
         }];
 
-        let merged = merge_work_unit(vec![("a".into(), a), ("b".into(), b)], 0, 0);
+        let merged = merge_work_unit(vec![("a".into(), a), ("b".into(), b)]);
         assert_eq!(merged.user_texts.len(), 1);
         assert_eq!(
             merged.user_texts[0].session_ix, 1,

@@ -148,6 +148,12 @@ pub struct AssembledUnit {
     pub subagent_paths: Vec<PathBuf>,
     /// The grouping decision, for disclosure in payloads.
     pub unit: crate::work_unit::WorkUnit,
+    /// Discovered members that could not be loaded (unreadable, over the
+    /// byte ceiling). NOT folded into `flags.subagent_files_missing`, whose
+    /// documented meaning is "subagent spawns whose child transcript could
+    /// not be analyzed": a missing work-unit member is not a subagent spawn,
+    /// so it gets its own disclosure (`work_unit.members_unreadable`).
+    pub members_missing: u64,
 }
 
 /// Turn a main transcript path into a merged session covering its whole work
@@ -209,12 +215,13 @@ pub fn load_work_unit(main_path: &Path, max_bytes: u64) -> std::io::Result<Assem
     let mut seen_subagents = std::collections::HashSet::new();
     subagent_paths.retain(|p| seen_subagents.insert(p.clone()));
 
-    let session = merge_work_unit(parts, members_missing, unit.dropped);
+    let session = merge_work_unit(parts);
     Ok(AssembledUnit {
         session,
         member_paths,
         subagent_paths,
         unit,
+        members_missing,
     })
 }
 
@@ -409,6 +416,49 @@ mod tests {
         let out = load_work_unit(&b_path, ceiling).unwrap();
         assert_eq!(out.session.actions.len(), 1, "only the readable member");
         assert_eq!(out.unit.members.len(), 2, "the unit still knows about both");
+        assert_eq!(out.members_missing, 1, "the unloadable member is counted");
+        assert_eq!(
+            out.session.subagent_files_missing, 0,
+            "a missing MEMBER is not a missing subagent; the flag must not \
+             absorb it and misstate what went wrong"
+        );
+
+        // The disclosure a payload builds from this partial load must stay
+        // internally consistent: every count describes the analyzed members,
+        // and the excluded one is disclosed separately. Before the fix,
+        // `sessions` said 2 while `session_ids` had 1 entry, violating the
+        // schema invariant check_payloads.py enforces.
+        let meta = crate::payloads::unit_meta_from(&out).expect("a 2-member unit disclosed");
+        assert_eq!(meta.sessions, 1, "sessions counts ANALYZED members");
+        assert_eq!(meta.session_ids.len(), meta.sessions);
+        assert_eq!(
+            meta.joined_gaps_min.len(),
+            meta.sessions - 1,
+            "gaps stay one shorter than the analyzed member count"
+        );
+        assert_eq!(meta.members_unreadable, 1);
+        assert_eq!(
+            meta.span_start, "2026-01-01T00:05:00Z",
+            "the span covers the analyzed member, not the excluded one"
+        );
+    }
+
+    #[test]
+    fn a_plain_single_transcript_unit_discloses_no_work_unit_block() {
+        // The schema says a single-transcript analysis carries no work_unit
+        // block. The CLI used to wrap unconditionally while the MCP store
+        // gated on member count, so the two binaries disagreed; the gate now
+        // lives inside `unit_meta_from` where neither caller can skip it.
+        let td = tempfile::tempdir().unwrap();
+        let id = "cccccccc-1111-2222-3333-444455556666";
+        let path = td.path().join(format!("{id}.jsonl"));
+        std::fs::write(&path, main_edit_line(id, "2026-01-01T00:00:00Z", "/x.rs")).unwrap();
+
+        let out = load_work_unit(&path, MAX_TRANSCRIPT_BYTES).unwrap();
+        assert!(
+            crate::payloads::unit_meta_from(&out).is_none(),
+            "one discovered member, loaded, nothing excluded: nothing to disclose"
+        );
     }
 
     #[test]

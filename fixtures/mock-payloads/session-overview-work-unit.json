@@ -17,4 +17,6 @@
  "span_start":"2026-01-01T09:00:00Z",
  "span_end":"2026-01-01T19:15:00Z",
  "session_ids":["aaaaaaaa","bbbbbbbb","cccccccc"],
- "dropped":0}}
+ "dropped":0,
+ "members_unreadable":0,
+ "siblings_unplaced":0}}

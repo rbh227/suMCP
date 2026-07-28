@@ -278,8 +278,13 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
+        // `unit_meta_from` decides for BOTH binaries whether a `work_unit`
+        // block appears: `None` for a plain single-transcript unit, `Some`
+        // whenever there is a grouping or an exclusion to disclose. The CLI
+        // used to wrap unconditionally, which put a `work_unit` block on
+        // single-transcript payloads the schema says must not carry one.
         let meta = unit_meta_from(&assembled);
-        (assembled.session, Some(meta))
+        (assembled.session, meta)
     };
     let ranked = rank(&session);
     let meta = SessionMeta {

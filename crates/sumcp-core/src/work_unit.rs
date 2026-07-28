@@ -47,6 +47,41 @@ pub struct WorkUnit {
     pub joined_gaps_min: Vec<f64>,
     /// Members discarded because the unit exceeded `MAX_WORK_UNIT_SESSIONS`.
     pub dropped: u64,
+    /// Same-directory transcripts whose time span could not be read at
+    /// discovery (unreadable file, no parseable timestamp). Such a file
+    /// cannot be placed in time, so its unit membership is UNKNOWN: this is
+    /// a directory-level count attached to every unit discovered there, not
+    /// a claim that these files belong to this unit. Spec §8 requires the
+    /// exclusion to be counted rather than silent.
+    pub unplaced: u64,
+}
+
+/// Gaps in minutes between each member and the running span end before it,
+/// over exactly the given members (oldest first). One shorter than the input.
+/// Same rule `group_spans` applies while grouping; this recomputes it for a
+/// SUBSET (the members that actually loaded), so a payload's gap list can
+/// stay one-shorter-than-sessions when a member was discovered but could not
+/// be read.
+pub fn gaps_between(members: &[Member]) -> Vec<f64> {
+    let mut gaps = Vec::new();
+    let Some(first) = members.first() else {
+        return gaps;
+    };
+    let mut running_end = first.span.last.clone();
+    for m in &members[1..] {
+        // Members handed here were already grouped, so their timestamps
+        // parsed once before; `unwrap_or(0.0)` is a can't-happen guard, not
+        // a policy (NaN would serialize as JSON null and break the schema).
+        gaps.push(
+            secs_between(&running_end, &m.span.first)
+                .map(|g| g as f64 / 60.0)
+                .unwrap_or(0.0),
+        );
+        if m.span.last > running_end {
+            running_end = m.span.last.clone();
+        }
+    }
+    gaps
 }
 
 /// Seconds from `a` to `b`, where both are RFC 3339 UTC strings.
@@ -182,6 +217,7 @@ pub fn group_spans(mut items: Vec<Member>) -> Vec<WorkUnit> {
                     members: vec![item],
                     joined_gaps_min: Vec::new(),
                     dropped: 0,
+                    unplaced: 0,
                 });
             }
         }
@@ -224,6 +260,7 @@ pub fn discover_work_unit(main_path: &Path) -> WorkUnit {
         }],
         joined_gaps_min: Vec::new(),
         dropped: 0,
+        unplaced: 0,
     };
     let Some(dir) = main_path.parent() else {
         return fallback();
@@ -233,6 +270,7 @@ pub fn discover_work_unit(main_path: &Path) -> WorkUnit {
     };
 
     let mut items: Vec<Member> = Vec::new();
+    let mut unplaced = 0u64;
     for entry in entries.flatten() {
         let p = entry.path();
         // This function enumerates a whole directory, which is exactly the
@@ -276,15 +314,24 @@ pub fn discover_work_unit(main_path: &Path) -> WorkUnit {
         }
         if let Some(span) = transcript_span(&p) {
             items.push(Member { path: p, span });
+        } else {
+            // A file that cannot be placed in time cannot be grouped, but
+            // silently vanishing is worse than admitting the gap: it might
+            // have belonged to the unit being reported. Counted here,
+            // stamped onto the returned unit below, disclosed in payloads.
+            unplaced += 1;
         }
     }
 
-    for unit in group_spans(items) {
+    for mut unit in group_spans(items) {
         if unit.members.iter().any(|mm| mm.path == main_path) {
+            unit.unplaced = unplaced;
             return unit;
         }
     }
-    fallback()
+    let mut fb = fallback();
+    fb.unplaced = unplaced;
+    fb
 }
 
 #[cfg(test)]
@@ -436,6 +483,39 @@ mod tests {
             unit.members.iter().map(|m| &m.path).collect::<Vec<_>>()
         );
         assert_eq!(unit.members[0].path, main);
+    }
+
+    #[test]
+    fn an_unplaceable_sibling_is_counted_not_silently_dropped() {
+        // A sibling transcript whose span cannot be read (here: no
+        // timestamps at all) cannot be grouped, but before the fix it
+        // vanished with zero disclosure anywhere: the unit reported itself
+        // complete while a file that might belong to it was ignored. Spec §8
+        // requires the exclusion to be counted.
+        let td = tempfile::tempdir().unwrap();
+        let main = td.path().join("dddd0001-1111-2222-3333-444455556666.jsonl");
+        std::fs::write(
+            &main,
+            concat!(
+                r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z"}"#,
+                "\n",
+                r#"{"type":"assistant","timestamp":"2026-01-01T00:10:00Z"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            td.path().join("dddd0002-1111-2222-3333-444455556666.jsonl"),
+            r#"{"type":"assistant","note":"no timestamp anywhere"}"#,
+        )
+        .unwrap();
+
+        let unit = discover_work_unit(&main);
+        assert_eq!(unit.members.len(), 1, "the datable transcript alone");
+        assert_eq!(
+            unit.unplaced, 1,
+            "the undatable sibling is counted, membership unknown"
+        );
     }
 
     // These anchors are independently known values (computable by hand or by

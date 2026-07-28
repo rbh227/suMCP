@@ -78,51 +78,80 @@ pub struct SessionMeta {
 }
 
 /// The work-unit grouping behind a report, when there was one.
+///
+/// Every count and list here describes the transcripts that were ACTUALLY
+/// ANALYZED, so the schema invariants hold under a partial load: `sessions`
+/// equals `session_ids.len()`, and `joined_gaps_min` is one shorter. What
+/// could not be analyzed is disclosed separately (`members_unreadable`,
+/// `siblings_unplaced`, `dropped`) rather than making the analyzed counts
+/// lie in either direction.
 #[derive(Debug, Clone)]
 pub struct UnitMeta {
-    /// Transcripts merged.
+    /// Transcripts merged (loaded and analyzed).
     pub sessions: usize,
-    /// Gap in minutes before each member after the first. Negative means the
-    /// transcript overlapped the running span, so it was a concurrent Claude
-    /// Code instance rather than a continuation.
+    /// Gap in minutes before each analyzed member after the first. Negative
+    /// means the transcript overlapped the running span, so it was a
+    /// concurrent Claude Code instance rather than a continuation.
     pub joined_gaps_min: Vec<f64>,
-    /// First timestamp in the unit.
+    /// First timestamp across the analyzed members.
     pub span_start: String,
-    /// Last timestamp in the unit.
+    /// Last timestamp across the analyzed members.
     pub span_end: String,
-    /// Transcript ids, oldest first.
+    /// Analyzed transcript ids, oldest first.
     pub session_ids: Vec<String>,
     /// Members dropped by the size cap.
     pub dropped: u64,
+    /// Discovered members of THIS unit that could not be loaded (unreadable
+    /// file, over the byte ceiling). Their gaps and span are excluded above.
+    pub members_unreadable: u64,
+    /// Same-directory transcripts whose time span could not be read at
+    /// discovery. Unit membership unknown; see `WorkUnit::unplaced`.
+    pub siblings_unplaced: u64,
 }
 
-/// Turn an assembled work unit into the `UnitMeta` a payload discloses.
-///
-/// Both binaries that can report on a work unit (the CLI's bare/`--work-unit`
-/// path and the MCP server's `SessionStore`) need to build a `UnitMeta` from
-/// an `AssembledUnit`, and the mapping is pure bookkeeping with no
-/// caller-specific logic, so it lives here once instead of being copied
-/// twice.
-pub fn unit_meta_from(a: &AssembledUnit) -> UnitMeta {
-    UnitMeta {
-        sessions: a.unit.members.len(),
-        joined_gaps_min: a.unit.joined_gaps_min.clone(),
-        span_start: a
-            .unit
-            .members
+/// Turn an assembled work unit into the `UnitMeta` a payload discloses, or
+/// `None` when there is nothing to disclose: exactly one discovered member,
+/// which loaded, with nothing dropped and nothing unplaced. That is the
+/// plain single-transcript analysis the schema documents as carrying no
+/// `work_unit` block, and gating it HERE keeps the CLI and the MCP server
+/// (the two callers) incapable of disagreeing about when the block appears.
+pub fn unit_meta_from(a: &AssembledUnit) -> Option<UnitMeta> {
+    if a.unit.members.len() <= 1
+        && a.members_missing == 0
+        && a.unit.unplaced == 0
+        && a.unit.dropped == 0
+    {
+        return None;
+    }
+    // The analyzed members, oldest first: the unit's discovered members
+    // filtered down to the ones that actually loaded. Gaps and span are
+    // recomputed over this subset so every field describes the same set of
+    // transcripts the report analyzed (a discovered-but-unreadable member
+    // must not contribute a gap entry the schema then miscounts).
+    let loaded: Vec<crate::work_unit::Member> = a
+        .unit
+        .members
+        .iter()
+        .filter(|m| a.member_paths.contains(&m.path))
+        .cloned()
+        .collect();
+    Some(UnitMeta {
+        sessions: loaded.len(),
+        joined_gaps_min: crate::work_unit::gaps_between(&loaded),
+        span_start: loaded
             .first()
             .map(|m| m.span.first.clone())
             .unwrap_or_default(),
-        span_end: a
-            .unit
-            .members
+        span_end: loaded
             .iter()
             .map(|m| m.span.last.clone())
             .max()
             .unwrap_or_default(),
         session_ids: a.session.session_ids.clone(),
         dropped: a.unit.dropped,
-    }
+        members_unreadable: a.members_missing,
+        siblings_unplaced: a.unit.unplaced,
+    })
 }
 
 /// Approximate token count of a serialized payload.
@@ -458,6 +487,12 @@ pub fn session_overview(s: &Session, ranked: &[FileScore], meta: &SessionMeta) -
                     .map(|s| short_id(s))
                     .collect::<Vec<_>>(),
                 "dropped": u.dropped,
+                // The two exclusion disclosures (spec §8): members of this
+                // unit that could not be loaded, and same-directory
+                // transcripts that could not be placed in time at all.
+                // Always present so the shape is stable; both are usually 0.
+                "members_unreadable": u.members_unreadable,
+                "siblings_unplaced": u.siblings_unplaced,
             });
             // Fold into the same `truncated` disclosure every other cut in this
             // file uses: only ever flip it to `true`, never back to `false`,
@@ -849,6 +884,8 @@ mod tests {
                 span_end: "2026-01-01T01:00:00Z".into(),
                 session_ids: vec!["aaaaaaaa".into(), "bbbbbbbb".into()],
                 dropped: 0,
+                members_unreadable: 0,
+                siblings_unplaced: 0,
             }),
         }
     }
@@ -1523,6 +1560,8 @@ mod tests {
                 span_end: "2026-01-01T05:00:00Z".into(),
                 session_ids: vec!["aaaaaaaa".into(), "bbbbbbbb".into(), "cccccccc".into()],
                 dropped: 0,
+                members_unreadable: 0,
+                siblings_unplaced: 0,
             }),
         };
         let v = session_overview(&s, &[], &meta);
@@ -1579,6 +1618,8 @@ mod tests {
                     .map(|i| format!("{i:08x}-aaaa-bbbb-cccc-dddddddddddd"))
                     .collect(),
                 dropped: 0,
+                members_unreadable: 0,
+                siblings_unplaced: 0,
             }),
         };
         let p = session_overview(&s, &[], &m);

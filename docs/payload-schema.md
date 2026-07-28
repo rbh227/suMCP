@@ -254,8 +254,15 @@ payload's `v` becomes `2`.
 
 ### `work_unit` (new, `session_overview` only)
 
-Present only when the report covers more than one transcript; absent
-entirely for a single-transcript analysis.
+Present when the report covers more than one transcript, OR when something
+was discovered but excluded (an unreadable member, an undatable sibling, a
+cap drop): an exclusion is exactly what must not go undisclosed. Absent
+entirely for a plain single-transcript analysis with nothing excluded.
+
+Every count and list describes the transcripts that were **actually
+analyzed**, so the invariants below hold even when a discovered member could
+not be read; what was excluded is disclosed in its own fields rather than
+skewing the analyzed counts.
 
 ```json
 "work_unit":{
@@ -265,18 +272,22 @@ entirely for a single-transcript analysis.
   "span_start":"2026-01-01T09:00:00Z",
   "span_end":"2026-01-01T19:15:00Z",
   "session_ids":["aaaaaaaa","bbbbbbbb","cccccccc"],
-  "dropped":0
+  "dropped":0,
+  "members_unreadable":0,
+  "siblings_unplaced":0
 }
 ```
 
 | field | contents |
 |---|---|
 | `rule` | the grouping rule, printed verbatim (same auditability promise as `ranking_rule`: a reader checks the grouping by hand, never by trusting an opaque decision) |
-| `sessions` | how many transcripts were merged into this report |
-| `joined_gaps_min` | one entry per transcript after the first: the gap in minutes between the running span's end and that transcript joining. **A negative value means the transcript overlapped the running span instead of following it**, which is how a reader spots a concurrent Claude Code instance rather than a continuation. Always `sessions - 1` entries. |
-| `span_start` / `span_end` | first and last timestamp across the whole merged unit |
-| `session_ids` | transcript ids, oldest first, each shortened to its first 8 characters (`short_id`): long enough to identify a transcript, short enough to hold the token cap, and it leaks neither the home directory nor the username the way a full path would |
+| `sessions` | how many transcripts were analyzed and merged into this report |
+| `joined_gaps_min` | one entry per analyzed transcript after the first: the gap in minutes between the running span's end and that transcript joining. **A negative value means the transcript overlapped the running span instead of following it**, which is how a reader spots a concurrent Claude Code instance rather than a continuation. Always `sessions - 1` entries. |
+| `span_start` / `span_end` | first and last timestamp across the analyzed members |
+| `session_ids` | analyzed transcript ids, oldest first, each shortened to its first 8 characters (`short_id`): long enough to identify a transcript, short enough to hold the token cap, and it leaks neither the home directory nor the username the way a full path would. Always exactly `sessions` entries. |
 | `dropped` | how many transcripts the unit's size cap discarded (oldest first); `0` when everything merged in |
+| `members_unreadable` | discovered members of this unit that could not be loaded (unreadable file, over the byte ceiling). Their ids, gaps, and spans are excluded from the fields above rather than miscounted into them. |
+| `siblings_unplaced` | same-directory transcripts whose time span could not be read at discovery. Such a file cannot be placed in time, so whether it belongs to this unit is unknown; the count says "something here could not be grouped" without claiming membership. |
 
 ### `session` (new, conditional, on findings only)
 
