@@ -1,9 +1,14 @@
 //! `sumcp` — human CLI over the same Report the MCP server serves.
 //!
-//! Bare `sumcp` analyzes the most recent session of the current project, so
-//! the first run needs no arguments; `--file <path>` overrides that choice.
-//! Either way it prints the overview + ranked struggle areas, or the
-//! `session_overview` payload (the v1 contract) under `--json`.
+//! Three entry points, three scopes. Bare `sumcp` needs no arguments: it
+//! analyzes the whole work unit (every transcript in the same continuous
+//! stretch of work) containing the most recent session of the current
+//! project. `--work-unit <path>` analyzes the work unit containing that
+//! specific transcript. `--file <path>` is the odd one out on purpose: an
+//! explicit path names an explicit scope, so it stays single-transcript even
+//! when that transcript is part of a larger unit (it prints a stderr note
+//! when that happens). Either way it prints the overview + ranked struggle
+//! areas, or the `session_overview` payload (the v1 contract) under `--json`.
 
 mod install;
 
@@ -21,9 +26,15 @@ struct Args {
     #[command(subcommand)]
     command: Option<Command>,
     /// Path to a transcript `.jsonl` to analyze. Defaults to the most recent
-    /// session of the current directory's project.
+    /// session of the current directory's project. An explicit path names an
+    /// explicit scope, so this stays single-transcript even when the named
+    /// file is part of a larger work unit (see `--work-unit`).
     #[arg(long)]
     file: Option<PathBuf>,
+    /// Analyze the whole work unit containing this transcript: every
+    /// transcript in the same continuous stretch of work.
+    #[arg(long, conflicts_with = "file")]
+    work_unit: Option<PathBuf>,
     /// Emit the session_overview JSON payload instead of the text view.
     #[arg(long)]
     json: bool,
@@ -74,12 +85,16 @@ enum NoTarget {
 
 /// Decide which transcript to analyze.
 ///
-/// An explicit `--file` always wins: the user naming a path is the strongest
-/// signal there is. It is also resolved BEFORE we look at `claude_home`, so
-/// `sumcp --file x.jsonl` keeps working where there is no `~/.claude` and no
-/// `$HOME` at all (a CI container, say) — hence the `Option` arguments.
-/// Without `--file` we fall back to "the session I last worked in here",
-/// which is what a human at a terminal means by a bare `sumcp`.
+/// `explicit_path` is whichever of `--file` or `--work-unit` the caller gave
+/// (clap's `conflicts_with` guarantees at most one is `Some`); either always
+/// wins, because the user naming a path is the strongest signal there is.
+/// It is also resolved BEFORE we look at `claude_home`, so `sumcp --file
+/// x.jsonl` keeps working where there is no `~/.claude` and no `$HOME` at all
+/// (a CI container, say) — hence the `Option` arguments. This function only
+/// picks the PATH; whether that path is read as one transcript or as its
+/// whole work unit is decided afterward, by which flag supplied it. With
+/// neither flag we fall back to "the session I last worked in here", which
+/// is what a human at a terminal means by a bare `sumcp`.
 ///
 /// Pure: no env, no printing, so tests can drive it against a temp tree. The
 /// `NoSessions` case carries the directory we searched, because that path is
@@ -117,6 +132,32 @@ fn stem_id(path: &Path) -> String {
     path.file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default()
+}
+
+/// Build the payload-facing description of a work unit from what assembly
+/// actually read. Kept next to the CLI because the MCP server builds the
+/// same thing from the same fields in Task 9; if a third caller appears,
+/// move this into `payloads`.
+fn unit_meta_from(a: &sumcp_core::assemble::AssembledUnit) -> sumcp_core::payloads::UnitMeta {
+    sumcp_core::payloads::UnitMeta {
+        sessions: a.unit.members.len(),
+        joined_gaps_min: a.unit.joined_gaps_min.clone(),
+        span_start: a
+            .unit
+            .members
+            .first()
+            .map(|m| m.span.first.clone())
+            .unwrap_or_default(),
+        span_end: a
+            .unit
+            .members
+            .iter()
+            .map(|m| m.span.last.clone())
+            .max()
+            .unwrap_or_default(),
+        session_ids: a.session.session_ids.clone(),
+        dropped: a.unit.dropped,
+    }
 }
 
 /// `~/.claude`, overridable via `SUMCP_CLAUDE_HOME` (tests point this at a
@@ -162,10 +203,15 @@ fn main() -> ExitCode {
 
     // These two lookups can fail (an environment with no `$HOME`, a deleted
     // cwd); `resolve_target` decides whether that actually mattered, since
-    // `--file` needs neither.
+    // `--file` and `--work-unit` both need neither.
     let home = claude_home();
     let cwd = std::env::current_dir().ok();
-    let target = match resolve_target(args.file, home.as_deref(), cwd.as_deref()) {
+    // `--file` and `--work-unit` conflict (clap enforces it, see `Args`), so
+    // at most one of these is `Some`. `resolve_target` only decides the
+    // PATH; which of the two scopes below reads that path is decided just
+    // below, by which flag (if either) supplied it.
+    let explicit_path = args.file.clone().or_else(|| args.work_unit.clone());
+    let target = match resolve_target(explicit_path, home.as_deref(), cwd.as_deref()) {
         Ok(t) => t,
         Err(why) => {
             match why {
@@ -200,30 +246,74 @@ fn main() -> ExitCode {
         );
     }
 
-    // `load_session` does more than read one file: it ingests the main
-    // transcript AND looks for sibling subagent transcripts next to it,
-    // flat-merging any it finds into a single `Session`. What it can't find
-    // it records honestly (see `flags.subagent_files_missing`) rather than
-    // silently dropping. It returns an `Assembled { session, subagent_paths }`
-    // (or an io::Error if the main file can't be read / is too large), so we
-    // pull `.session` out and proceed exactly as before.
-    let assembled =
-        match sumcp_core::assemble::load_session(&path, sumcp_core::assemble::MAX_TRANSCRIPT_BYTES)
-        {
+    // Three entry points, three scopes. `--file` is explicit and stays
+    // single-transcript, because an explicit path means an explicit scope.
+    // Everything else (bare `sumcp`, or `--work-unit`) reports the whole
+    // stretch of work, which is what the user actually just did.
+    let (session, unit_meta) = if args.file.is_some() {
+        // `load_session` does more than read one file: it ingests the main
+        // transcript AND looks for sibling subagent transcripts next to it,
+        // flat-merging any it finds into a single `Session`. What it can't
+        // find it records honestly (see `flags.subagent_files_missing`)
+        // rather than silently dropping. It returns an
+        // `Assembled { session, subagent_paths }` (or an io::Error if the
+        // main file can't be read / is too large), so we pull `.session`
+        // out and proceed exactly as before.
+        let assembled = match sumcp_core::assemble::load_session(
+            &path,
+            sumcp_core::assemble::MAX_TRANSCRIPT_BYTES,
+        ) {
             Ok(a) => a,
             Err(e) => {
                 eprintln!("could not load {}: {e}", path.display());
                 return ExitCode::FAILURE;
             }
         };
-    let session = assembled.session;
+        // Tell the user, on stderr so stdout stays pipeable, when the
+        // transcript they named is only part of a larger stretch. Without
+        // this a user can read a 51-edit report with 224 more edits beside
+        // it and no indication they exist.
+        let unit = sumcp_core::work_unit::discover_work_unit(&path);
+        if unit.members.len() > 1 {
+            // `unit.members` is oldest first, but the number a user wants is
+            // "how far back is this from the most recent", not "how far in
+            // from the start": the newest transcript (the one just worked
+            // in) reads as "1 of N", counting backward from there.
+            let at = unit
+                .members
+                .iter()
+                .position(|m| m.path == path)
+                .map(|i| unit.members.len() - i)
+                .unwrap_or(1);
+            eprintln!(
+                "note: this transcript is {at} of {} in a work unit; use --work-unit to analyze all of it",
+                unit.members.len()
+            );
+        }
+        (assembled.session, None)
+    } else {
+        // Bare `sumcp` and `--work-unit` both want the whole stretch of
+        // work, so both go through `load_work_unit`: it discovers every
+        // transcript in the same continuous stretch as `path` and merges
+        // them into one total order (see `assemble::load_work_unit`'s doc).
+        let assembled = match sumcp_core::assemble::load_work_unit(
+            &path,
+            sumcp_core::assemble::MAX_TRANSCRIPT_BYTES,
+        ) {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("could not load {}: {e}", path.display());
+                return ExitCode::FAILURE;
+            }
+        };
+        let meta = unit_meta_from(&assembled);
+        (assembled.session, Some(meta))
+    };
     let ranked = rank(&session);
     let meta = SessionMeta {
         id: stem_id(&path),
         identified_by: target.identified_by.into(),
-        // The CLI reads one transcript file at a time, so there is never a
-        // work unit to disclose here (see `SessionMeta::unit`'s doc).
-        unit: None,
+        unit: unit_meta,
     };
 
     if args.html {

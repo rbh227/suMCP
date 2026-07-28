@@ -30,3 +30,74 @@ fn html_output_is_self_contained_and_structured() {
     // No secret leaks in evidence excerpts (redaction wired).
     assert!(!html.contains("BEGIN RSA PRIVATE KEY"), "unredacted secret");
 }
+
+#[test]
+fn work_unit_flag_merges_adjacent_transcripts() {
+    let td = tempfile::tempdir().unwrap();
+    let id_a = "aaaaaaaa-1111-2222-3333-444455556666";
+    let id_b = "bbbbbbbb-1111-2222-3333-444455556666";
+    let line = |sess: &str, ts: &str, path: &str| {
+        format!(
+            r#"{{"type":"assistant","timestamp":"{ts}","sessionId":"{sess}","message":{{"content":[{{"type":"tool_use","id":"e1","name":"Edit","input":{{"file_path":"{path}","old_string":"a","new_string":"b"}}}}]}}}}"#
+        )
+    };
+    std::fs::write(
+        td.path().join(format!("{id_a}.jsonl")),
+        line(id_a, "2026-01-01T00:00:00Z", "/x.rs"),
+    )
+    .unwrap();
+    let b = td.path().join(format!("{id_b}.jsonl"));
+    std::fs::write(&b, line(id_b, "2026-01-01T00:05:00Z", "/y.rs")).unwrap();
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_sumcp"))
+        .arg("--work-unit")
+        .arg(&b)
+        .arg("--json")
+        .output()
+        .expect("run sumcp");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid json");
+    assert_eq!(v["work_unit"]["sessions"], 2);
+    assert_eq!(v["totals"]["edits"], 2, "both transcripts' edits counted");
+}
+
+#[test]
+fn file_flag_notes_that_the_transcript_is_part_of_a_unit() {
+    let td = tempfile::tempdir().unwrap();
+    let id_a = "aaaaaaaa-1111-2222-3333-444455556666";
+    let id_b = "bbbbbbbb-1111-2222-3333-444455556666";
+    let line = |sess: &str, ts: &str, path: &str| {
+        format!(
+            r#"{{"type":"assistant","timestamp":"{ts}","sessionId":"{sess}","message":{{"content":[{{"type":"tool_use","id":"e1","name":"Edit","input":{{"file_path":"{path}","old_string":"a","new_string":"b"}}}}]}}}}"#
+        )
+    };
+    std::fs::write(
+        td.path().join(format!("{id_a}.jsonl")),
+        line(id_a, "2026-01-01T00:00:00Z", "/x.rs"),
+    )
+    .unwrap();
+    let b = td.path().join(format!("{id_b}.jsonl"));
+    std::fs::write(&b, line(id_b, "2026-01-01T00:05:00Z", "/y.rs")).unwrap();
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_sumcp"))
+        .arg("--file")
+        .arg(&b)
+        .arg("--json")
+        .output()
+        .expect("run sumcp");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("1 of 2 in a work unit"),
+        "expected a stderr hint, got: {stderr}"
+    );
+    // The note must NOT contaminate stdout, which stays pipeable.
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid json");
+    assert_eq!(
+        v["totals"]["edits"], 1,
+        "--file still reports one transcript"
+    );
+}
