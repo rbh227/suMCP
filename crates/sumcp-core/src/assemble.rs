@@ -397,4 +397,37 @@ mod tests {
         assert_eq!(out.session.actions.len(), 1, "only the readable member");
         assert_eq!(out.unit.members.len(), 2, "the unit still knows about both");
     }
+
+    #[test]
+    fn legacy_sibling_subagent_edit_is_merged_exactly_once() {
+        // The double-count bug, end to end. Before the fix, `discover_work_unit`
+        // picked up the legacy `agent-<id>.jsonl` sibling as a work-unit member
+        // IN ITS OWN RIGHT (see `work_unit.rs`'s
+        // `a_legacy_sibling_subagent_file_is_excluded_from_membership` for that
+        // half). `load_work_unit` would then call `load_session` on it as if it
+        // were its own main transcript -- while `load_session` on the REAL main
+        // transcript had already discovered and merged that same file as a
+        // subagent. The single Edit inside it landed in the merged session
+        // TWICE. This is the assertion that matters: the bug's symptom is
+        // duplicated actions, not merely a wrong member list.
+        let td = tempfile::tempdir().unwrap();
+        let uuid = "5717aaaa-1111-2222-3333-444455556666";
+        let main = td.path().join(format!("{uuid}.jsonl"));
+        std::fs::write(&main, agent_spawn_lines("a1", "xyz")).unwrap();
+        std::fs::write(td.path().join("agent-xyz.jsonl"), sub_edit_line(uuid)).unwrap();
+
+        let a = load_work_unit(&main, MAX_TRANSCRIPT_BYTES).unwrap();
+        assert_eq!(
+            a.unit.members.len(),
+            1,
+            "the legacy subagent sibling must not be its own member"
+        );
+        let edits = a
+            .session
+            .actions
+            .iter()
+            .filter(|x| x.file_path.as_deref() == Some("/sub.rs"))
+            .count();
+        assert_eq!(edits, 1, "the subagent's edit must be merged exactly once");
+    }
 }

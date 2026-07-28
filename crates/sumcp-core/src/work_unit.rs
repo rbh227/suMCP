@@ -1,7 +1,7 @@
 //! Work units: the several transcripts that make up one continuous stretch of
 //! work. See `docs/superpowers/specs/2026-07-28-v02-measurement-fidelity-design.md`.
 
-use crate::locate::{TranscriptSpan, transcript_span};
+use crate::locate::{TranscriptSpan, is_agent_jsonl, transcript_span};
 use std::path::{Path, PathBuf};
 
 /// The idle gap that separates two stretches of work, in seconds.
@@ -250,6 +250,30 @@ pub fn discover_work_unit(main_path: &Path) -> WorkUnit {
         if p.extension().and_then(|x| x.to_str()) != Some("jsonl") {
             continue;
         }
+        // A subagent transcript must never become a work-unit member in its
+        // own right: `load_session` (called later, once per member) already
+        // reads and merges it as part of its PARENT transcript, so counting
+        // it again here would merge that same file a second time and double
+        // every action inside it.
+        //
+        // Claude Code has stored subagent transcripts in two different
+        // places across versions, and each is excluded here for a different
+        // reason:
+        //   - newer (2.1.x+) layout: namespaced one directory down, at
+        //     `<project>/<uuid>/subagents/agent-<id>.jsonl`. Those are
+        //     excluded automatically, just by where `std::fs::read_dir(dir)`
+        //     above looks: it only lists `dir` itself, never descends into
+        //     `dir/<uuid>/subagents`, so a file living one level down is
+        //     never even offered to this loop.
+        //   - legacy (pre-2.1.x) layout: a SIBLING of the main transcript,
+        //     right here in `dir`, named `agent-<id>.jsonl`. Nothing about
+        //     its location marks it as a subagent, so it sails straight past
+        //     the directory-listing check above and must be excluded by name
+        //     instead, with the same `is_agent_jsonl` predicate
+        //     `discover_subagent_paths` uses to find it in the first place.
+        if is_agent_jsonl(&p) {
+            continue;
+        }
         if let Some(span) = transcript_span(&p) {
             items.push(Member { path: p, span });
         }
@@ -369,6 +393,49 @@ mod tests {
     #[test]
     fn empty_input_produces_no_units() {
         assert!(group_spans(vec![]).is_empty());
+    }
+
+    #[test]
+    fn a_legacy_sibling_subagent_file_is_excluded_from_membership() {
+        // Legacy layout: `agent-<id>.jsonl` sits right next to the main
+        // transcript in the SAME directory, not one directory down the way
+        // the newer namespaced layout does. Before the fix, this function
+        // had no way to tell that sibling apart from a real top-level
+        // transcript, so it was picked up as a second member of its own work
+        // unit here -- and then `load_session` would merge the very same
+        // file again as a subagent of its parent, double-counting every
+        // action inside it. See `legacy_sibling_subagent_edit_is_merged_exactly_once`
+        // in `assemble.rs` for the end-to-end symptom.
+        let td = tempfile::tempdir().unwrap();
+        let main = td.path().join("5717aaaa-1111-2222-3333-444455556666.jsonl");
+        std::fs::write(
+            &main,
+            concat!(
+                r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z"}"#,
+                "\n",
+                r#"{"type":"assistant","timestamp":"2026-01-01T00:10:00Z"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        // A legacy subagent sibling whose span sits inside the main
+        // transcript's own window, so a bug here would join it into the same
+        // unit rather than the timestamps simply missing each other.
+        std::fs::write(
+            td.path().join("agent-xyz.jsonl"),
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:05:00Z"}"#,
+        )
+        .unwrap();
+
+        let unit = discover_work_unit(&main);
+        assert_eq!(
+            unit.members.len(),
+            1,
+            "the legacy subagent sibling must not become a member in its own \
+             right: got {:?}",
+            unit.members.iter().map(|m| &m.path).collect::<Vec<_>>()
+        );
+        assert_eq!(unit.members[0].path, main);
     }
 
     // These anchors are independently known values (computable by hand or by
