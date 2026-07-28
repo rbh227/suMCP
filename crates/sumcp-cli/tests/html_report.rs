@@ -91,7 +91,7 @@ fn file_flag_notes_that_the_transcript_is_part_of_a_unit() {
         .expect("run sumcp");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("1 of 2 in a work unit"),
+        stderr.contains("2 of 2 in a work unit"),
         "expected a stderr hint, got: {stderr}"
     );
     // The note must NOT contaminate stdout, which stays pipeable.

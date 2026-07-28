@@ -275,15 +275,13 @@ fn main() -> ExitCode {
         // it and no indication they exist.
         let unit = sumcp_core::work_unit::discover_work_unit(&path);
         if unit.members.len() > 1 {
-            // `unit.members` is oldest first, but the number a user wants is
-            // "how far back is this from the most recent", not "how far in
-            // from the start": the newest transcript (the one just worked
-            // in) reads as "1 of N", counting backward from there.
+            // `unit.members` is ordered oldest first. Position in the work unit
+            // counts chronologically: the oldest transcript is 1, the newest is N.
             let at = unit
                 .members
                 .iter()
                 .position(|m| m.path == path)
-                .map(|i| unit.members.len() - i)
+                .map(|i| i + 1)
                 .unwrap_or(1);
             eprintln!(
                 "note: this transcript is {at} of {} in a work unit; use --work-unit to analyze all of it",
