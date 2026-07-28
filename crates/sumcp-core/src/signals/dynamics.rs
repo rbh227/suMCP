@@ -47,7 +47,7 @@ fn action_loops(s: &Session) -> Vec<Finding> {
     // would be treated as one lane and their calls compared for a loop that
     // never happened. `lane_key()` folds in `session_ix` so lanes from
     // different transcripts never collide. Kept as a `BTreeSet` (not a `Vec`)
-    // so each distinct key is visited once — a `Vec` would run this whole
+    // so each distinct key is visited once: a `Vec` would run this whole
     // O(n) pass once per ACTION instead of once per lane, and would emit the
     // same finding once per action in that lane.
     let keys: std::collections::BTreeSet<(u16, &crate::model::Lane)> =
@@ -112,32 +112,60 @@ pub(crate) struct Segment<'a> {
 /// own file's line numbering, so comparing their `line_no` against main-
 /// transcript user lines would be meaningless.
 ///
+/// A task segment belongs to one transcript: a segment boundary must only
+/// ever be drawn from a user message in the SAME transcript as the action
+/// being placed, never from another transcript merged into the same
+/// `Session`. `line_no` is a position inside one transcript's own file, so
+/// comparing it across transcripts is comparing two unrelated counters that
+/// happen to overlap numerically.
+///
 /// Lifetime note for the Rust-learning reader: `Segment<'a>` borrows actions
 /// from the `Session` — the `'a` says "these references live only as long as
 /// the session does", which the compiler enforces for us.
 pub(crate) fn segments(s: &Session) -> Vec<Segment<'_>> {
     let mut out: Vec<Segment<'_>> = Vec::new();
-    // user_texts are in source order; walk them alongside the actions.
-    let mut boundaries = s.user_texts.iter().peekable();
     let mut current = Segment {
         user_line_no: None,
         actions: Vec::new(),
     };
+
+    // Group `user_texts` by transcript (`session_ix`) so each transcript's
+    // messages are walked independently, in their own source order, with
+    // their own cursor. A single shared cursor over the flat `user_texts`
+    // list (the old approach) implicitly assumed line numbers were globally
+    // increasing, which stops being true the moment two transcripts share a
+    // `Session`. A work unit holds at most 16 transcripts (see
+    // `Action::session_ix`'s doc), so a `Vec` here (not a `HashMap`, which
+    // would make iteration order nondeterministic) costs nothing to scan.
+    let mut by_session: Vec<(u16, Vec<&crate::model::UserText>)> = Vec::new();
+    for u in &s.user_texts {
+        match by_session.iter_mut().find(|(ix, _)| *ix == u.session_ix) {
+            Some((_, msgs)) => msgs.push(u),
+            None => by_session.push((u.session_ix, vec![u])),
+        }
+    }
+    // next_unconsumed[i] indexes into by_session[i].1: how far that
+    // transcript's own message stream has already been walked past.
+    let mut next_unconsumed: Vec<usize> = vec![0; by_session.len()];
+
     for a in s.actions.iter().filter(|a| {
         // Deliberately `.lane`, not `.lane_key()`: this asks "is this a
         // main-agent action", which is a meaningful question in any
         // transcript, not "is this the same lane as some other action".
         a.lane == crate::model::Lane::Main
     }) {
-        // Every user message at or before this action's line opens a fresh
-        // segment (the LAST such message wins when several are adjacent).
+        // Every user message from a's OWN transcript, at or before this
+        // action's line, opens a fresh segment (the LAST such message wins
+        // when several are adjacent). A message from any OTHER transcript is
+        // never even consulted, no matter what its line_no is.
         let mut crossed = None;
-        while let Some(u) = boundaries.peek() {
-            if u.line_no < a.line_no {
-                crossed = Some(u.line_no);
-                boundaries.next();
-            } else {
-                break;
+        if let Some(group) = by_session.iter().position(|(ix, _)| *ix == a.session_ix) {
+            let msgs = &by_session[group].1;
+            while next_unconsumed[group] < msgs.len()
+                && msgs[next_unconsumed[group]].line_no < a.line_no
+            {
+                crossed = Some(msgs[next_unconsumed[group]].line_no);
+                next_unconsumed[group] += 1;
             }
         }
         if let Some(line) = crossed {
@@ -279,10 +307,17 @@ fn reverts_and_flips(s: &Session) -> Vec<Finding> {
                 //
                 // Deliberately `.lane`, not `.lane_key()`: this asks "is this
                 // a main-agent action", which is a meaningful question in any
-                // transcript. The pairing above already guaranteed both
-                // actions come from the same transcript (via `lane_key()`).
+                // transcript. The pairing above already guaranteed both edits
+                // come from the same transcript (via `lane_key()`), and that
+                // is now also true of the pushback lookup itself: passing
+                // `earlier.session_ix` (== `later.session_ix`) into
+                // `pushback_between` makes it only ever consider user
+                // messages FROM THAT SAME TRANSCRIPT, so a pushback message
+                // from an unrelated merged transcript can never masquerade
+                // as pushback here just because its `line_no` happens to
+                // fall in the same numeric range.
                 let is_flip = later.lane == crate::model::Lane::Main
-                    && pushback_between(s, earlier.line_no, later.line_no)
+                    && pushback_between(s, earlier.session_ix, earlier.line_no, later.line_no)
                         .is_some_and(|push| !evidence_between(s, push, later));
                 out.push(Finding {
                     kind: if is_flip {
@@ -313,11 +348,22 @@ fn reverts_and_flips(s: &Session) -> Vec<Finding> {
     out
 }
 
-/// The first user message with pushback wording between two main-transcript
-/// line numbers, if any.
-fn pushback_between(s: &Session, lo: usize, hi: usize) -> Option<&crate::model::UserText> {
+/// The first user message with pushback wording between two line numbers,
+/// scoped to one transcript. `session_ix` must be the transcript both edits
+/// belong to (the caller gets this for free, since `lane_key()` already
+/// guaranteed the two edits share one). Line numbers are only ever
+/// comparable WITHIN one transcript's own file: transcript B's line 5 has
+/// nothing to do with transcript A's line 5, so without this filter a
+/// pushback message from a completely different merged transcript could
+/// numerically land "between" two edits it has nothing to do with.
+fn pushback_between(
+    s: &Session,
+    session_ix: u16,
+    lo: usize,
+    hi: usize,
+) -> Option<&crate::model::UserText> {
     s.user_texts.iter().find(|u| {
-        u.line_no > lo && u.line_no < hi && {
+        u.session_ix == session_ix && u.line_no > lo && u.line_no < hi && {
             let t = u.text.to_lowercase();
             PUSHBACK.iter().any(|p| t.contains(p))
         }
@@ -330,14 +376,22 @@ fn pushback_between(s: &Session, lo: usize, hi: usize) -> Option<&crate::model::
 /// do not restrict to the reverted file.
 ///
 /// Main-lane actions compare by transcript line number (same file as the
-/// pushback message). Subagent actions live in other files, so they compare
-/// by timestamp — *strictly* between, so timestamp ties stay excluded per the
+/// pushback message), gated to `push.session_ix` (the SAME transcript the
+/// pushback came from): `line_no` repeats per transcript once a work
+/// unit merges several of them, so an unscoped comparison could credit a Read
+/// from a totally unrelated transcript as "evidence" here. Subagent actions
+/// live in other files entirely, so they compare by timestamp instead,
+/// *strictly* between, so timestamp ties stay excluded per the
 /// order-uncertain contract (SPEC decision 2).
 fn evidence_between(s: &Session, push: &crate::model::UserText, later: &Action) -> bool {
     s.actions.iter().any(|a| {
         matches!(a.kind, ActionKind::Read | ActionKind::Bash)
             && match a.lane {
-                crate::model::Lane::Main => a.line_no > push.line_no && a.line_no < later.line_no,
+                crate::model::Lane::Main => {
+                    a.session_ix == push.session_ix
+                        && a.line_no > push.line_no
+                        && a.line_no < later.line_no
+                }
                 crate::model::Lane::Sub(_) => {
                     // ISO-8601 timestamps of equal format compare correctly
                     // as strings; ties are excluded by the strict `<`/`>`.
@@ -679,6 +733,7 @@ mod tests {
                 line_no: 3,
                 text: "no revert that please".into(),
                 effective_ts: "2026-01-01T00:00:02Z".into(),
+                session_ix: 0,
             }],
             cwd: None,
             tokens: Default::default(),
@@ -873,5 +928,164 @@ mod tests {
             1,
             "within one session it fires"
         );
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn pushback_in_another_transcript_does_not_create_a_flip() {
+        // Session 0: edit A ("foo"->"bar") then edit B ("bar"->"foo") -- a
+        // textbook revert. Session 1 has an unrelated user message with
+        // pushback wording whose `line_no` (2) numerically falls between the
+        // two session-0 edits' line numbers (1 and 3). `line_no` only means
+        // "line inside ITS OWN transcript's file" (see `Action::lane_key`'s
+        // doc), so a message from session 1 must never be read as pushback
+        // between two session-0 edits -- doing so would invent a struggle
+        // that never happened (the two transcripts are unrelated).
+        use crate::model::UserText;
+        let mut first = Action::default();
+        first.idx = Idx(0);
+        first.effective_ts = "2026-01-01T00:00:01Z".into();
+        first.lane = Lane::Main;
+        first.session_ix = 0;
+        first.line_no = 1;
+        first.kind = ActionKind::Edit;
+        first.file_path = Some("/a.rs".into());
+        first.edit_old = Some("foo".into());
+        first.edit_new = Some("bar".into());
+
+        let mut second = Action::default();
+        second.idx = Idx(1);
+        second.effective_ts = "2026-01-01T00:00:03Z".into();
+        second.lane = Lane::Main;
+        second.session_ix = 0;
+        second.line_no = 3;
+        second.kind = ActionKind::Edit;
+        second.file_path = Some("/a.rs".into());
+        second.edit_old = Some("bar".into());
+        second.edit_new = Some("foo".into());
+
+        let mut s = Session::default();
+        s.actions = vec![first, second];
+        s.user_texts = vec![UserText {
+            effective_ts: "2026-01-01T00:00:02Z".into(),
+            line_no: 2, // between 1 and 3 -- but in a DIFFERENT transcript
+            text: "no, revert that".into(),
+            session_ix: 1,
+        }];
+        s.session_ids = vec!["sess-0".into(), "sess-1".into()];
+
+        let findings = reverts_and_flips(&s);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(
+            findings[0].kind,
+            FindingKind::TrueRevert,
+            "a pushback from a DIFFERENT transcript must not manufacture a Flip, got {:?}",
+            findings[0].kind
+        );
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn pushback_in_the_same_transcript_still_creates_a_flip() {
+        // Positive control for the test above: identical shape, but the
+        // pushback is in session 0 -- the SAME transcript as the two edits
+        // -- so it must still upgrade the revert to a Flip. This proves the
+        // scoping fix does not simply disable flip detection outright,
+        // which is the obvious way to make the test above pass for the
+        // wrong reason.
+        use crate::model::UserText;
+        let mut first = Action::default();
+        first.idx = Idx(0);
+        first.effective_ts = "2026-01-01T00:00:01Z".into();
+        first.lane = Lane::Main;
+        first.session_ix = 0;
+        first.line_no = 1;
+        first.kind = ActionKind::Edit;
+        first.file_path = Some("/a.rs".into());
+        first.edit_old = Some("foo".into());
+        first.edit_new = Some("bar".into());
+
+        let mut second = Action::default();
+        second.idx = Idx(1);
+        second.effective_ts = "2026-01-01T00:00:03Z".into();
+        second.lane = Lane::Main;
+        second.session_ix = 0;
+        second.line_no = 3;
+        second.kind = ActionKind::Edit;
+        second.file_path = Some("/a.rs".into());
+        second.edit_old = Some("bar".into());
+        second.edit_new = Some("foo".into());
+
+        let mut s = Session::default();
+        s.actions = vec![first, second];
+        s.user_texts = vec![UserText {
+            effective_ts: "2026-01-01T00:00:02Z".into(),
+            line_no: 2,
+            text: "no, revert that".into(),
+            session_ix: 0, // same transcript as the edits
+        }];
+        s.session_ids = vec!["sess-0".into()];
+
+        let findings = reverts_and_flips(&s);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(
+            findings[0].kind,
+            FindingKind::Flip,
+            "same-transcript pushback must still produce a Flip"
+        );
+    }
+
+    #[test]
+    fn segments_do_not_draw_boundaries_from_another_transcripts_user_message() {
+        // Two session-0 main actions at line_no 1 and 10. A session-1 user
+        // message at line_no 5 numerically falls between them, but it
+        // belongs to a DIFFERENT transcript, so it must not split the
+        // segment: `line_no` only means "position in this transcript's own
+        // file", never a global counter comparable across transcripts.
+        use crate::model::UserText;
+        let mk = |idx, line_no| Action {
+            idx: Idx(idx),
+            effective_ts: format!("2026-01-01T00:00:{line_no:02}Z"),
+            ts_inherited: false,
+            lane: Lane::Main,
+            session_ix: 0,
+            line_no,
+            kind: ActionKind::Read,
+            file_path: None,
+            is_error: None,
+            write_len: None,
+            write_lines: None,
+            read_total_lines: None,
+            input_hash: None,
+            error: None,
+            hunks: vec![],
+            command: None,
+            user_modified: false,
+            edit_old: None,
+            edit_new: None,
+            approval_latency_s: None,
+        };
+        let s = Session {
+            actions: vec![mk(0, 1), mk(1, 10)],
+            user_texts: vec![UserText {
+                effective_ts: "2026-01-01T00:00:05Z".into(),
+                line_no: 5,
+                text: "an unrelated transcript's message".into(),
+                session_ix: 1,
+            }],
+            session_ids: vec!["sess-0".into(), "sess-1".into()],
+            ..Session::default()
+        };
+        let segs = segments(&s);
+        assert_eq!(
+            segs.len(),
+            1,
+            "a foreign-transcript user message must not split the segment"
+        );
+        assert_eq!(
+            segs[0].user_line_no, None,
+            "no same-transcript boundary was crossed"
+        );
+        assert_eq!(segs[0].actions.len(), 2);
     }
 }

@@ -104,6 +104,11 @@ pub fn ingest_str(raw: &str, default_lane: Lane) -> Session {
                 effective_ts: effective_ts.clone(),
                 line_no,
                 text,
+                // A bare `ingest_str` call parses one transcript in isolation
+                // and has no idea what index it will end up at inside a
+                // work unit, so this is always `0` here; the merge step
+                // stamps the real value later (see `UserText::session_ix`).
+                session_ix: 0,
             });
         }
 

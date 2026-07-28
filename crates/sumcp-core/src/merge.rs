@@ -160,6 +160,7 @@ mod tests {
             line_no: 1,
             text: "human says".into(),
             effective_ts: "2026-01-01T00:00:00Z".into(),
+            session_ix: 0,
         }];
         main.auto_accept = false;
         let mut sub = one(Lane::Sub("x".into()), "2026-01-01T00:00:01Z", 3, "/b");
@@ -167,6 +168,7 @@ mod tests {
             line_no: 1,
             text: "orchestrator prompt".into(),
             effective_ts: "2026-01-01T00:00:00Z".into(),
+            session_ix: 0,
         }];
         sub.auto_accept = true; // a sub in auto-accept must NOT flip the merged flag
 

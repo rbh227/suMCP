@@ -330,6 +330,17 @@ pub struct UserText {
     pub line_no: usize,
     /// The message text.
     pub text: String,
+    /// Which transcript of the work unit this message came from: an index
+    /// into [`Session::session_ids`], exactly like [`Action::session_ix`]
+    /// (see that field's doc for the full reasoning: a `u16` index instead
+    /// of a `String` id, `0` for a single-transcript analysis).
+    ///
+    /// `ingest_str` does not know its own transcript id, so it always
+    /// leaves this at the default `0`; the work-unit merge step (a later
+    /// task) stamps the real index once several transcripts are assembled
+    /// together, the same way it does for `Action::session_ix`.
+    #[serde(default)]
+    pub session_ix: u16,
 }
 
 /// A fully parsed session: ordered actions plus parse-health counters.
