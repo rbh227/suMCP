@@ -19,3 +19,4 @@ __pycache__/
 
 # raphflow session state (local, never committed)
 .raphflow/
+.codex/
