@@ -75,6 +75,153 @@ pub fn merge_sessions(main: Session, subs: Vec<Session>, files_missing: u64) -> 
     }
 }
 
+/// Merge the per-transcript sessions of one work unit into a single Session.
+///
+/// Each input is an already-assembled transcript (its own main lane plus any
+/// subagent lanes, already through `merge_sessions`), paired with its
+/// transcript id, oldest first.
+///
+/// HOW THIS DIFFERS FROM `merge_sessions`. That one merges a privileged main
+/// with its subordinate subagents, so it keeps only main's user turns and
+/// refuses to let a subagent's auto-accept mode suppress the main lane's
+/// latency signals. Here every part is a real human-facing session, so user
+/// turns all carry and `auto_accept` is OR'd: if any transcript in the stretch
+/// ran under auto-accept, the latency heuristics are meaningless for the unit
+/// and must be suppressed.
+///
+/// IMPORTANT: this stamps `session_ix` onto every action AND every user text
+/// with the part's slot in `session_ids`. Stamping only actions would leave
+/// every user text at ingest's default of `0`, and `pushback_between`
+/// (signals/dynamics.rs) only matches user messages whose `session_ix`
+/// equals the edit's `session_ix`, so transcripts after the first would
+/// silently lose all pushback/Flip detection, with no error anywhere.
+pub fn merge_work_unit(
+    parts: Vec<(String, Session)>,
+    files_missing: u64,
+    // Not stored: the caller surfaces this in payload flags directly. Kept
+    // as a parameter (rather than dropped from the signature) because the
+    // caller's dropped-transcript count belongs conceptually next to
+    // `files_missing` here, even though this function has nothing to do
+    // with it. Underscore-prefixed so clippy doesn't warn about it being
+    // unused.
+    _dropped: u64,
+) -> Session {
+    let mut actions: Vec<Action> = Vec::new();
+    let mut user_texts = Vec::new();
+    let mut session_ids: Vec<String> = Vec::new();
+    let mut cwd = None;
+    let mut tokens = crate::model::Tokens::default();
+    let mut type_counts: std::collections::BTreeMap<String, u64> = Default::default();
+    let mut parse_errors = 0u64;
+    let mut untimestamped_lines = 0u64;
+    let mut interrupts = 0u64;
+    let mut auto_accept = false;
+    let mut spawns = Vec::new();
+    let mut subagent_files_missing = files_missing;
+
+    for (ix, (id, part)) in parts.into_iter().enumerate() {
+        // `ix` is this transcript's slot in `session_ids` (parts arrive
+        // oldest first, and we push into session_ids in that same order
+        // below, so `session_ix` is simply "the position in that list").
+        // `as u16` never truncates in practice: the caller caps a work unit
+        // at 16 transcripts, far under u16::MAX.
+        let ix = ix as u16;
+        session_ids.push(id);
+        // Stamp every action AND every user text from this part with its
+        // transcript's slot, before folding them into the shared vectors.
+        // Doing both in the same loop, right next to each other, is exactly
+        // the point: it is easy to remember to restamp actions and forget
+        // user texts, since only actions carry session_ix in most other
+        // code paths. See the doc comment above for what silently breaks if
+        // the user_texts stamp is skipped.
+        for mut a in part.actions {
+            a.session_ix = ix;
+            actions.push(a);
+        }
+        for mut u in part.user_texts {
+            u.session_ix = ix;
+            user_texts.push(u);
+        }
+        // First non-None cwd wins; every transcript in a unit is in the same
+        // project, so they agree, but a synthetic session can have None.
+        if cwd.is_none() {
+            cwd = part.cwd;
+        }
+        tokens.input += part.tokens.input;
+        tokens.output += part.tokens.output;
+        tokens.cache_read += part.tokens.cache_read;
+        tokens.cache_creation += part.tokens.cache_creation;
+        for (t, n) in part.type_counts {
+            *type_counts.entry(t).or_insert(0) += n;
+        }
+        parse_errors += part.parse_errors;
+        untimestamped_lines += part.untimestamped_lines;
+        interrupts += part.interrupts;
+        auto_accept |= part.auto_accept;
+        spawns.extend(part.spawns);
+        subagent_files_missing += part.subagent_files_missing;
+    }
+
+    // One sort of the whole concatenation: O(n log n) total, done once. Never
+    // a pairwise merge loop that folds transcripts in two at a time: at 16
+    // transcripts that would mean 16 passes over the growing action stream
+    // instead of one pass over all of it.
+    //
+    // The sort key is (timestamp, transcript slot, lane, source line number).
+    // Each piece breaks a tie left by the one before it:
+    //   - effective_ts: the real ordering signal, wall-clock time.
+    //   - session_ix: two transcripts can share a timestamp (second
+    //     resolution, or a synthetic session's borrowed clock); this decides
+    //     between them the same way every time, regardless of which order
+    //     the caller listed the parts in.
+    //   - lane: within one transcript, Main sorts before its subagent lanes
+    //     (mirrors merge_sessions's own tie-break).
+    //   - line_no: only meaningful within one (transcript, lane) pair, which
+    //     the two keys before it already pin down.
+    // Because this key is total (no two actions can tie on all four parts
+    // and still be genuinely ambiguous), the result is deterministic no
+    // matter what order `parts` arrived in or whether the sort is stable.
+    actions.sort_by(|a, b| {
+        (&a.effective_ts, a.session_ix, &a.lane, a.line_no).cmp(&(
+            &b.effective_ts,
+            b.session_ix,
+            &b.lane,
+            b.line_no,
+        ))
+    });
+    // User turns are read in order by the flip detector, so they need the
+    // same total-ordering treatment as actions (timestamp, then line number
+    // within a transcript to break ties).
+    user_texts.sort_by(|a, b| (&a.effective_ts, a.line_no).cmp(&(&b.effective_ts, b.line_no)));
+
+    // Re-number Idx across the merged whole. Before this loop, every action's
+    // `idx` is only valid within its own transcript (e.g. two different
+    // parts can both have an action with idx 0); after sorting them together
+    // those old values are meaningless. This loop walks the now-sorted
+    // vector and overwrites idx with its actual position, so
+    // `actions[i].idx == Idx(i)` holds for the merged whole. Every payload
+    // and the `evidence()` tool rely on that equality to look an action up
+    // by index.
+    for (i, a) in actions.iter_mut().enumerate() {
+        a.idx = Idx(i as u32);
+    }
+
+    Session {
+        actions,
+        user_texts,
+        cwd,
+        tokens,
+        type_counts,
+        parse_errors,
+        untimestamped_lines,
+        interrupts,
+        auto_accept,
+        spawns,
+        subagent_files_missing,
+        session_ids,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -263,5 +410,127 @@ mod tests {
         let merged = merge_sessions(main, vec![empty], 1);
         assert_eq!(merged.actions.len(), 1);
         assert_eq!(merged.subagent_files_missing, 1);
+    }
+
+    #[test]
+    fn work_unit_merge_stamps_session_ix_and_renumbers_idx() {
+        // Two transcripts, the second starting earlier in wall-clock time than
+        // the first ends, so the total order interleaves them.
+        let a = one(Lane::Main, "2026-01-01T00:00:03Z", 1, "/a");
+        let b = one(Lane::Main, "2026-01-01T00:00:01Z", 1, "/b");
+
+        let merged = merge_work_unit(
+            vec![("sess-a".to_string(), a), ("sess-b".to_string(), b)],
+            0,
+            0,
+        );
+
+        // The table records both transcripts, in the order given.
+        assert_eq!(merged.session_ids, vec!["sess-a", "sess-b"]);
+        // Two actions, interleaved by timestamp: b's is earlier.
+        assert_eq!(merged.actions.len(), 2);
+        assert_eq!(merged.actions[0].file_path.as_deref(), Some("/b"));
+        assert_eq!(merged.actions[0].session_ix, 1, "b is index 1");
+        assert_eq!(merged.actions[1].session_ix, 0, "a is index 0");
+        // Idx renumbered across the merged whole, the invariant evidence() needs.
+        for (i, act) in merged.actions.iter().enumerate() {
+            assert_eq!(act.idx, Idx(i as u32));
+        }
+    }
+
+    #[test]
+    fn work_unit_merge_sums_counters_across_transcripts() {
+        use crate::model::Tokens;
+        let mut a = one(Lane::Main, "2026-01-01T00:00:01Z", 1, "/a");
+        a.tokens = Tokens {
+            input: 10,
+            output: 20,
+            cache_read: 30,
+            cache_creation: 40,
+        };
+        a.parse_errors = 1;
+        a.interrupts = 2;
+        a.subagent_files_missing = 1;
+
+        let mut b = one(Lane::Main, "2026-01-01T00:00:02Z", 1, "/b");
+        b.tokens = Tokens {
+            input: 5,
+            output: 7,
+            cache_read: 3,
+            cache_creation: 2,
+        };
+        b.parse_errors = 3;
+        b.interrupts = 4;
+        b.subagent_files_missing = 2;
+
+        let merged = merge_work_unit(vec![("a".to_string(), a), ("b".to_string(), b)], 0, 0);
+        assert_eq!(merged.tokens.input, 15);
+        assert_eq!(merged.tokens.output, 27);
+        assert_eq!(merged.tokens.cache_read, 33);
+        assert_eq!(merged.tokens.cache_creation, 42);
+        assert_eq!(merged.parse_errors, 4);
+        assert_eq!(merged.interrupts, 6);
+        assert_eq!(
+            merged.subagent_files_missing, 3,
+            "per-transcript subagent misses sum across the unit"
+        );
+    }
+
+    #[test]
+    fn work_unit_merge_ors_auto_accept_and_keeps_every_user_text() {
+        use crate::model::UserText;
+        // Unlike the subagent merge, which deliberately ignores a subagent's
+        // user turns and auto-accept, every transcript in a work unit is a
+        // real human-facing session, so both must carry.
+        let mut a = one(Lane::Main, "2026-01-01T00:00:01Z", 1, "/a");
+        a.user_texts = vec![UserText {
+            line_no: 1,
+            text: "first".into(),
+            effective_ts: "2026-01-01T00:00:00Z".into(),
+            session_ix: 0,
+        }];
+        a.auto_accept = false;
+        let mut b = one(Lane::Main, "2026-01-01T00:00:02Z", 1, "/b");
+        b.user_texts = vec![UserText {
+            line_no: 1,
+            text: "second".into(),
+            effective_ts: "2026-01-01T00:00:02Z".into(),
+            session_ix: 0,
+        }];
+        b.auto_accept = true;
+
+        let merged = merge_work_unit(vec![("a".into(), a), ("b".into(), b)], 0, 0);
+        assert_eq!(merged.user_texts.len(), 2);
+        assert!(
+            merged.auto_accept,
+            "a transcript that ran under auto-accept must suppress latency signals for the unit"
+        );
+    }
+
+    #[test]
+    fn work_unit_merge_stamps_session_ix_on_user_texts_too() {
+        // CRITICAL: pushback_between (signals/dynamics.rs) only matches user
+        // messages whose session_ix equals the edit's session_ix. If the
+        // merge stamped actions but left every user_text at its ingest-time
+        // default of 0, then for the second transcript and beyond,
+        // pushback_between would silently find nothing and Flip detection
+        // would die for those transcripts with no error and no failing test
+        // elsewhere: this test is the only thing pinning that behavior down.
+        use crate::model::UserText;
+        let a = one(Lane::Main, "2026-01-01T00:00:01Z", 1, "/a");
+        let mut b = one(Lane::Main, "2026-01-01T00:00:02Z", 1, "/b");
+        b.user_texts = vec![UserText {
+            line_no: 1,
+            text: "second transcript's user turn".into(),
+            effective_ts: "2026-01-01T00:00:02Z".into(),
+            session_ix: 0, // as ingest always leaves it; the merge must restamp
+        }];
+
+        let merged = merge_work_unit(vec![("a".into(), a), ("b".into(), b)], 0, 0);
+        assert_eq!(merged.user_texts.len(), 1);
+        assert_eq!(
+            merged.user_texts[0].session_ix, 1,
+            "b's user text must carry b's slot (1), not the ingest-time default 0"
+        );
     }
 }
