@@ -678,7 +678,7 @@ pub fn blind_spots(s: &Session, meta: &SessionMeta) -> Value {
             "list_cap": k,
             "suppression": {
                 "approval_latency": if crate::signals::comprehension::approval_latency_active(s) {"active"} else {"suppressed"},
-                "suppressed_when": "permissionMode grants auto-accept",
+                "suppressed_when": "every main-lane action ran under an auto-accept permission mode",
                 "review_burden": "never suppressed"
             },
             "truncated": longest > k || findings_cut || id_cut

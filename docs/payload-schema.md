@@ -95,9 +95,12 @@ Emitted when self-identification cannot verify the caller and no explicit
 
 ## Suppression (heuristic honesty)
 
-`blind_spots.suppression` reports whether approval-latency metrics are active;
-when `permissionMode` grants auto-accept they are suppressed entirely rather
-than reported as meaningless numbers. `review_burden` (the comprehension-layer
+`blind_spots.suppression` reports whether approval-latency metrics are active.
+Suppression is per action (the transcript's `mode` events say which permission
+mode each action ran under), so "suppressed" here means every main-lane action
+ran under auto-accept; a session that mixed modes stays "active" and its
+normal-mode stretches keep their signals rather than being reported as
+meaningless numbers. `review_burden` (the comprehension-layer
 anchor, metrics-spec #27) is **never suppressed** — LOC-per-human-turn stays
 meaningful under auto-accept, which is exactly when it matters most; the
 suppression object says so explicitly.

@@ -12,5 +12,5 @@
  {"kind":"large_write_instant_accept","tier":"T2","exact":false,"confidence":"medium","idxs":[203,204],"file":"src/App.tsx","write_chars":9814,"latency_s":2.1,"note":"heuristic: Edit/Write only; delta ~= human decision time"}],
 "totals":{"secrets_file_touched":0,"blind_write_attempts":2,"review_burden":1,"approval_outliers":1},
 "list_cap":8,
-"suppression":{"approval_latency":"active","reason":null,"suppressed_when":"permissionMode grants auto-accept","review_burden":"never suppressed"},
+"suppression":{"approval_latency":"active","reason":null,"suppressed_when":"every main-lane action ran under an auto-accept permission mode","review_burden":"never suppressed"},
 "truncated":false}
