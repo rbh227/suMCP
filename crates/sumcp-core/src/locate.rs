@@ -153,17 +153,37 @@ fn scan_timestamps(chunk: &str) -> Vec<String> {
 /// The time span a transcript covers, or `None` if it has no timestamps.
 ///
 /// Reads at most `SPAN_PROBE_BYTES` from each end rather than the whole file.
-/// Both probes are read into their own buffer which is dropped before the
-/// function returns, so peak memory here is 512 KB regardless of file size.
+/// The head buffer and the tail buffer are both ordinary locals: they are
+/// both still alive at once in the moment just before the function returns
+/// (that is the peak), and both go out of scope together when it does. So
+/// peak memory here is 512 KB regardless of file size, but the two buffers
+/// are not dropped one before the other; they drop together, at return.
 pub fn transcript_span(path: &Path) -> Option<TranscriptSpan> {
-    use std::io::{Read, Seek, SeekFrom};
-
     let meta = std::fs::metadata(path).ok()?;
     if !meta.is_file() {
         return None;
     }
     let len = meta.len();
     let mut f = std::fs::File::open(path).ok()?;
+    transcript_span_from_reader(&mut f, len)
+}
+
+/// Does the actual work of [`transcript_span`], but over any `Read + Seek`
+/// instead of opening the file itself.
+///
+/// This split exists purely for testability. The public function's signature
+/// (`&Path -> Option<TranscriptSpan>`) cannot be probed from a test without
+/// either touching real disk I/O (which cannot tell you how many bytes were
+/// read) or pulling in a mocking crate (which this project does not depend
+/// on). Taking the "seam" out into its own function that accepts a generic
+/// `R: Read + Seek` lets a test hand in something that LOOKS like a file to
+/// this function but that also counts bytes on the side. See
+/// `CountingReader` in the test module below.
+fn transcript_span_from_reader<R: std::io::Read + std::io::Seek>(
+    f: &mut R,
+    len: u64,
+) -> Option<TranscriptSpan> {
+    use std::io::SeekFrom;
 
     // Head probe.
     let mut head = vec![0u8; SPAN_PROBE_BYTES.min(len) as usize];
@@ -490,9 +510,14 @@ mod tests {
 
     #[test]
     fn transcript_span_does_not_read_the_whole_file() {
-        // WHY: the whole point of this function is that discovery must not
-        // cost as much as analysis. A 4 MB file padded with untimestamped
-        // filler still resolves its span, because the head and tail carry it.
+        // WHY: this only checks CORRECTNESS on a large file: a 4 MB file
+        // padded with untimestamped filler still resolves the right span,
+        // because the head and tail probes carry the real timestamps. It
+        // does NOT prove the function avoided reading the whole file: a
+        // naive whole-file implementation would produce the identical span
+        // and pass this test unchanged. The actual boundedness proof, which
+        // watches bytes read, is
+        // `transcript_span_reader_stays_within_the_probe_budget` below.
         let td = tempfile::tempdir().unwrap();
         let p = td.path().join("big.jsonl");
         let filler = format!("{}\n", r#"{"type":"system","pad":"xxxxxxxxxxxxxxxx"}"#);
@@ -509,5 +534,107 @@ mod tests {
         let span = transcript_span(&p).expect("a span");
         assert_eq!(span.first, "2026-01-01T00:00:01Z");
         assert_eq!(span.last, "2026-01-01T09:00:00Z");
+    }
+
+    /// A fake "file" that lets a test observe how many bytes
+    /// `transcript_span_from_reader` actually reads, which a real file
+    /// cannot do on its own. This is the standard way to make I/O testable
+    /// in Rust without a mocking framework: the function under test does not
+    /// know or care whether it is talking to a real `std::fs::File` or to
+    /// this struct, because both implement the same two traits, `Read` and
+    /// `Seek`. All this wrapper adds on top of a normal in-memory buffer is
+    /// a counter that grows every time `read` hands bytes back.
+    struct CountingReader {
+        // `Cursor<Vec<u8>>` already implements `Read` and `Seek` over an
+        // in-memory byte buffer, tracking a "current position" the same way
+        // a real file's cursor does. Wrapping it means we get correct seek
+        // behavior for free and only have to write the counting part
+        // ourselves.
+        inner: std::io::Cursor<Vec<u8>>,
+        // Running total of bytes returned across every call to `read`.
+        // This is the number the test asserts on: it is the only way to
+        // observe from OUTSIDE the function how much of the fake file it
+        // touched.
+        bytes_read: usize,
+    }
+
+    impl CountingReader {
+        fn new(data: Vec<u8>) -> Self {
+            CountingReader {
+                inner: std::io::Cursor::new(data),
+                bytes_read: 0,
+            }
+        }
+    }
+
+    // Implementing `Read` ourselves (instead of just using `Cursor`
+    // directly) is what lets us intercept every read and add to the
+    // counter. `Read` has one required method, `read`: it is handed an
+    // empty-ish `buf` to fill, and must return how many bytes it actually
+    // wrote into `buf` (which can be less than `buf.len()`, e.g. near
+    // end-of-data).
+    impl std::io::Read for CountingReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            // Let the wrapped `Cursor` do the real copying; it returns how
+            // many bytes it actually wrote into `buf`.
+            let n = self.inner.read(buf)?;
+            // That count is ground truth for "bytes read just now". A
+            // caller like `read_exact` can call `read` several times to
+            // fill one buffer, so we must add on every call rather than
+            // assume one call fills the whole request.
+            self.bytes_read += n;
+            Ok(n)
+        }
+    }
+
+    // `Seek` (jumping to a byte offset, used for the tail probe) is
+    // separate from `Read` in std: a type can support one without the
+    // other. We forward it to the inner `Cursor` untouched. Seeking does
+    // not read any bytes, so it must NOT add to `bytes_read`; only actual
+    // data transfer through `read` counts.
+    impl std::io::Seek for CountingReader {
+        fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+            self.inner.seek(pos)
+        }
+    }
+
+    #[test]
+    fn transcript_span_reader_stays_within_the_probe_budget() {
+        // WHY: `transcript_span_does_not_read_the_whole_file` above proves
+        // the RESULT is correct on a large file, but a whole-file
+        // implementation would pass that test too, since it would compute
+        // the same span. This test is the one that actually watches bytes
+        // read through the reader, so it is the one that would catch a
+        // regression back to "just read the whole file".
+        let filler = format!("{}\n", r#"{"type":"system","pad":"xxxxxxxxxxxxxxxx"}"#);
+        let mut body = String::new();
+        body.push_str(r#"{"type":"user","timestamp":"2026-01-01T00:00:01Z"}"#);
+        body.push('\n');
+        while body.len() < 4 * 1024 * 1024 {
+            body.push_str(&filler);
+        }
+        body.push_str(r#"{"type":"user","timestamp":"2026-01-01T09:00:00Z"}"#);
+        body.push('\n');
+        let len = body.len() as u64;
+
+        let mut reader = CountingReader::new(body.into_bytes());
+        let span = transcript_span_from_reader(&mut reader, len).expect("a span");
+
+        // Correctness: still the right span, same as the whole-file test.
+        assert_eq!(span.first, "2026-01-01T00:00:01Z");
+        assert_eq!(span.last, "2026-01-01T09:00:00Z");
+
+        // Boundedness: this is the assertion the old test was missing. At
+        // most one head probe and one tail probe should ever be read,
+        // however many megabytes the fake file holds. If someone changes
+        // the function to read the whole file (or to loop past the
+        // probes), this fails; today it does not.
+        let budget = 2 * SPAN_PROBE_BYTES as usize;
+        assert!(
+            reader.bytes_read <= budget,
+            "expected at most {budget} bytes read (one head + one tail probe), \
+             but {} bytes were actually read out of a {len}-byte file",
+            reader.bytes_read
+        );
     }
 }
