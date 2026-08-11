@@ -78,8 +78,15 @@ const QUOTE_MAX: usize = 500;
 /// reviewer that has decided it needs the full request text, not pushed at
 /// one that did not ask.
 const CAP_INTENT: usize = 20_000;
-/// Starting request count for `session_intent`, walked down by
-/// `shrink_to_fit`. High enough that a normal session is never trimmed.
+/// Ordinary cardinality cap on `session_intent`'s request list: at most this
+/// many requests are ever CONSIDERED for packing, applied before the
+/// size-based packing in `session_intent` runs. High enough that a normal
+/// session is never trimmed by it; it exists to bound the packing loop's
+/// work (each step re-serializes the running payload) against a session
+/// with a pathological number of human turns, not to shrink ordinary
+/// output. Distinct from, and reported separately from, the size-based
+/// per-request skip: a request beyond this window is dropped by count, not
+/// because its own text failed to fit.
 const INTENT_LIST_MAX: usize = 200;
 
 /// The grouping rule, printed verbatim in every work-unit payload so a reader
@@ -908,6 +915,13 @@ pub fn review_context(s: &Session, meta: &SessionMeta) -> Value {
     // with) or subagent prose `claims` excluded (`agent_texts_excluded`,
     // never eligible for `claims` to begin with). `coverage_incomplete` is
     // the one boolean a reviewer needs to know that gap exists at all.
+    //
+    // `session_intent` carries the narrower `request_coverage` object
+    // instead of this one, deliberately not named `coverage`: it has no
+    // claims block, so `agent_texts_excluded` describes an exposure it
+    // does not have, and folding it in anyway would make the two payloads'
+    // same-shaped fields mean different things. See `session_intent`'s doc
+    // comment (Fix 3) for the full reasoning.
     let coverage_incomplete = scope.unattributed_turns > 0 || s.agent_texts_excluded > 0;
     let coverage = json!({
         "coverage_incomplete": coverage_incomplete,
@@ -1047,24 +1061,65 @@ pub fn review_context(s: &Session, meta: &SessionMeta) -> Value {
 /// the entire point of this tool existing separately.
 ///
 /// Request text is NEVER elided, unlike every other transcript-derived
-/// string this crate echoes. If the budget is exceeded, `shrink_to_fit`
-/// drops WHOLE requests and `truncated` says so, rather than cutting each
-/// one down: a half-quoted request is worse than a missing one for a tool
-/// whose entire premise is exact quoting.
+/// string this crate echoes. If a request does not fit, it is DROPPED
+/// whole, never cut down: a half-quoted request is worse than a missing one
+/// for a tool whose entire premise is exact quoting.
 ///
 /// `max_tokens` lets a caller request a smaller budget than `CAP_INTENT`. A
 /// caller-supplied budget can only ever LOWER the cap, never raise it
 /// (`.min(CAP_INTENT)`), so this tool can't be pointed at itself to buy back
 /// the room `review_context` deliberately withholds.
 ///
-/// `scope.requests` is the SAME attributed-only set `review_context` shows,
-/// in full rather than as a capped sample: neither payload can recover a
-/// turn whose origin could not be attributed (`Scope::unattributed_turns`,
-/// see its doc comment in `context.rs`). This payload has the identical
-/// exposure `review_context` does, so it discloses it the same way: a
-/// top-level `coverage` object, mirroring that payload's shape rather than
-/// inventing a different one, so a reviewer pulling "the full intent" is
-/// told plainly that some turns are not in it.
+/// # Fix 1: requests are packed INDIVIDUALLY, not via `shrink_to_fit`
+///
+/// `shrink_to_fit`'s shared-prefix walk (`take(k)`, `k` falling from a
+/// start) does not fit this payload: request 0 is a member of every
+/// nonempty prefix, so a single oversized first request busts the cap at
+/// every `k > 0`, forcing the walk to `k == 0` and withholding EVERY
+/// request, including ones far down the list that would have fit easily on
+/// their own. A reviewer that gets nothing back cannot tell "intent existed
+/// but was withheld" from "there was no intent to show", and `truncated`
+/// alone does not distinguish the two.
+///
+/// Fixed locally to this payload (not in `shrink_to_fit`, which five other
+/// payloads share and whose shared-prefix contract is correct for them):
+/// walk `scope.requests` in order, add each one to the running payload if
+/// doing so keeps it within `cap`, and otherwise skip just that one and
+/// keep walking. `requests_included` and `requests_omitted_for_size` are
+/// reported unconditionally so a reviewer can always tell how much was
+/// withheld and that the reason was size, distinct from `INTENT_LIST_MAX`
+/// (an ordinary cardinality cap on how many requests are even considered,
+/// ahead of packing, purely to bound the packing loop's own work).
+///
+/// # Fix 2: `max_tokens` is honored as a real ceiling, not overshot
+///
+/// The payload's fixed envelope (session id, totals, coverage, zero
+/// requests) has a real minimum size: `min_viable_tokens`, computed once
+/// per call and always reported. When `cap` is below it, no amount of
+/// packing can help, so this returns the envelope with `budget_too_small:
+/// true` rather than silently emitting a payload bigger than the caller
+/// asked for.
+///
+/// # Fix 3: `request_coverage`, not `coverage`
+///
+/// `review_context`'s `coverage_incomplete` folds in `agent_texts_excluded`
+/// (subagent prose that never made it into `agent_texts`, so `claims`
+/// cannot show it). This payload has no claims block and never touches
+/// `agent_texts`, so `agent_texts_excluded` describes an exposure this tool
+/// genuinely does not have; folding it in anyway (option (a), a shared
+/// coverage builder) would give `session_intent` a field with no meaning in
+/// its own context, purely to LOOK consistent with `review_context`. That
+/// is worse than the divergence it would fix: identical field values with
+/// different meanings are exactly as unsafe to compare as identically
+/// NAMED fields with different meanings. So this is option (b): the object
+/// is renamed `request_coverage`, scoped to the one exposure this payload
+/// actually has (`unattributed_turns`, the same attributed-only set
+/// `review_context` shows), so the name itself says "this is narrower than
+/// `review_context`'s `coverage`" and no consumer can read one payload's
+/// field expecting the other's semantics. Both derive `unattributed_turns`
+/// from the same `context::scope`, so the two can never disagree about
+/// THAT count, only about whether `agent_texts_excluded` also applies,
+/// which `request_coverage` no longer claims to speak to at all.
 pub fn session_intent(s: &Session, meta: &SessionMeta, max_tokens: Option<usize>) -> Value {
     let scope = crate::context::scope(s);
     let (session, id_cut) = session_block(meta);
@@ -1072,28 +1127,66 @@ pub fn session_intent(s: &Session, meta: &SessionMeta, max_tokens: Option<usize>
     let total = scope.requests.len();
 
     let coverage_incomplete = scope.unattributed_turns > 0;
-    let coverage = json!({
+    let request_coverage = json!({
         "coverage_incomplete": coverage_incomplete,
         "unattributed_turns": scope.unattributed_turns,
         "note": "requests re-derives the same attributed requests scope() produced, in full; it cannot recover unattributed_turns (unknown-origin turns, never attributed to begin with)"
     });
 
-    shrink_to_fit(cap, INTENT_LIST_MAX.min(total.max(1)), |k| {
+    // Fix 1's ordinary cardinality cap: at most `INTENT_LIST_MAX` requests
+    // are ever considered for packing. Separate from, and reported
+    // separately from, the size-based skip below.
+    let considered = &scope.requests[..total.min(INTENT_LIST_MAX)];
+    let list_capped = total > considered.len();
+
+    let build = |kept: &[Value], omitted_for_size: usize, budget_too_small: bool| {
         json!({
             "v": 3,
-            "session": session,
-            "requests": scope.requests.iter().take(k).map(|r| json!({
-                // NOT elided: the entire point of this tool is the full
-                // text. If it does not fit, whole requests are dropped
-                // (below) rather than each one being mutilated.
-                "text": r.text,
-                "line": r.line_no
-            })).collect::<Vec<_>>(),
+            "session": session.clone(),
+            "requests": kept,
             "totals": {"requests": total},
-            "coverage": coverage,
-            "truncated": total > k || id_cut
+            "requests_included": kept.len(),
+            "requests_omitted_for_size": omitted_for_size,
+            "request_coverage": request_coverage.clone(),
+            "budget_too_small": budget_too_small,
+            "truncated": omitted_for_size > 0 || list_capped || id_cut || budget_too_small
         })
-    })
+    };
+
+    // Fix 2: the zero-request envelope is the floor this payload can ever
+    // shrink to. `omitted_for_size` is reported as every considered request
+    // here, which is accurate: if even the empty envelope does not fit
+    // `cap`, no single request can fit alongside it either.
+    let envelope = build(&[], considered.len(), false);
+    let min_viable_tokens = est_tokens(&envelope);
+    if min_viable_tokens > cap {
+        let mut too_small = build(&[], considered.len(), true);
+        too_small["min_viable_tokens"] = json!(min_viable_tokens);
+        return too_small;
+    }
+
+    // Fix 1: pack individually. Push each candidate, keep it if the payload
+    // still fits, otherwise pop it back off and count it as omitted for
+    // size, then move on to the NEXT request rather than giving up.
+    let mut kept: Vec<Value> = Vec::new();
+    let mut omitted_for_size = 0usize;
+    for r in considered {
+        kept.push(json!({
+            // NOT elided: the entire point of this tool is the full text.
+            // If a request does not fit, it is dropped whole (below) rather
+            // than mutilated.
+            "text": r.text,
+            "line": r.line_no
+        }));
+        if est_tokens(&build(&kept, omitted_for_size, false)) > cap {
+            kept.pop();
+            omitted_for_size += 1;
+        }
+    }
+
+    let mut payload = build(&kept, omitted_for_size, false);
+    payload["min_viable_tokens"] = json!(min_viable_tokens);
+    payload
 }
 
 fn excerpt(a: &Action) -> String {
@@ -2260,10 +2353,73 @@ mod tests {
 
         let p = session_intent(&s, &meta, None);
         assert!(
-            p["coverage"]["unattributed_turns"].as_u64().unwrap() > 0,
+            p["request_coverage"]["unattributed_turns"]
+                .as_u64()
+                .unwrap()
+                > 0,
             "the fixture must actually produce an unattributed turn"
         );
-        assert_eq!(p["coverage"]["coverage_incomplete"], true);
+        assert_eq!(p["request_coverage"]["coverage_incomplete"], true);
+    }
+
+    #[test]
+    fn session_intent_oversized_first_request_does_not_starve_the_rest() {
+        // Fix 1 (RED on the pre-fix code): shrink_to_fit's shared-prefix walk
+        // (`take(k)`, k falling from a start) means request 0 is a member of
+        // EVERY nonempty prefix. If it alone busts the cap, every k > 0 busts
+        // the cap too, so the loop is forced all the way to k = 0 and returns
+        // NO requests at all, even though requests 1..5 below would fit the
+        // budget easily on their own. Individual packing must walk past the
+        // oversized one and still keep the small ones.
+        let big = "x".repeat(6000);
+        let mut lines = vec![format!(
+            r#"{{"type":"user","timestamp":"2026-01-01T00:00:00Z","origin":{{"kind":"human"}},"message":{{"content":"{big}"}}}}"#
+        )];
+        for i in 1..=5 {
+            lines.push(format!(
+                r#"{{"type":"user","timestamp":"2026-01-01T00:00:{i:02}Z","origin":{{"kind":"human"}},"message":{{"content":"hi {i}"}}}}"#
+            ));
+        }
+        let s = crate::ingest::ingest_str(&lines.join("\n"), crate::model::Lane::Main);
+        let meta = SessionMeta {
+            id: "s1".into(),
+            identified_by: "explicit".into(),
+            unit: None,
+        };
+
+        // 1000 tokens (~3500 chars) is comfortably bigger than the fixed
+        // envelope and the five small requests together, but far smaller
+        // than the 6000-char first request alone.
+        let p = session_intent(&s, &meta, Some(1000));
+
+        assert_eq!(p["totals"]["requests"], 6, "total never shrinks");
+        let kept: Vec<&str> = p["requests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["text"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            kept.len(),
+            5,
+            "the five small requests must all survive the oversized first one, got {kept:?}"
+        );
+        for i in 1..=5 {
+            assert!(
+                kept.contains(&format!("hi {i}").as_str()),
+                "request {i} was dropped even though it fits the budget on its own"
+            );
+        }
+        assert!(
+            !kept.iter().any(|t| t.starts_with('x')),
+            "the oversized request must never be half-quoted into the output"
+        );
+        assert_eq!(
+            p["requests_omitted_for_size"], 1,
+            "the omission must be reported unconditionally"
+        );
+        assert_eq!(p["requests_included"], 5);
+        assert_eq!(p["truncated"], true);
     }
 
     #[test]
@@ -2292,6 +2448,96 @@ mod tests {
         assert_eq!(
             p["coverage"]["unattributed_turns"],
             p["scope"]["unattributed_turns"]
+        );
+    }
+
+    #[test]
+    fn session_intent_flags_budget_too_small_below_the_zero_request_envelope() {
+        // Fix 2: `max_tokens` did not actually bound the output.
+        // `shrink_to_fit`'s k = 0 payload (the fixed envelope) was returned
+        // unconditionally, so a caller passing a tiny `max_tokens` still
+        // got the whole envelope back with no sign the budget was blown.
+        // `min_viable_tokens` is the documented floor; below it the payload
+        // must say so explicitly rather than silently overshoot.
+        let s = crate::ingest::ingest_str(
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:00Z","origin":{"kind":"human"},"message":{"content":"hello"}}"#,
+            crate::model::Lane::Main,
+        );
+        let meta = SessionMeta {
+            id: "s1".into(),
+            identified_by: "explicit".into(),
+            unit: None,
+        };
+
+        // A generous cap so the normal packing path runs and reports the
+        // envelope's real size, unaffected by whether requests fit.
+        let baseline = session_intent(&s, &meta, None);
+        let envelope = baseline["min_viable_tokens"].as_u64().unwrap();
+        assert!(
+            envelope > 1,
+            "sanity: the envelope must be bigger than the pathological caps below"
+        );
+        assert_eq!(baseline["budget_too_small"], false);
+
+        for cap in [0u64, 1u64, envelope - 1] {
+            let p = session_intent(&s, &meta, Some(cap as usize));
+            assert_eq!(
+                p["budget_too_small"], true,
+                "cap {cap} is below the {envelope}-token envelope and must be flagged"
+            );
+            assert_eq!(
+                p["requests"].as_array().unwrap().len(),
+                0,
+                "no request can fit alongside an envelope that itself does not fit"
+            );
+            assert_eq!(p["min_viable_tokens"], envelope);
+            assert_eq!(p["truncated"], true);
+        }
+
+        let fits = session_intent(&s, &meta, Some(envelope as usize));
+        assert_eq!(
+            fits["budget_too_small"], false,
+            "a cap exactly at the envelope's size must be honored, not flagged"
+        );
+    }
+
+    #[test]
+    fn session_intent_and_review_context_coverage_cannot_contradict() {
+        // Fix 3: the two payloads used to fold unattributed_turns (and, for
+        // review_context, agent_texts_excluded) into an identically-named
+        // `coverage_incomplete` under an identically-named `coverage`
+        // object, computed by DIFFERENT rules. The same session could
+        // report coverage_incomplete: true from one and false from the
+        // other under a field name a consumer would reasonably assume
+        // meant the same thing in both. session_intent's object is now
+        // `request_coverage`, scoped to the one exposure (unattributed
+        // turns) it actually shares with review_context, so the two can
+        // never disagree about what they both claim to measure.
+        let unattributed = r#"{"type":"user","timestamp":"2026-01-01T00:00:00Z","message":{"content":"[Request interrupted by user]"}}"#;
+        let s = crate::ingest::ingest_str(unattributed, crate::model::Lane::Main);
+        let meta = SessionMeta {
+            id: "s1".into(),
+            identified_by: "explicit".into(),
+            unit: None,
+        };
+
+        let intent = session_intent(&s, &meta, None);
+        let ctx = review_context(&s, &meta);
+
+        assert_eq!(intent["request_coverage"]["coverage_incomplete"], true);
+        // The narrower flag can never claim incompleteness the broader one
+        // denies: both are driven by the same `unattributed_turns` count,
+        // and review_context's flag is a strict superset (it also folds in
+        // agent_texts_excluded), so it can never be MORE optimistic.
+        if intent["request_coverage"]["coverage_incomplete"] == true {
+            assert_eq!(
+                ctx["coverage"]["coverage_incomplete"], true,
+                "session_intent reports incomplete coverage while review_context reports complete, for the same session"
+            );
+        }
+        assert_eq!(
+            intent["request_coverage"]["unattributed_turns"], ctx["coverage"]["unattributed_turns"],
+            "both re-derive unattributed_turns from the same context::scope"
         );
     }
 }
