@@ -399,6 +399,87 @@ pub fn incomplete(s: &Session) -> Incomplete {
     }
 }
 
+/// Something the agent said it did, for the reviewer to check against the
+/// diff.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Claim {
+    /// The prose, verbatim (capped at ingest).
+    pub text: String,
+    /// Source line, for citation.
+    pub line_no: usize,
+    /// Which transcript of the work unit it came from.
+    pub session_ix: u16,
+}
+
+/// Extract the agent's claims about what it did.
+///
+/// A claim is the LAST prose block before each human turn, plus the final
+/// block of the session when no human turn followed it. That is where an
+/// agent summarizes what it did; mid-turn narration ("Let me check the
+/// tests") is always followed by more prose and so is never last.
+///
+/// This is a positional rule, not a content judgment, which is what keeps it
+/// deterministic. An earlier draft filtered prose by length instead and was
+/// rejected on measurement: across 8 real sessions, 79% of blocks clear 80
+/// characters and the 80-159 character band is mostly narration ("Now the
+/// rules engine and TikTok driver:"), so length does not separate assertion
+/// from chatter. Measured on 4 real sessions, this positional rule yields 18
+/// claims from 172 blocks, 3 from 22, and 4 from 6.
+pub fn claims(s: &Session) -> Vec<Claim> {
+    // Human turn boundaries, as source line numbers.
+    //
+    // Deliberately `is_human()`, not the explicit-`Human`-only filter
+    // `scope()` uses -- and that asymmetry is intentional, not an
+    // inconsistency to "fix" to match `scope()`. `scope()` QUOTES a turn as
+    // the human's stated intent, so it needs certainty: an origin-less turn
+    // is often junk like "[Request interrupted by user]", and quoting that
+    // as intent would be a lie. `claims()` only uses a human turn as a
+    // BOUNDARY, to decide where one claim window ends -- it never quotes the
+    // turn itself. An interrupt genuinely does end the agent's turn, so it
+    // is a real boundary regardless of whether we can attribute it to a
+    // human with certainty. Requiring that certainty here would merge two
+    // windows together and promote mid-turn narration into a claim, exactly
+    // the failure mode this rule exists to avoid.
+    let mut boundaries: Vec<usize> = s
+        .user_texts
+        .iter()
+        .filter(|u| u.is_human())
+        .map(|u| u.line_no)
+        .collect();
+    boundaries.sort_unstable();
+
+    let mut out = Vec::new();
+    let mut last: Option<&crate::model::AgentText> = None;
+    let mut next_boundary = 0usize;
+
+    for t in &s.agent_texts {
+        // Cross every boundary this block sits after, emitting the block
+        // that was last before each one. A window with no prose in it emits
+        // nothing, which is correct: the agent said nothing to claim.
+        while next_boundary < boundaries.len() && t.line_no > boundaries[next_boundary] {
+            if let Some(prev) = last.take() {
+                out.push(Claim {
+                    text: prev.text.clone(),
+                    line_no: prev.line_no,
+                    session_ix: prev.session_ix,
+                });
+            }
+            next_boundary += 1;
+        }
+        last = Some(t);
+    }
+    // The trailing window: prose after the final human turn, or a session
+    // that never had one.
+    if let Some(prev) = last {
+        out.push(Claim {
+            text: prev.text.clone(),
+            line_no: prev.line_no,
+            session_ix: prev.session_ix,
+        });
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -909,5 +990,48 @@ mod tests {
             incomplete(&s).failing_commands.is_empty(),
             "the last recorded outcome of this command is a pass"
         );
+    }
+
+    // ---- claims() ----
+
+    #[test]
+    fn a_claim_is_the_last_prose_block_before_each_human_turn() {
+        // Mid-turn narration is followed by more prose, so it is never last.
+        // The summary the agent writes before handing back IS the claim.
+        let n1 = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"text","text":"Let me check the tests."}]}}"#;
+        let sum1 = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:01Z","message":{"content":[{"type":"text","text":"Added the cache and its tests, 5 passing."}]}}"#;
+        let human = r#"{"type":"user","timestamp":"2026-01-01T00:00:02Z","origin":{"kind":"human"},"message":{"content":"now wire it up"}}"#;
+        let sum2 = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:03Z","message":{"content":[{"type":"text","text":"Wired into the loader."}]}}"#;
+        let s = ingest_str(&format!("{n1}\n{sum1}\n{human}\n{sum2}"), Lane::Main);
+
+        let c = claims(&s);
+        assert_eq!(c.len(), 2, "one per window, not one per block");
+        assert_eq!(c[0].text, "Added the cache and its tests, 5 passing.");
+        assert_eq!(
+            c[1].text, "Wired into the loader.",
+            "trailing window counts"
+        );
+    }
+
+    #[test]
+    fn a_harness_turn_does_not_close_a_claim_window() {
+        // A task notification is not the agent handing work back to a human,
+        // so splitting on it would promote mid-turn narration into a claim.
+        let n1 = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"text","text":"Starting the migration."}]}}"#;
+        let note = r#"{"type":"user","timestamp":"2026-01-01T00:00:01Z","origin":{"kind":"task-notification"},"message":{"content":"<task-notification>done</task-notification>"}}"#;
+        let sum = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:02Z","message":{"content":[{"type":"text","text":"Migration complete, 12 rows moved."}]}}"#;
+        let s = ingest_str(&format!("{n1}\n{note}\n{sum}"), Lane::Main);
+
+        let c = claims(&s);
+        assert_eq!(c.len(), 1, "the notification did not close a window");
+        assert_eq!(c[0].text, "Migration complete, 12 rows moved.");
+    }
+
+    #[test]
+    fn a_session_with_no_human_turn_still_yields_its_final_claim() {
+        let only = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"text","text":"Done, nothing to change."}]}}"#;
+        let s = ingest_str(only, Lane::Main);
+
+        assert_eq!(claims(&s).len(), 1);
     }
 }
