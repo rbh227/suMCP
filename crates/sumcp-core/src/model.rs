@@ -388,13 +388,17 @@ pub struct Decision {
     /// Source line of the asking call (total-order tiebreak, same key as
     /// actions and user texts).
     pub line_no: usize,
-    /// The asking action's index, so `evidence()` can dereference it.
-    /// `None` only if the call was deduped away as a replay.
-    pub idx: Option<Idx>,
     /// Which transcript of the work unit this came from. See
     /// [`Action::session_ix`] for why this is an index and not a `String`.
     #[serde(default)]
     pub session_ix: u16,
+    // Deliberately no `Idx` field here. Both `merge_sessions` and
+    // `merge_work_unit` renumber every action's `Idx` globally, so an index
+    // assigned at ingest time would go stale the moment a merge ran, and a
+    // stale citation is worse than an absent one. `line_no` + `session_ix`
+    // above are stable across merges; a later task resolves the real,
+    // current `Idx` from the MERGED session by matching on that pair. Do
+    // not re-add `idx` here without solving the staleness problem first.
 }
 
 /// A fully parsed session: ordered actions plus parse-health counters.

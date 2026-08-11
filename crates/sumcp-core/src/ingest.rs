@@ -53,9 +53,22 @@ pub fn ingest_str(raw: &str, default_lane: Lane) -> Session {
     // call carries the question and options, the paired result carries the
     // answer. We stash the half we have and join by tool_use id at the end,
     // exactly the way spawns already resolve their agentId.
-    let mut pending_decisions: Vec<(String, Decision)> = Vec::new();
-    let mut decision_answers: std::collections::BTreeMap<String, String> =
-        std::collections::BTreeMap::new();
+    //
+    // The join MUST be scoped by tool_use_id, not by question text alone.
+    // If a session asks the same question text in two different calls, a
+    // text-only key would let the second call's answer overwrite the
+    // first's in a shared map, so BOTH decisions would report the later
+    // answer, a fabricated result for the earlier one. Each pending
+    // decision therefore carries the tool_use_id of the call that asked it
+    // (`None` only if the call's `id` was itself missing, which the "cannot
+    // disambiguate" fallback below also covers), and `decision_answers` is
+    // keyed by tool_use_id first, question text second, matching the shape
+    // of the transcript's own per-call `answers` object.
+    let mut pending_decisions: Vec<(Option<String>, bool, Decision)> = Vec::new();
+    let mut decision_answers: std::collections::BTreeMap<
+        String,
+        std::collections::BTreeMap<String, String>,
+    > = std::collections::BTreeMap::new();
 
     for (line_no, line) in raw.lines().enumerate() {
         if line.trim().is_empty() {
@@ -226,6 +239,21 @@ pub fn ingest_str(raw: &str, default_lane: Lane) -> Session {
                                 .and_then(|i| i.get("questions"))
                                 .and_then(Value::as_array)
                         {
+                            // The transcript's own answers map (read from the
+                            // paired result line) is keyed by question text
+                            // WITHIN one call. If this call asks the same
+                            // text twice, that map has room for only one
+                            // entry, so there is no way to tell which
+                            // decision the recorded answer belongs to.
+                            // Detect that collision here, at the source, so
+                            // the join below can refuse to guess instead of
+                            // handing both decisions the same answer.
+                            let mut text_counts: HashMap<&str, usize> = HashMap::new();
+                            for q in qs {
+                                if let Some(text) = q.get("question").and_then(Value::as_str) {
+                                    *text_counts.entry(text).or_insert(0) += 1;
+                                }
+                            }
                             for q in qs {
                                 let Some(question) = q.get("question").and_then(Value::as_str)
                                 else {
@@ -241,17 +269,16 @@ pub fn ingest_str(raw: &str, default_lane: Lane) -> Session {
                                             .collect()
                                     })
                                     .unwrap_or_default();
+                                let ambiguous_in_call =
+                                    text_counts.get(question).copied().unwrap_or(0) > 1;
                                 pending_decisions.push((
-                                    question.to_string(),
+                                    tool_id.map(str::to_string),
+                                    ambiguous_in_call,
                                     Decision {
                                         question: question.to_string(),
                                         options,
                                         answer: None, // filled by the join below
                                         line_no,
-                                        // The asking action's Idx is assigned
-                                        // when `pending` is drained, so this
-                                        // is resolved in the join too.
-                                        idx: None,
                                         session_ix: 0,
                                     },
                                 ));
@@ -297,17 +324,23 @@ pub fn ingest_str(raw: &str, default_lane: Lane) -> Session {
                             // structuredPatch (edit line ranges) lives at the
                             // top level of the same line, paired with this result.
                             let hunks = read_hunks(v.get("toolUseResult"));
-                            // The answers map is keyed by the question text
-                            // itself, so it joins to the pending decisions
-                            // without needing the tool_use id.
+                            // The answers map is keyed by question text
+                            // WITHIN this one call, so it is stored under
+                            // this result's tool_use_id (`id`, bound above)
+                            // and joined to the pending decisions by that id
+                            // plus question text below. Keying by question
+                            // text alone (the old behaviour) let a second
+                            // call asking the same text overwrite the
+                            // first's answer in a session-wide map.
                             if let Some(answers) = v
                                 .get("toolUseResult")
                                 .and_then(|r| r.get("answers"))
                                 .and_then(Value::as_object)
                             {
+                                let per_call = decision_answers.entry(id.to_string()).or_default();
                                 for (q, a) in answers {
                                     if let Some(text) = a.as_str() {
-                                        decision_answers.insert(q.clone(), text.to_string());
+                                        per_call.insert(q.clone(), text.to_string());
                                     }
                                 }
                             }
@@ -418,12 +451,24 @@ pub fn ingest_str(raw: &str, default_lane: Lane) -> Session {
         tokens.cache_creation += u.cache_creation;
     }
 
-    // Join the two halves. An unanswered question keeps `answer: None`: the
-    // options it offered are still evidence of what was under consideration.
+    // Join the two halves, scoped by the asking call's tool_use_id. An
+    // unanswered question keeps `answer: None`: the options it offered are
+    // still evidence of what was under consideration. A question that
+    // shares its exact text with another question in the SAME call also
+    // keeps `answer: None`: the call's own answers map cannot tell the two
+    // apart, so reporting a specific answer there would be a guess dressed
+    // up as quoted ground truth, exactly the fabrication this join exists
+    // to prevent.
     let decisions: Vec<Decision> = pending_decisions
         .into_iter()
-        .map(|(q, mut d)| {
-            d.answer = decision_answers.get(&q).cloned();
+        .map(|(tool_use_id, ambiguous_in_call, mut d)| {
+            if !ambiguous_in_call {
+                d.answer = tool_use_id
+                    .as_ref()
+                    .and_then(|id| decision_answers.get(id))
+                    .and_then(|per_call| per_call.get(&d.question))
+                    .cloned();
+            }
             d
         })
         .collect();
@@ -858,5 +903,56 @@ mod tests {
 
         assert_eq!(s.decisions.len(), 1);
         assert_eq!(s.decisions[0].answer, None);
+    }
+
+    #[test]
+    fn same_question_text_twice_in_one_session_gets_its_own_answer_each_time() {
+        // Regression for a fabrication bug: decision_answers used to be keyed
+        // by question text ALONE across the whole session, so a second call
+        // asking the identically-worded question overwrote the first call's
+        // answer in the shared map, and BOTH decisions reported the later
+        // answer. The join must be scoped by the asking call's tool_use_id
+        // so each call's answer stays its own.
+        let call1 = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"tool_use","id":"q1","name":"AskUserQuestion","input":{"questions":[{"question":"Which store?","options":[{"label":"SQLite"},{"label":"JSONL"}]}]}}]}}"#;
+        let result1 = r#"{"type":"user","timestamp":"2026-01-01T00:00:05Z","message":{"content":[{"type":"tool_result","tool_use_id":"q1"}]},"toolUseResult":{"answers":{"Which store?":"JSONL"}}}"#;
+        let call2 = r#"{"type":"assistant","timestamp":"2026-01-01T00:10:00Z","message":{"content":[{"type":"tool_use","id":"q2","name":"AskUserQuestion","input":{"questions":[{"question":"Which store?","options":[{"label":"SQLite"},{"label":"JSONL"}]}]}}]}}"#;
+        let result2 = r#"{"type":"user","timestamp":"2026-01-01T00:10:05Z","message":{"content":[{"type":"tool_result","tool_use_id":"q2"}]},"toolUseResult":{"answers":{"Which store?":"SQLite"}}}"#;
+        let raw = format!("{call1}\n{result1}\n{call2}\n{result2}");
+        let s = ingest_str(&raw, Lane::Main);
+
+        assert_eq!(s.decisions.len(), 2, "both decisions recorded");
+        assert_eq!(
+            s.decisions[0].answer.as_deref(),
+            Some("JSONL"),
+            "first call's own answer, not the second call's"
+        );
+        assert_eq!(
+            s.decisions[1].answer.as_deref(),
+            Some("SQLite"),
+            "second call's own answer, not the first call's"
+        );
+    }
+
+    #[test]
+    fn two_identical_questions_in_one_call_both_resolve_to_none() {
+        // One AskUserQuestion call can carry several questions. If two of
+        // them share identical text, the transcript's own `answers` map
+        // (keyed by question text) has room for only one entry, so there is
+        // no way to tell which decision it belongs to. Guessing would hand
+        // both decisions the same fabricated answer, exactly the failure
+        // mode this fix exists to prevent, so both must stay `None`.
+        let call = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"tool_use","id":"q1","name":"AskUserQuestion","input":{"questions":[{"question":"Which store?","options":[{"label":"SQLite"}]},{"question":"Which store?","options":[{"label":"JSONL"}]}]}}]}}"#;
+        let result = r#"{"type":"user","timestamp":"2026-01-01T00:00:05Z","message":{"content":[{"type":"tool_result","tool_use_id":"q1"}]},"toolUseResult":{"answers":{"Which store?":"JSONL"}}}"#;
+        let s = ingest_str(&format!("{call}\n{result}"), Lane::Main);
+
+        assert_eq!(s.decisions.len(), 2, "both questions still recorded");
+        assert_eq!(
+            s.decisions[0].answer, None,
+            "ambiguous within the call: no guessing"
+        );
+        assert_eq!(
+            s.decisions[1].answer, None,
+            "ambiguous within the call: no guessing"
+        );
     }
 }
