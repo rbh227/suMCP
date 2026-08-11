@@ -62,6 +62,17 @@ const FINDING_IDXS_MAX: usize = 10;
 const BLIND_LIST_MAX: usize = 8;
 /// Starting cap on distinct unknown event types listed in `session_overview`.
 const UNKNOWN_TYPES_MAX: usize = 8;
+/// Token cap for `review_context`. Larger than the other payloads because it
+/// carries quoted prose rather than counts, and smaller than
+/// `session_intent` because it is PUSHED into the reviewer's context by
+/// default. Keeping the pushed payload small is what avoids the
+/// overcorrection effect the design is built around.
+const CAP_REVIEW_CONTEXT: usize = 2000;
+/// Starting list length for each block, walked down by `shrink_to_fit`.
+const CONTEXT_LIST_MAX: usize = 12;
+/// Longest single quoted string in `review_context`. A quote longer than this
+/// belongs in `session_intent`, which the reviewer pulls deliberately.
+const QUOTE_MAX: usize = 500;
 
 /// The grouping rule, printed verbatim in every work-unit payload so a reader
 /// never has to consult the source to audit a grouping.
@@ -824,6 +835,103 @@ pub fn evidence(s: &Session, idxs: &[Idx], meta: &SessionMeta) -> Value {
         found.pop();
         dropped_for_cap = true;
     }
+}
+
+/// Recorded session context for a reviewing agent (`v: 3`).
+///
+/// Four blocks (`scope`, `decisions`, `incomplete`, `claims`), all exact. (A
+/// fifth heuristic `constraints` block was cut before implementation; see the
+/// plan's Task 9.) Every list is a capped sample and every corresponding
+/// total is unconditional, so "3 shown" can never be read as "3 happened".
+pub fn review_context(s: &Session, meta: &SessionMeta) -> Value {
+    let scope = crate::context::scope(s);
+    let decisions = crate::context::decisions(s);
+    let incomplete = crate::context::incomplete(s);
+    let claims = crate::context::claims(s);
+    let (session, id_cut) = session_block(meta);
+
+    // The true counts, computed once and never subject to the cap below.
+    // `agent_texts_excluded` rides alongside `claims` for the same
+    // disclosure reason `unattributed_turns` rides alongside `requests`:
+    // a payload that quotes only what it could attribute must say how much
+    // it could not, or a short list reads as complete when it is not.
+    let totals = json!({
+        "requests": scope.requests.len(),
+        "files_edited": scope.files_edited.len(),
+        "decisions": decisions.len(),
+        "unfinished_tasks": incomplete.unfinished_tasks.len(),
+        "failing_commands": incomplete.failing_commands.len(),
+        "claims": claims.len(),
+        "agent_texts_excluded": s.agent_texts_excluded
+    });
+    let longest = scope
+        .requests
+        .len()
+        .max(scope.files_edited.len())
+        .max(decisions.len())
+        .max(claims.len())
+        .max(incomplete.unfinished_tasks.len())
+        .max(incomplete.failing_commands.len());
+
+    shrink_to_fit(CAP_REVIEW_CONTEXT, CONTEXT_LIST_MAX, |k| {
+        json!({
+            "v": 3,
+            "session": session,
+            "scope": {
+                "requests": scope.requests.iter().take(k).map(|r| json!({
+                    "text": elide_middle(&r.text, QUOTE_MAX),
+                    "line": r.line_no
+                })).collect::<Vec<_>>(),
+                "files_edited": scope.files_edited.iter().take(k).map(|f| json!(
+                    elide_middle(f, PATH_MAX)
+                )).collect::<Vec<_>>(),
+                // Disclosure, not a cap victim: a scalar count that is never
+                // itself shrunk. Turns whose origin could not be attributed
+                // to the human are excluded from `requests` (see
+                // `context::Scope::unattributed_turns`); hiding this count
+                // would misrepresent how complete the quoted intent is.
+                "unattributed_turns": scope.unattributed_turns
+            },
+            "decisions": decisions.iter().take(k).map(|d| json!({
+                "question": elide_middle(&d.question, QUOTE_MAX),
+                "chosen": d.chosen.as_ref().map(|c| elide_middle(c, QUOTE_MAX)),
+                "options_not_chosen": d.options_not_chosen,
+                // idxs, not just a line number: the Global Constraint is that
+                // every item is dereferenceable, and `evidence()` takes Idx.
+                // A bare line number is not something a reviewer can resolve.
+                "idxs": d.idxs.iter().take(FINDING_IDXS_MAX).collect::<Vec<_>>(),
+                "line": d.line_no
+            })).collect::<Vec<_>>(),
+            "incomplete": {
+                "unfinished_tasks": incomplete.unfinished_tasks.iter().take(k)
+                    .map(|t| json!({
+                        "subject": t.subject.as_ref().map(|x| elide_middle(x, QUOTE_MAX)),
+                        "last_status": t.last_status,
+                        "line": t.line_no
+                    })).collect::<Vec<_>>(),
+                "failing_commands": incomplete.failing_commands.iter().take(k)
+                    .map(|c| json!({
+                        "command": elide_middle(&c.command, QUOTE_MAX),
+                        "idxs": [c.idx]
+                    })).collect::<Vec<_>>()
+            },
+            "claims": claims.iter().take(k).map(|c| json!({
+                "text": elide_middle(&c.text, QUOTE_MAX),
+                "line": c.line_no,
+                // True when the human turn closing this claim's window was an
+                // interrupt: the text is still real evidence of what the
+                // agent was doing, but it is possible INTENT cut short, not a
+                // completion claim to check against the diff.
+                "window_interrupted": c.window_interrupted
+            })).collect::<Vec<_>>(),
+            "totals": totals,
+            "list_cap": k,
+            // The reviewer must know the full intent is available rather than
+            // guessing that what it received is everything there was.
+            "full_intent_via": "session_intent",
+            "truncated": longest > k || id_cut
+        })
+    })
 }
 
 fn excerpt(a: &Action) -> String {
@@ -1633,5 +1741,191 @@ mod tests {
             p["work_unit"]["session_ids"].as_array().unwrap().len(),
             sessions
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // review_context (v3)
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn review_context_carries_all_four_blocks_and_true_totals() {
+        // "3 shown" must never be mistaken for "3 happened": the same rule
+        // blind_spots already holds. Totals are unconditional; lists are a
+        // capped sample. Four blocks, not five: the heuristic `constraints`
+        // block (Task 9) was cut before implementation.
+        let human = r#"{"type":"user","timestamp":"2026-01-01T00:00:00Z","origin":{"kind":"human"},"message":{"content":"add a cache"}}"#;
+        let ask = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:01Z","message":{"content":[{"type":"tool_use","id":"q1","name":"AskUserQuestion","input":{"questions":[{"question":"Which store?","options":[{"label":"SQLite"},{"label":"JSONL"}]}]}}]}}"#;
+        let ans = r#"{"type":"user","timestamp":"2026-01-01T00:00:02Z","message":{"content":[{"type":"tool_result","tool_use_id":"q1"}]},"toolUseResult":{"answers":{"Which store?":"JSONL"}}}"#;
+        let task = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:03Z","message":{"content":[{"type":"tool_use","id":"t1","name":"TaskCreate","input":{"subject":"Add tests"}}]}}"#;
+        // A TaskCreate needs its paired result: the harness-assigned id in
+        // `toolUseResult.task.id` is the only source of truth for
+        // `TaskEvent::id` (a TaskCreate with no result produces no event at
+        // all, per ingest's `a_task_create_with_no_paired_result_produces_no_event`).
+        let task_result = r#"{"type":"user","timestamp":"2026-01-01T00:00:04Z","message":{"content":[{"type":"tool_result","tool_use_id":"t1"}]},"toolUseResult":{"task":{"id":"1","subject":"Add tests"}}}"#;
+        let s = crate::ingest::ingest_str(
+            &format!("{human}\n{ask}\n{ans}\n{task}\n{task_result}"),
+            crate::model::Lane::Main,
+        );
+        let meta = SessionMeta {
+            id: "s1".into(),
+            identified_by: "explicit".into(),
+            unit: None,
+        };
+
+        let p = review_context(&s, &meta);
+        assert_eq!(p["v"], 3, "new contract version");
+        assert_eq!(p["scope"]["requests"][0]["text"], "add a cache");
+        assert_eq!(p["decisions"][0]["chosen"], "JSONL");
+        assert_eq!(
+            p["decisions"][0]["options_not_chosen"][0], "SQLite",
+            "DecisionOut carries options_not_chosen, not rejected"
+        );
+        assert!(
+            p["decisions"][0]["idxs"].as_array().unwrap().len() == 1,
+            "the resolved AskUserQuestion action idx must be citable via evidence()"
+        );
+        assert_eq!(
+            p["incomplete"]["unfinished_tasks"][0]["subject"],
+            "Add tests"
+        );
+        assert_eq!(p["totals"]["decisions"], 1);
+        assert_eq!(p["totals"]["unfinished_tasks"], 1);
+        // Disclosure fields the brief's snapshot of the types could not know
+        // about: unattributed turns (scope) and excluded subagent prose
+        // (session-wide), surfaced alongside their respective blocks.
+        assert_eq!(p["scope"]["unattributed_turns"], 0);
+        assert_eq!(p["totals"]["agent_texts_excluded"], 0);
+    }
+
+    #[test]
+    fn review_context_tags_a_claim_closed_by_an_interrupt() {
+        // A reviewer must be able to tell a completion claim from text cut
+        // off mid-turn, or it will try to verify future intent against a
+        // diff. `window_interrupted` is the only source of that signal.
+        let human = r#"{"type":"user","timestamp":"2026-01-01T00:00:00Z","origin":{"kind":"human"},"message":{"content":"add a cache"}}"#;
+        let prose = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:01Z","message":{"content":[{"type":"text","text":"Let me check the tests"}]}}"#;
+        let interrupt = r#"{"type":"user","timestamp":"2026-01-01T00:00:02Z","message":{"content":"[Request interrupted by user]"}}"#;
+        let s = crate::ingest::ingest_str(
+            &format!("{human}\n{prose}\n{interrupt}"),
+            crate::model::Lane::Main,
+        );
+        let meta = SessionMeta {
+            id: "s1".into(),
+            identified_by: "explicit".into(),
+            unit: None,
+        };
+
+        let p = review_context(&s, &meta);
+        assert_eq!(p["claims"][0]["text"], "Let me check the tests");
+        assert_eq!(p["claims"][0]["window_interrupted"], true);
+    }
+
+    #[test]
+    fn review_context_stays_under_its_token_cap_on_a_dense_session() {
+        // A real session has 13 human messages and 60 prose blocks. Without
+        // shrink_to_fit this payload would blow past every other payload in
+        // the crate combined.
+        let mut lines = Vec::new();
+        for i in 0..40 {
+            let text = "z".repeat(400);
+            lines.push(format!(
+                r#"{{"type":"user","timestamp":"2026-01-01T00:00:{i:02}Z","origin":{{"kind":"human"}},"message":{{"content":"{text}"}}}}"#
+            ));
+            lines.push(format!(
+                r#"{{"type":"assistant","timestamp":"2026-01-01T00:01:{i:02}Z","message":{{"content":[{{"type":"text","text":"{text}"}}]}}}}"#
+            ));
+        }
+        let s = crate::ingest::ingest_str(&lines.join("\n"), crate::model::Lane::Main);
+        let meta = SessionMeta {
+            id: "s1".into(),
+            identified_by: "explicit".into(),
+            unit: None,
+        };
+
+        let p = review_context(&s, &meta);
+        assert!(
+            est_tokens(&p) <= CAP_REVIEW_CONTEXT,
+            "payload must fit its cap, got {}",
+            est_tokens(&p)
+        );
+        assert_eq!(p["truncated"], true, "and must say so");
+        assert_eq!(p["totals"]["claims"], 40, "true total survives the cap");
+    }
+
+    #[test]
+    fn review_context_reports_true_totals_for_every_block_when_every_list_is_capped() {
+        // Beyond the brief: a session with MORE items than CONTEXT_LIST_MAX
+        // in every block at once (requests, decisions, unfinished tasks,
+        // failing commands, claims), so a total that silently shrank with
+        // its list -- the exact failure mode this discipline exists to
+        // prevent -- would be caught here, not just for one block.
+        const N: usize = 15; // > CONTEXT_LIST_MAX (12)
+        let mut lines = Vec::new();
+        let mut ts = 0u32;
+        let mut next_ts = || {
+            let m = ts / 60;
+            let sec = ts % 60;
+            ts += 1;
+            format!("2026-01-01T00:{m:02}:{sec:02}Z")
+        };
+        for i in 0..N {
+            lines.push(format!(
+                r#"{{"type":"user","timestamp":"{}","origin":{{"kind":"human"}},"message":{{"content":"req {i}"}}}}"#,
+                next_ts()
+            ));
+            lines.push(format!(
+                r#"{{"type":"assistant","timestamp":"{}","message":{{"content":[{{"type":"text","text":"claim {i}"}}]}}}}"#,
+                next_ts()
+            ));
+            lines.push(format!(
+                r#"{{"type":"assistant","timestamp":"{}","message":{{"content":[{{"type":"tool_use","id":"q{i}","name":"AskUserQuestion","input":{{"questions":[{{"question":"Which store {i}?","options":[{{"label":"A"}},{{"label":"B"}}]}}]}}}}]}}}}"#,
+                next_ts()
+            ));
+            lines.push(format!(
+                r#"{{"type":"user","timestamp":"{}","message":{{"content":[{{"type":"tool_result","tool_use_id":"q{i}"}}]}},"toolUseResult":{{"answers":{{"Which store {i}?":"B"}}}}}}"#,
+                next_ts()
+            ));
+            lines.push(format!(
+                r#"{{"type":"assistant","timestamp":"{}","message":{{"content":[{{"type":"tool_use","id":"t{i}","name":"TaskCreate","input":{{"subject":"Task {i}"}}}}]}}}}"#,
+                next_ts()
+            ));
+            lines.push(format!(
+                r#"{{"type":"user","timestamp":"{}","message":{{"content":[{{"type":"tool_result","tool_use_id":"t{i}"}}]}},"toolUseResult":{{"task":{{"id":"{i}","subject":"Task {i}"}}}}}}"#,
+                next_ts()
+            ));
+            lines.push(format!(
+                r#"{{"type":"assistant","timestamp":"{}","message":{{"content":[{{"type":"tool_use","id":"b{i}","name":"Bash","input":{{"command":"cargo test {i}"}}}}]}}}}"#,
+                next_ts()
+            ));
+            lines.push(format!(
+                r#"{{"type":"user","timestamp":"{}","message":{{"content":[{{"type":"tool_result","tool_use_id":"b{i}","is_error":true}}]}}}}"#,
+                next_ts()
+            ));
+        }
+        let s = crate::ingest::ingest_str(&lines.join("\n"), crate::model::Lane::Main);
+        let meta = SessionMeta {
+            id: "s1".into(),
+            identified_by: "explicit".into(),
+            unit: None,
+        };
+
+        let p = review_context(&s, &meta);
+        assert_eq!(p["totals"]["requests"], N as u64, "requests total");
+        assert_eq!(p["totals"]["decisions"], N as u64, "decisions total");
+        assert_eq!(
+            p["totals"]["unfinished_tasks"], N as u64,
+            "unfinished_tasks total"
+        );
+        assert_eq!(
+            p["totals"]["failing_commands"], N as u64,
+            "failing_commands total: distinct validation commands, each failing"
+        );
+        assert_eq!(p["totals"]["claims"], N as u64, "claims total");
+        assert_eq!(p["truncated"], true, "every list above had to be capped");
+        assert!(
+            p["decisions"].as_array().unwrap().len() < N,
+            "the shown list is a sample, strictly smaller than the true total"
+        );
+        assert!(est_tokens(&p) <= CAP_REVIEW_CONTEXT);
     }
 }
