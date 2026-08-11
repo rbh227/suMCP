@@ -562,4 +562,40 @@ mod tests {
             "b's user text must carry b's slot (1), not the ingest-time default 0"
         );
     }
+
+    #[test]
+    fn main_and_subagent_lanes_can_each_hold_task_id_1_without_colliding() {
+        // Each transcript's harness numbers task ids from 1 independently, so
+        // a subagent's task "1" and the main lane's task "1" are unrelated
+        // tasks that merely share a string id. `merge_sessions` concatenates
+        // the subagent's task_events into the main lane's without
+        // renumbering anything, so if identity were `id` alone, a later
+        // final-state replay keyed on it would silently merge these two
+        // distinct tasks into one. `lane` must keep them apart.
+        use crate::ingest::ingest_str;
+
+        let main_create = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"tool_use","id":"m1","name":"TaskCreate","input":{"subject":"Main lane task"}}]}}"#;
+        let main_result = r#"{"type":"user","timestamp":"2026-01-01T00:00:01Z","message":{"content":[{"type":"tool_result","tool_use_id":"m1"}]},"toolUseResult":{"task":{"id":"1","subject":"Main lane task"}}}"#;
+        let mut main = ingest_str(&format!("{main_create}\n{main_result}"), Lane::Main);
+        main.spawns = vec![Spawn {
+            agent_id: Some("x".into()),
+        }];
+
+        let sub_create = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"tool_use","id":"s1","name":"TaskCreate","input":{"subject":"Subagent lane task"}}]}}"#;
+        let sub_result = r#"{"type":"user","timestamp":"2026-01-01T00:00:01Z","message":{"content":[{"type":"tool_result","tool_use_id":"s1"}]},"toolUseResult":{"task":{"id":"1","subject":"Subagent lane task"}}}"#;
+        let sub = ingest_str(
+            &format!("{sub_create}\n{sub_result}"),
+            Lane::Sub("x".into()),
+        );
+
+        let merged = merge_sessions(main, vec![sub], 0);
+
+        assert_eq!(merged.task_events.len(), 2, "both tasks kept, not merged");
+        assert!(merged.task_events.iter().any(|t| t.id == "1"
+            && t.lane == Lane::Main
+            && t.subject.as_deref() == Some("Main lane task")));
+        assert!(merged.task_events.iter().any(|t| t.id == "1"
+            && t.lane == Lane::Sub("x".into())
+            && t.subject.as_deref() == Some("Subagent lane task")));
+    }
 }

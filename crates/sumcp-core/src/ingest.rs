@@ -71,12 +71,17 @@ pub fn ingest_str(raw: &str, default_lane: Lane) -> Session {
         String,
         std::collections::BTreeMap<String, String>,
     > = std::collections::BTreeMap::new();
-    // Task ids are assigned by the harness and only echoed back as free text,
-    // so we number creates ourselves in the order they appear. The harness
-    // numbers them the same way, which is why a later TaskUpdate's taskId
-    // matches.
-    let mut task_events: Vec<TaskEvent> = Vec::new();
-    let mut creates_seen: u32 = 0;
+    // Task creates and updates, like decisions, arrive in two halves on
+    // different lines: the call, then its paired result. A create's real id
+    // is only reported in the result (`toolUseResult.task.id`), and an
+    // update can fail, in which case reporting the requested status as
+    // though it happened would hide genuinely unfinished work. Both are
+    // therefore staged here in the order they're seen and resolved by
+    // tool_use_id after the full pass, exactly like `pending_decisions`.
+    // `Session::task_events` documents itself as "in source order", so this
+    // stays a single ordered `Vec` rather than separate create/update lists
+    // that would need re-interleaving afterward.
+    let mut pending_task_events: Vec<PendingTaskEvent> = Vec::new();
 
     for (line_no, line) in raw.lines().enumerate() {
         if line.trim().is_empty() {
@@ -297,37 +302,39 @@ pub fn ingest_str(raw: &str, default_lane: Lane) -> Session {
                         // pending; TaskUpdate is a lifecycle event only when
                         // it carries a status (it is also used for renames
                         // and dependency edits, which are not evidence of
-                        // anything unfinished).
+                        // anything unfinished). Neither becomes a `TaskEvent`
+                        // yet: a create needs its result for the real id, and
+                        // an update needs its result to confirm the status
+                        // actually took. Both are staged for the join below.
                         if name == "TaskCreate" {
-                            creates_seen += 1;
-                            task_events.push(TaskEvent {
-                                id: creates_seen.to_string(),
+                            pending_task_events.push(PendingTaskEvent::Create {
+                                tool_use_id: tool_id.map(str::to_string),
                                 subject: input
                                     .and_then(|i| i.get("subject"))
                                     .and_then(Value::as_str)
                                     .map(str::to_string),
-                                status: "pending".to_string(),
                                 line_no,
-                                session_ix: 0,
+                                lane: default_lane.clone(),
                             });
                         } else if name == "TaskUpdate"
                             && let Some(status) = input
                                 .and_then(|i| i.get("status"))
                                 .and_then(Value::as_str)
                         {
-                            task_events.push(TaskEvent {
-                                id: input
+                            pending_task_events.push(PendingTaskEvent::Update {
+                                tool_use_id: tool_id.map(str::to_string),
+                                task_id: input
                                     .and_then(|i| i.get("taskId"))
                                     .and_then(Value::as_str)
                                     .unwrap_or("?")
                                     .to_string(),
+                                requested_status: status.to_string(),
                                 subject: input
                                     .and_then(|i| i.get("subject"))
                                     .and_then(Value::as_str)
                                     .map(str::to_string),
-                                status: status.to_string(),
                                 line_no,
-                                session_ix: 0,
+                                lane: default_lane.clone(),
                             });
                         }
 
@@ -412,6 +419,33 @@ pub fn ingest_str(raw: &str, default_lane: Lane) -> Session {
                                 .and_then(|r| r.get("agentId"))
                                 .and_then(Value::as_str)
                                 .map(str::to_string);
+                            // A TaskCreate result's real, harness-assigned id
+                            // (measured present in 78/78 real cases): the
+                            // only source of truth for `TaskEvent::id`, since
+                            // the id is otherwise reported only as free text.
+                            let task_id = v
+                                .get("toolUseResult")
+                                .and_then(|r| r.get("task"))
+                                .and_then(|t| t.get("id"))
+                                .and_then(Value::as_str)
+                                .map(str::to_string);
+                            // A TaskUpdate result's confirmation. `success`
+                            // gates whether the update happened at all;
+                            // `statusChange` is present in 120/121 measured
+                            // cases and, when present, is the confirmed
+                            // resulting status (preferred over the requested
+                            // one). The one older case without it still
+                            // carries `success`, which the join below falls
+                            // back on.
+                            let task_update_success = v
+                                .get("toolUseResult")
+                                .and_then(|r| r.get("success"))
+                                .and_then(Value::as_bool);
+                            let task_status_change = v
+                                .get("toolUseResult")
+                                .and_then(|r| r.get("statusChange"))
+                                .and_then(Value::as_str)
+                                .map(str::to_string);
                             results.insert(
                                 id.to_string(),
                                 ResultInfo {
@@ -422,6 +456,9 @@ pub fn ingest_str(raw: &str, default_lane: Lane) -> Session {
                                     result_ts: effective_ts.clone(),
                                     read_total_lines,
                                     agent_id,
+                                    task_id,
+                                    task_update_success,
+                                    task_status_change,
                                 },
                             );
                         }
@@ -516,6 +553,68 @@ pub fn ingest_str(raw: &str, default_lane: Lane) -> Session {
                     .cloned();
             }
             d
+        })
+        .collect();
+
+    // Resolve task creates and updates against their paired results, in the
+    // order they were seen (see `pending_task_events`'s declaration for why
+    // order is preserved through this join). `filter_map` drops an entry
+    // rather than inventing one: an interrupted session can leave a create
+    // or update with no result line at all, and that is exactly the case
+    // where fabricating a status would be worst.
+    let task_events: Vec<TaskEvent> = pending_task_events
+        .into_iter()
+        .filter_map(|p| match p {
+            PendingTaskEvent::Create {
+                tool_use_id,
+                subject,
+                line_no,
+                lane,
+            } => {
+                // No paired result, or a result that never reports the
+                // harness-assigned id: nothing to trust as this task's
+                // identity, so no event (FIX1's "interrupted session" case).
+                let id = tool_use_id
+                    .as_deref()
+                    .and_then(|id| results.get(id))
+                    .and_then(|r| r.task_id.clone())?;
+                Some(TaskEvent {
+                    id,
+                    subject,
+                    status: "pending".to_string(),
+                    line_no,
+                    session_ix: 0,
+                    lane,
+                })
+            }
+            PendingTaskEvent::Update {
+                tool_use_id,
+                task_id,
+                requested_status,
+                subject,
+                line_no,
+                lane,
+            } => {
+                let r = tool_use_id.as_deref().and_then(|id| results.get(id))?;
+                // Anything other than an explicit `success: true` is treated
+                // as unconfirmed: a failure, or a result that omits the key
+                // entirely, is not evidence the transition happened.
+                if r.task_update_success != Some(true) {
+                    return None;
+                }
+                let status = r
+                    .task_status_change
+                    .clone()
+                    .unwrap_or(requested_status);
+                Some(TaskEvent {
+                    id: task_id,
+                    subject,
+                    status,
+                    line_no,
+                    session_ix: 0,
+                    lane,
+                })
+            }
         })
         .collect();
 
@@ -621,6 +720,40 @@ struct ResultInfo {
     read_total_lines: Option<usize>,
     /// The child agent's id from a subagent spawn's `toolUseResult.agentId`.
     agent_id: Option<String>,
+    /// A TaskCreate result's harness-assigned id (`toolUseResult.task.id`).
+    task_id: Option<String>,
+    /// A TaskUpdate result's `success` flag.
+    task_update_success: Option<bool>,
+    /// A TaskUpdate result's confirmed status (`toolUseResult.statusChange`),
+    /// when the result shape carries one.
+    task_status_change: Option<String>,
+}
+
+/// A `TaskCreate` or `TaskUpdate` call, staged until its paired result comes
+/// back. Kept as one enum (not two separate `Vec`s) so the join below can
+/// walk both in the single order they were seen in the transcript, matching
+/// `Session::task_events`'s "in source order" contract.
+enum PendingTaskEvent {
+    /// The call that starts a task. Its real id is not known yet: the
+    /// harness reports it only in the paired result's `task.id`.
+    Create {
+        tool_use_id: Option<String>,
+        subject: Option<String>,
+        line_no: usize,
+        lane: Lane,
+    },
+    /// A status-carrying call. `task_id` comes straight from the call's own
+    /// `taskId` input (that part was never in question); `requested_status`
+    /// is what it asked for, which the join below only trusts once the
+    /// paired result confirms it.
+    Update {
+        tool_use_id: Option<String>,
+        task_id: String,
+        requested_status: String,
+        subject: Option<String>,
+        line_no: usize,
+        lane: Lane,
+    },
 }
 
 /// Hash (tool name + raw input JSON) for the loop detector: byte-identical
@@ -986,13 +1119,18 @@ mod tests {
         // completed means the commit is partial, and no reviewer can tell that
         // from the code.
         let create = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"tool_use","id":"t1","name":"TaskCreate","input":{"subject":"Wire the cache"}}]}}"#;
+        let create_result = r#"{"type":"user","timestamp":"2026-01-01T00:00:01Z","message":{"content":[{"type":"tool_result","tool_use_id":"t1"}]},"toolUseResult":{"task":{"id":"1","subject":"Wire the cache"}}}"#;
         let update = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:10Z","message":{"content":[{"type":"tool_use","id":"t2","name":"TaskUpdate","input":{"taskId":"1","status":"in_progress"}}]}}"#;
-        let s = ingest_str(&format!("{create}\n{update}"), Lane::Main);
+        let update_result = r#"{"type":"user","timestamp":"2026-01-01T00:00:11Z","message":{"content":[{"type":"tool_result","tool_use_id":"t2"}]},"toolUseResult":{"success":true,"taskId":"1","statusChange":"in_progress"}}"#;
+        let s = ingest_str(
+            &format!("{create}\n{create_result}\n{update}\n{update_result}"),
+            Lane::Main,
+        );
 
         assert_eq!(s.task_events.len(), 2);
         assert_eq!(s.task_events[0].subject.as_deref(), Some("Wire the cache"));
         assert_eq!(s.task_events[0].status, "pending", "a create starts pending");
-        assert_eq!(s.task_events[0].id, "1", "creates are numbered in order");
+        assert_eq!(s.task_events[0].id, "1", "id comes from the result");
         assert_eq!(s.task_events[1].id, "1");
         assert_eq!(s.task_events[1].status, "in_progress");
     }
@@ -1005,6 +1143,77 @@ mod tests {
         let s = ingest_str(update, Lane::Main);
 
         assert!(s.task_events.is_empty());
+    }
+
+    #[test]
+    fn a_task_create_takes_its_id_from_the_result_not_appearance_order() {
+        // The old code numbered creates 1..N in the order they appeared,
+        // assuming the harness numbers them identically. Real transcripts
+        // don't guarantee that (a task from an earlier, since-cleared list
+        // can leave the counter ahead), so the first create appearing here
+        // deliberately reports an id that is NOT "1".
+        let create = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"tool_use","id":"t1","name":"TaskCreate","input":{"subject":"Commit untracked VGGT scripts"}}]}}"#;
+        let create_result = r#"{"type":"user","timestamp":"2026-01-01T00:00:01Z","message":{"content":[{"type":"tool_result","tool_use_id":"t1"}]},"toolUseResult":{"task":{"id":"7","subject":"Commit untracked VGGT scripts"}}}"#;
+        let s = ingest_str(&format!("{create}\n{create_result}"), Lane::Main);
+
+        assert_eq!(s.task_events.len(), 1);
+        assert_eq!(
+            s.task_events[0].id, "7",
+            "the reported id, not the 1st-appearance position"
+        );
+    }
+
+    #[test]
+    fn a_task_create_with_no_paired_result_produces_no_event() {
+        // An interrupted session can leave a TaskCreate with no result line.
+        // With no result there is no real id to report, and inventing one
+        // (the old synthetic counter's behaviour) would be a fabrication.
+        let create = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"tool_use","id":"t1","name":"TaskCreate","input":{"subject":"Wire the cache"}}]}}"#;
+        let s = ingest_str(create, Lane::Main);
+
+        assert!(s.task_events.is_empty());
+    }
+
+    #[test]
+    fn a_task_update_whose_result_reports_failure_produces_no_event() {
+        // A failed update that requested "completed" must not be recorded as
+        // completed: that would hide genuinely unfinished work in exactly
+        // the block whose value is reporting it honestly.
+        let update = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:10Z","message":{"content":[{"type":"tool_use","id":"t2","name":"TaskUpdate","input":{"taskId":"1","status":"completed"}}]}}"#;
+        let update_result = r#"{"type":"user","timestamp":"2026-01-01T00:00:11Z","message":{"content":[{"type":"tool_result","tool_use_id":"t2"}]},"toolUseResult":{"success":false,"taskId":"1"}}"#;
+        let s = ingest_str(&format!("{update}\n{update_result}"), Lane::Main);
+
+        assert!(s.task_events.is_empty());
+    }
+
+    #[test]
+    fn a_task_update_result_with_status_change_uses_the_confirmed_status() {
+        // The result's `statusChange` is authoritative over the requested
+        // status: here the update asks for "completed" but the result
+        // confirms only "blocked" (e.g. an unmet dependency), and the
+        // recorded event must reflect what actually happened.
+        let update = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:10Z","message":{"content":[{"type":"tool_use","id":"t2","name":"TaskUpdate","input":{"taskId":"1","status":"completed"}}]}}"#;
+        let update_result = r#"{"type":"user","timestamp":"2026-01-01T00:00:11Z","message":{"content":[{"type":"tool_result","tool_use_id":"t2"}]},"toolUseResult":{"success":true,"taskId":"1","statusChange":"blocked"}}"#;
+        let s = ingest_str(&format!("{update}\n{update_result}"), Lane::Main);
+
+        assert_eq!(s.task_events.len(), 1);
+        assert_eq!(
+            s.task_events[0].status, "blocked",
+            "the confirmed status, not the requested one"
+        );
+    }
+
+    #[test]
+    fn a_task_update_result_without_status_change_falls_back_to_requested_status() {
+        // One measured real case carried `success` but no `statusChange`
+        // (an older result shape). `success: true` with nothing to override
+        // it is still a confirmation, so the requested status stands.
+        let update = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:10Z","message":{"content":[{"type":"tool_use","id":"t2","name":"TaskUpdate","input":{"taskId":"1","status":"in_progress"}}]}}"#;
+        let update_result = r#"{"type":"user","timestamp":"2026-01-01T00:00:11Z","message":{"content":[{"type":"tool_result","tool_use_id":"t2"}]},"toolUseResult":{"success":true,"taskId":"1"}}"#;
+        let s = ingest_str(&format!("{update}\n{update_result}"), Lane::Main);
+
+        assert_eq!(s.task_events.len(), 1);
+        assert_eq!(s.task_events[0].status, "in_progress");
     }
 
     #[test]
