@@ -5,7 +5,7 @@
 //! verbatim, with a citation. It never asserts that anything is acceptable or
 //! risky, because that judgement belongs to the agent consuming this.
 
-use crate::model::{ActionKind, Session, TurnOrigin};
+use crate::model::{ActionKind, Idx, Session, TurnOrigin};
 use std::collections::BTreeSet;
 
 /// One thing the human asked for, quoted exactly as written.
@@ -113,10 +113,72 @@ pub fn scope(s: &Session) -> Scope {
     }
 }
 
+/// A recorded human choice, rendered for the payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecisionOut {
+    /// The question, verbatim.
+    pub question: String,
+    /// What the human chose. `None` when the session ended unanswered, or
+    /// when one call asked two questions with identical text and its answers
+    /// map therefore cannot disambiguate them.
+    pub chosen: Option<String>,
+    /// The options that were turned down. When the answer was free text
+    /// matching no option, every option is here, which is the correct
+    /// reading: nothing on the menu was picked.
+    pub rejected: Vec<String>,
+    /// The asking action's index, so `evidence(idxs)` resolves this decision
+    /// to the raw transcript. Empty when no action matches, which is
+    /// possible if the asking call was deduped away as a replay.
+    pub idxs: Vec<Idx>,
+    /// Source line, kept alongside `idxs` because it is the key the index was
+    /// resolved from and it stays meaningful if resolution fails.
+    pub line_no: usize,
+    /// Which transcript of the work unit it came from.
+    pub session_ix: u16,
+}
+
+/// Extract the recorded human decisions.
+///
+/// WHY THE INDEX IS RESOLVED HERE AND NOT AT INGEST (decided 2026-08-11 after
+/// an adversarial review): both `merge_sessions` and `merge_work_unit`
+/// globally renumber `Action::idx` after interleaving, so an index captured
+/// during parsing would be stale by the time anything read it, and a stale
+/// citation is worse than an absent one. `Decision` therefore stores only
+/// `(session_ix, line_no)`, which never changes, and the index is looked up
+/// here against the already-merged session. Correct by construction, with no
+/// remapping step to forget.
+pub fn decisions(s: &Session) -> Vec<DecisionOut> {
+    s.decisions
+        .iter()
+        .map(|d| DecisionOut {
+            question: d.question.clone(),
+            chosen: d.answer.clone(),
+            rejected: d
+                .options
+                .iter()
+                // Everything that is not the answer was turned down. An
+                // unanswered question (answer: None) rejects nothing, since
+                // no choice was made at all.
+                .filter(|o| d.answer.as_deref().is_some_and(|a| a != o.as_str()))
+                .cloned()
+                .collect(),
+            idxs: s
+                .actions
+                .iter()
+                .filter(|a| a.session_ix == d.session_ix && a.line_no == d.line_no)
+                .map(|a| a.idx)
+                .collect(),
+            line_no: d.line_no,
+            session_ix: d.session_ix,
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ingest::ingest_str;
+    use crate::merge::merge_work_unit;
     use crate::model::Lane;
 
     #[test]
@@ -220,6 +282,81 @@ mod tests {
             scope(&s).files_edited,
             Vec::<String>::new(),
             "a failed Edit was attempted, not completed, so it must not appear as touched"
+        );
+    }
+
+    // ---- decisions() ----
+
+    #[test]
+    fn decisions_report_what_was_chosen_and_what_it_beat() {
+        let call = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"tool_use","id":"q1","name":"AskUserQuestion","input":{"questions":[{"question":"Which store?","options":[{"label":"SQLite"},{"label":"JSONL"},{"label":"memory"}]}]}}]}}"#;
+        let result = r#"{"type":"user","timestamp":"2026-01-01T00:00:05Z","message":{"content":[{"type":"tool_result","tool_use_id":"q1"}]},"toolUseResult":{"answers":{"Which store?":"JSONL"}}}"#;
+        let s = ingest_str(&format!("{call}\n{result}"), Lane::Main);
+
+        let d = decisions(&s);
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].chosen.as_deref(), Some("JSONL"));
+        assert_eq!(d[0].rejected, vec!["SQLite".to_string(), "memory".to_string()]);
+    }
+
+    #[test]
+    fn a_free_text_answer_rejects_every_offered_option() {
+        // The human answered "Other". Nothing on the menu was chosen, so
+        // every option was turned down, and the free text is the choice.
+        let call = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"tool_use","id":"q1","name":"AskUserQuestion","input":{"questions":[{"question":"Which store?","options":[{"label":"SQLite"},{"label":"JSONL"}]}]}}]}}"#;
+        let result = r#"{"type":"user","timestamp":"2026-01-01T00:00:05Z","message":{"content":[{"type":"tool_result","tool_use_id":"q1"}]},"toolUseResult":{"answers":{"Which store?":"keep it in memory"}}}"#;
+        let s = ingest_str(&format!("{call}\n{result}"), Lane::Main);
+
+        let d = decisions(&s);
+        assert_eq!(d[0].chosen.as_deref(), Some("keep it in memory"));
+        assert_eq!(d[0].rejected, vec!["SQLite".to_string(), "JSONL".to_string()]);
+    }
+
+    #[test]
+    fn a_decisions_idxs_survives_renumbering_by_merge_work_unit() {
+        // The whole point of resolving idxs here, against the already-merged
+        // session, rather than storing an index at parse time: both merge
+        // functions globally renumber Action::idx after interleaving two
+        // transcripts, so a parse-time index would go stale. Build a
+        // two-transcript work unit where the decision comes from the SECOND
+        // transcript (whose own pre-merge idx is 0, since it is that
+        // transcript's only action) and assert the resolved idxs points at
+        // the post-merge global idx, not the pre-merge local one.
+        let first_call = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"tool_use","id":"e1","name":"Edit","input":{"file_path":"/a.rs","old_string":"x","new_string":"y"}}]}}"#;
+        let first = ingest_str(first_call, Lane::Main);
+
+        let question_call = r#"{"type":"assistant","timestamp":"2026-01-01T00:01:00Z","message":{"content":[{"type":"tool_use","id":"q1","name":"AskUserQuestion","input":{"questions":[{"question":"Which store?","options":[{"label":"SQLite"},{"label":"JSONL"}]}]}}]}}"#;
+        let question_result = r#"{"type":"user","timestamp":"2026-01-01T00:01:05Z","message":{"content":[{"type":"tool_result","tool_use_id":"q1"}]},"toolUseResult":{"answers":{"Which store?":"JSONL"}}}"#;
+        let second = ingest_str(&format!("{question_call}\n{question_result}"), Lane::Main);
+
+        // Sanity check: within its own transcript, the asking action's idx
+        // is 0, the pre-merge local value that must NOT leak into the result.
+        assert_eq!(second.actions[0].idx, Idx(0));
+
+        let merged = merge_work_unit(vec![
+            ("first".to_string(), first),
+            ("second".to_string(), second),
+        ]);
+
+        // Post-merge, the first transcript's edit sorts before the second
+        // transcript's question (earlier timestamp), so the question's
+        // global idx is 1, not its pre-merge local 0.
+        assert_eq!(merged.actions.len(), 2);
+        let asking_idx = merged
+            .actions
+            .iter()
+            .find(|a| a.kind == crate::model::ActionKind::Other("AskUserQuestion".to_string()))
+            .expect("the asking action survives the merge")
+            .idx;
+        assert_eq!(asking_idx, Idx(1));
+
+        let d = decisions(&merged);
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].session_ix, 1, "the decision came from the second transcript");
+        assert_eq!(
+            d[0].idxs,
+            vec![Idx(1)],
+            "idxs must resolve to the post-merge global idx, not the pre-merge local 0"
         );
     }
 }
