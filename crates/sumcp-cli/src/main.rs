@@ -15,7 +15,9 @@ mod install;
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use sumcp_core::payloads::{SessionMeta, session_overview, unit_meta_from};
+use sumcp_core::payloads::{
+    SessionMeta, review_context, session_intent, session_overview, unit_meta_from,
+};
 use sumcp_core::score::rank;
 
 /// Post-session forensics for Claude Code sessions.
@@ -58,6 +60,34 @@ enum Command {
         /// Actually perform the removals (default is a dry-run preview).
         #[arg(long)]
         apply: bool,
+    },
+    /// Print the recorded-session-context payload for a reviewing agent:
+    /// the same data the MCP `review_context` / `session_intent` tools
+    /// serve, for a reviewer with no MCP wiring. This is the one entry
+    /// point that can genuinely resolve a commit range into a time window,
+    /// because it is the one that knows the working directory to run git
+    /// in; the MCP server has no repo path and deliberately has no range
+    /// parameter at all.
+    Context {
+        /// Path to a transcript `.jsonl` to analyze. Defaults to the most
+        /// recent session of the current directory's project, exactly like
+        /// bare `sumcp` (both go through the same target resolution, so
+        /// they never disagree about what "this session" means).
+        #[arg(long)]
+        file: Option<PathBuf>,
+        /// A git revision range (e.g. `HEAD~3..HEAD`) whose commit times
+        /// are reported as a sanity check on the session picked above.
+        /// Resolved with `git`, run in the current directory; an
+        /// unresolvable range is a hard error, never a silent fall back to
+        /// reporting the whole session, because answering about the wrong
+        /// sessions is the exact failure this feature exists to prevent.
+        #[arg(long)]
+        range: Option<String>,
+        /// Emit the `session_intent` payload (what the human asked for)
+        /// instead of the default `review_context` payload (what actually
+        /// happened).
+        #[arg(long)]
+        intent: bool,
     },
 }
 
@@ -152,7 +182,15 @@ fn claude_home_from(override_dir: Option<PathBuf>, home: Option<PathBuf>) -> Opt
 fn main() -> ExitCode {
     let args = Args::parse();
 
-    // Subcommands (the write path) short-circuit the analysis flow.
+    // These two lookups can fail (an environment with no `$HOME`, a deleted
+    // cwd); `resolve_target` decides whether that actually mattered, since
+    // `--file` and `--work-unit` both need neither. Computed up front (not
+    // just below the subcommand dispatch) because `Context` needs them too.
+    let home = claude_home();
+    let cwd = std::env::current_dir().ok();
+
+    // Subcommands (the write path, plus `Context`) short-circuit the
+    // analysis flow.
     match args.command {
         Some(Command::Install { apply }) => {
             return match install::cmd_install(apply) {
@@ -172,14 +210,16 @@ fn main() -> ExitCode {
                 }
             };
         }
+        Some(Command::Context {
+            file,
+            range,
+            intent,
+        }) => {
+            return cmd_context(file, range, intent, home.as_deref(), cwd.as_deref());
+        }
         None => {}
     }
 
-    // These two lookups can fail (an environment with no `$HOME`, a deleted
-    // cwd); `resolve_target` decides whether that actually mattered, since
-    // `--file` and `--work-unit` both need neither.
-    let home = claude_home();
-    let cwd = std::env::current_dir().ok();
     // `--file` and `--work-unit` conflict (clap enforces it, see `Args`), so
     // at most one of these is `Some`. `resolve_target` only decides the
     // PATH; which of the two scopes below reads that path is decided just
@@ -331,6 +371,163 @@ fn main() -> ExitCode {
             );
         }
     }
+    ExitCode::SUCCESS
+}
+
+/// `sumcp context`: print the recorded-session-context payload (the same
+/// `review_context` / `session_intent` data the MCP tools serve) for a
+/// reviewer with no MCP wiring. Target resolution goes through
+/// [`resolve_target`], the exact function bare `sumcp` uses, so the two
+/// paths never disagree about what "this session" means.
+///
+/// A `--range` is resolved into a Unix-epoch time window purely to REPORT
+/// it as a sanity check on the session picked above; nothing here compares
+/// it against the transcript's own timestamps. `work_unit::to_epoch_secs`,
+/// the one converter from a transcript's RFC 3339 string onto the same
+/// epoch-second footing [`sumcp_core::git::range_window`] returns, is
+/// `pub(crate)` to `sumcp-core` and unreachable from this crate. A hand
+/// rolled second comparison here (say, formatting the epoch bounds back to
+/// RFC 3339 and comparing strings) would risk exactly the silent wrong
+/// order bug that function's own doc comment warns about: two RFC 3339
+/// strings only sort chronologically when they share one exact width and
+/// format, and a hand rolled formatter has no guarantee of that against
+/// transcript timestamps it never parsed. So this function resolves and
+/// reports the window and stops there; it does not select or exclude
+/// anything by it.
+///
+/// An unresolvable range is still a hard error, never a silent fall back to
+/// reporting the whole session: reporting context from the wrong sessions
+/// is the precise failure this feature exists to prevent, and
+/// `range_window` already errors rather than guessing, so this function
+/// must not undo that by papering over the failure.
+fn cmd_context(
+    file: Option<PathBuf>,
+    range: Option<String>,
+    intent: bool,
+    home: Option<&Path>,
+    cwd: Option<&Path>,
+) -> ExitCode {
+    // Captured before `file` moves into `resolve_target`: it decides below
+    // whether the named transcript stays single-transcript (explicit path,
+    // explicit scope) or is read as its whole work unit (no path named, so
+    // "this session" means the same stretch of work bare `sumcp` reports).
+    let explicit_file = file.is_some();
+    let target = match resolve_target(file, home, cwd) {
+        Ok(t) => t,
+        Err(why) => {
+            match why {
+                NoTarget::NowhereToLook => {
+                    eprintln!("sumcp: cannot tell which project this is (no HOME, or the current");
+                    eprintln!("       directory is unreadable).");
+                }
+                NoTarget::NoSessions(searched) => {
+                    eprintln!("sumcp: no Claude Code sessions found for this project.");
+                    if let Some(cwd) = cwd {
+                        eprintln!("  cwd:      {}", cwd.display());
+                    }
+                    eprintln!("  searched: {}", searched.display());
+                    eprintln!("Claude Code stores transcripts per project directory, so run sumcp");
+                    eprintln!("from the directory you launched Claude Code in.");
+                }
+            }
+            eprintln!("To analyze a specific transcript instead:");
+            eprintln!("  sumcp context --file <transcript.jsonl> [--intent]");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // A range narrows nothing yet if git cannot answer; that is a hard
+    // error rather than a silent full-session answer (see this function's
+    // doc comment).
+    if let Some(r) = range.as_deref() {
+        let Some(dir) = cwd else {
+            eprintln!(
+                "sumcp: --range needs a readable current directory to run git in, and none was found"
+            );
+            return ExitCode::FAILURE;
+        };
+        match sumcp_core::git::range_window(dir, r) {
+            Ok((start, end)) => {
+                // Reported, not compared: see this function's doc comment.
+                eprintln!(
+                    "sumcp: range {r} covers work done strictly after epoch {start}s, up to and including epoch {end}s"
+                );
+            }
+            Err(e) => {
+                eprintln!("sumcp: could not resolve range '{r}': {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+
+    // The user never named this file, so say which session we picked. Goes
+    // to stderr on purpose: stdout must stay pipeable JSON.
+    if target.identified_by == "cli_latest" {
+        eprintln!(
+            "sumcp: analyzing most recent session {} ({})",
+            stem_id(&target.path),
+            target.path.display()
+        );
+    }
+
+    // Mirrors the default path's own explicit-vs-whole-unit split (see
+    // `main`, above): an explicit `--file` stays single-transcript, and
+    // everything else reads the whole work unit.
+    let (session, unit_meta) = if explicit_file {
+        let assembled = match sumcp_core::assemble::load_session(
+            &target.path,
+            sumcp_core::assemble::MAX_TRANSCRIPT_BYTES,
+        ) {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("sumcp: could not read {}: {e}", target.path.display());
+                return ExitCode::FAILURE;
+            }
+        };
+        let unit = sumcp_core::work_unit::discover_work_unit(&target.path);
+        if unit.members.len() > 1 {
+            let at = unit
+                .members
+                .iter()
+                .position(|m| m.path == target.path)
+                .map(|i| i + 1)
+                .unwrap_or(1);
+            eprintln!(
+                "note: this transcript is {at} of {} in a work unit; sumcp context stays \
+                 single-transcript for an explicit --file",
+                unit.members.len()
+            );
+        }
+        (assembled.session, None)
+    } else {
+        let assembled = match sumcp_core::assemble::load_work_unit(
+            &target.path,
+            sumcp_core::assemble::MAX_TRANSCRIPT_BYTES,
+        ) {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("sumcp: could not read {}: {e}", target.path.display());
+                return ExitCode::FAILURE;
+            }
+        };
+        let meta = unit_meta_from(&assembled);
+        (assembled.session, meta)
+    };
+
+    let meta = SessionMeta {
+        id: stem_id(&target.path),
+        identified_by: target.identified_by.into(),
+        unit: unit_meta,
+    };
+    let payload = if intent {
+        session_intent(&session, &meta, None)
+    } else {
+        review_context(&session, &meta)
+    };
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&payload).unwrap_or_default()
+    );
     ExitCode::SUCCESS
 }
 
