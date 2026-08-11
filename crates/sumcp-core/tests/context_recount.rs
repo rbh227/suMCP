@@ -1,29 +1,51 @@
 //! An independent, deliberately naive recount of the review-context blocks.
 //!
-//! The rule this enforces: a second implementation that shares NO code with
-//! the production path must agree exactly on every count. The production
-//! extractor is clever (it joins across lines by `tool_use_id`, dedups
-//! replays, replays task state to a final value, and windows prose against
-//! human turns); this one is stupid on purpose, re-parsing the raw JSON by
-//! hand. When they disagree, one of them is wrong, and a disagreement is the
-//! only cheap way to find out which.
-//!
 //! Precedent: `scripts/recount.py` caught a 3x undercount that 271 green
 //! tests missed, because every fixture shared the production blind spot.
-//! Extraction gets the same insurance.
+//! Extraction gets the same insurance: a second implementation, re-parsing
+//! the raw JSON by hand, whose counts must agree exactly with the production
+//! extractor's on every real transcript in the corpus.
 //!
-//! THE ONE PRODUCTION RULE THIS FILE IS PERMITTED TO MIRROR: `ingest_str`
-//! dedups `tool_use` blocks by id (a resumed session can replay the same
-//! call), and without that same dedup here a replayed AskUserQuestion,
-//! TaskCreate, TaskUpdate, or validation Bash call would be counted twice on
-//! this side while the production side counts it once, a disagreement that
-//! is about replay bookkeeping, not about the extraction rules this test
-//! actually exists to check. `seen_tool_use_ids` below is that one mirrored
-//! rule, applied the same way ingest.rs applies it: at the tool_use block,
-//! before any per-tool logic runs.
+//! What this file actually proves is not uniform, and an earlier version of
+//! this header claimed more than it should have ("shares NO code with the
+//! production path"). Read literally that is true of every function here,
+//! but it is rhetorically misleading: some of what agreement demonstrates is
+//! genuine independent correctness, and some of it is only consistency.
+//! Split explicitly into the two tiers an adversarial review asked for:
 //!
-//! This file was rewritten because the original brief encoded rules that no
-//! longer exist: an 80-character floor on claims/prose (measured and
+//! ## Tier 1: independently derived ALGORITHMS
+//!
+//! The claims windowing, the task-lifecycle replay, and the failing-commands
+//! replay below are each re-derived from the RULE STATEMENT in `context.rs`,
+//! not transliterated from its code. This is verifiable, not just claimed:
+//! the task replay's `or_insert` (this file) genuinely differs from
+//! production's overwrite-on-update, so the two would actually DISAGREE on a
+//! transcript where a task's create record arrives after an update to the
+//! same id: that disagreement never firing across 627 real transcripts is
+//! real evidence, because a bug in either side's algorithm had a concrete,
+//! checkable way to surface. For this tier, exact agreement across the whole
+//! corpus is evidence of CORRECTNESS, not just of consistent application.
+//!
+//! ## Tier 2: mirrored DEFINITIONAL CONSTANTS
+//!
+//! `is_harness_notice`, `extract_user_text`, `origin_of`, and
+//! `is_validation_naive` below are not re-derivations: each is the same
+//! marker set, needle list, or shape re-typed by hand from the production
+//! function it mirrors (their own doc comments say so). So is
+//! `seen_tool_use_ids`'s tool_use-id dedup, mirroring the one rule the
+//! original header named explicitly. For this tier, agreement proves only
+//! that BOTH sides applied the same definition consistently; it cannot
+//! catch a definition that is wrong on both sides at once. If a future
+//! harness-notice wording is missing from the three markers here, or an
+//! eighth validation needle turns out to need a ninth, this gate is
+//! structurally blind to it: both sides would miss it identically and still
+//! agree. Correctness for this tier rests on the ingest-side measurement
+//! that picked the definition in the first place (the 42-record marker
+//! survey behind `is_harness_notice`, cited in `ingest.rs`), not on anything
+//! this file can independently check.
+//!
+//! This file was also rewritten because the original brief encoded rules
+//! that no longer exist: an 80-character floor on claims/prose (measured and
 //! rejected; see `context::claims`'s doc comment) and a global, un-scoped
 //! prose/boundary walk (the real rule is scoped per transcript, since
 //! `line_no` is only meaningful within one transcript's own file). Both are
@@ -35,8 +57,11 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 // ---------------------------------------------------------------------
-// Shared micro-helpers. Each one is a direct, independent reading of one
-// documented rule from ingest.rs/context.rs, not a call into either file.
+// Shared micro-helpers. Each is a direct reading of one documented rule
+// from ingest.rs/context.rs, re-typed here rather than called from either
+// file. Most of the ones below are Tier 2 (mirrored constants: see the
+// module doc) -- `is_harness_notice`, `extract_user_text`, `origin_of`, and
+// `is_validation_naive` are named there explicitly.
 // ---------------------------------------------------------------------
 
 /// Mirrors `ingest.rs`'s harness-notice check: a record Claude Code injects

@@ -229,6 +229,67 @@ fn finding_session(s: &Session, meta: &SessionMeta, idxs: &[Idx]) -> Option<Stri
         .map(|x| short_id(x))
 }
 
+/// Which transcript an item's own `session_ix` names, as a short id. Same
+/// conditionality as `finding_session` (a `work_unit` block must be present
+/// AND the unit must actually span more than one transcript), but for the
+/// `context` module's extraction structs (`Request`, `DecisionOut`,
+/// `UnfinishedTask`, `Claim`), which already carry `session_ix` directly
+/// rather than needing it resolved through an `Idx` into `Session::actions`.
+///
+/// This is the fix for the v3 payload citation gap: `review_context` and
+/// `session_intent` cover the whole work unit by default, where `line_no`
+/// alone is per-transcript and collides across members, so a bare "line": 7
+/// cannot say which transcript it names. Adding this alongside `line` (only
+/// when there is more than one transcript to disambiguate) makes every
+/// citation resolvable again without touching the single-transcript shape.
+fn item_session(s: &Session, meta: &SessionMeta, session_ix: u16) -> Option<String> {
+    if meta.unit.is_none() || s.session_ids.len() < 2 {
+        return None;
+    }
+    s.session_ids.get(session_ix as usize).map(|x| short_id(x))
+}
+
+/// The `work_unit` disclosure block, from `meta.unit`: which physically
+/// separate transcripts were merged into this analysis, the rule that
+/// merged them, and the gaps between them. `None` for a single-transcript
+/// analysis (no `unit` supplied), which is what keeps that payload
+/// byte-identical to v0.1/v2 apart from the version bump.
+///
+/// Shared by `session_overview` (its original home) and `review_context`
+/// (Important #2's fix: without this, a multi-transcript `review_context`
+/// payload discloses nowhere that several transcripts were merged at all).
+/// The second element of the returned pair is "did rendering this block
+/// have to elide a timestamp", which the caller folds into its own
+/// `truncated` the same way `session_overview` always has: only ever
+/// flipping it to `true`, never masking an earlier cut.
+fn work_unit_block(meta: &SessionMeta) -> Option<(Value, bool)> {
+    let u = meta.unit.as_ref()?;
+    // See `session_overview`'s inline comment (same elision, same reason):
+    // `span_start`/`span_end` are scraped straight out of a transcript's
+    // JSONL lines and are therefore untrusted, caller-controlled text.
+    let span_start_cut = would_elide(&u.span_start, TS_MAX);
+    let span_end_cut = would_elide(&u.span_end, TS_MAX);
+    let block = json!({
+        "rule": WORK_UNIT_RULE,
+        "sessions": u.sessions,
+        "joined_gaps_min": u.joined_gaps_min.iter().copied().map(round2).collect::<Vec<_>>(),
+        "span_start": elide_middle(&u.span_start, TS_MAX),
+        "span_end": elide_middle(&u.span_end, TS_MAX),
+        "session_ids": u.session_ids
+            .iter()
+            .map(|s| short_id(s))
+            .collect::<Vec<_>>(),
+        "dropped": u.dropped,
+        // The two exclusion disclosures (spec §8): members of this unit that
+        // could not be loaded, and same-directory transcripts that could not
+        // be placed in time at all. Always present so the shape is stable;
+        // both are usually 0.
+        "members_unreadable": u.members_unreadable,
+        "siblings_unplaced": u.siblings_unplaced,
+    });
+    Some((block, span_start_cut || span_end_cut))
+}
+
 /// The `session` envelope block with the id capped (see `SESSION_ID_MAX`).
 /// Returns the block plus "did the id have to be cut", which every builder
 /// folds into its `truncated` flag.
@@ -473,48 +534,19 @@ pub fn session_overview(s: &Session, ranked: &[FileScore], meta: &SessionMeta) -
         // the rule states itself, and the actual gaps are listed, so any
         // grouping can be checked by hand. Absent entirely for a
         // single-transcript analysis, which is what keeps that payload
-        // byte-identical to v0.1 apart from the version bump.
-        if let Some(u) = &meta.unit {
-            // `span_start`/`span_end` come from `TranscriptSpan { first, last }`,
-            // which is scraped straight out of a transcript's JSONL lines: it is
-            // untrusted, caller-controlled text, not something suMCP generates.
-            // Every other timestamp in this file goes through the same
-            // `elide_middle`/`TS_MAX` pair for exactly that reason (see
-            // `started` above, and `file_story`'s and `evidence`'s `t` fields).
-            // It matters more here than elsewhere: `work_unit` is MEASURED by
-            // the `shrink_to_fit` loop above but is not one of its knobs (the
-            // loop only shrinks `unknown_event_types`), so a transcript whose
-            // timestamp field is a 20 KB string would blow `CAP_OVERVIEW` with
-            // nothing left able to trim it back down.
-            let span_start_cut = would_elide(&u.span_start, TS_MAX);
-            let span_end_cut = would_elide(&u.span_end, TS_MAX);
-            out["work_unit"] = json!({
-                "rule": WORK_UNIT_RULE,
-                "sessions": u.sessions,
-                // Rounded like every other float in this module (`round2`): an
-                // unrounded gap serializes as up to 17 characters (e.g. a real
-                // 331-second gap is "5.516666666666667"), roughly 3x the token
-                // cost of the rounded value, for precision nobody reads.
-                "joined_gaps_min": u.joined_gaps_min.iter().copied().map(round2).collect::<Vec<_>>(),
-                "span_start": elide_middle(&u.span_start, TS_MAX),
-                "span_end": elide_middle(&u.span_end, TS_MAX),
-                "session_ids": u.session_ids
-                    .iter()
-                    .map(|s| short_id(s))
-                    .collect::<Vec<_>>(),
-                "dropped": u.dropped,
-                // The two exclusion disclosures (spec §8): members of this
-                // unit that could not be loaded, and same-directory
-                // transcripts that could not be placed in time at all.
-                // Always present so the shape is stable; both are usually 0.
-                "members_unreadable": u.members_unreadable,
-                "siblings_unplaced": u.siblings_unplaced,
-            });
+        // byte-identical to v0.1 apart from the version bump. Note that
+        // `work_unit` is MEASURED by the `shrink_to_fit` loop above but is
+        // not one of its knobs (the loop only shrinks `unknown_event_types`),
+        // so a transcript whose timestamp field is a 20 KB string would blow
+        // `CAP_OVERVIEW` with nothing left able to trim it back down; that is
+        // why `work_unit_block` elides its own timestamps independently.
+        if let Some((block, cut)) = work_unit_block(meta) {
+            out["work_unit"] = block;
             // Fold into the same `truncated` disclosure every other cut in this
             // file uses: only ever flip it to `true`, never back to `false`,
             // so an earlier cut (a sampled type map, a capped id) can never be
             // masked by this one not firing.
-            if span_start_cut || span_end_cut {
+            if cut {
                 out["truncated"] = json!(true);
             }
         }
@@ -965,14 +997,26 @@ pub fn review_context(s: &Session, meta: &SessionMeta) -> Value {
         let string_cut =
             requests_cut || files_cut || decisions_cut || tasks_cut || commands_cut || claims_cut;
 
-        json!({
+        let mut out = json!({
             "v": 3,
             "session": session,
             "scope": {
-                "requests": scope.requests.iter().take(k).map(|r| json!({
-                    "text": elide_middle(&r.text, QUOTE_MAX),
-                    "line": r.line_no
-                })).collect::<Vec<_>>(),
+                "requests": scope.requests.iter().take(k).map(|r| {
+                    let mut v = json!({
+                        "text": elide_middle(&r.text, QUOTE_MAX),
+                        "line": r.line_no
+                    });
+                    // Only present for a multi-transcript work unit (see
+                    // `item_session`): `line_no` alone is per-transcript and
+                    // collides across members once several transcripts are
+                    // in scope, so this is what makes the citation resolve.
+                    // Absent for single-transcript payloads, which keeps
+                    // that shape byte-identical to before this fix.
+                    if let Some(sess) = item_session(s, meta, r.session_ix) {
+                        v["session"] = json!(sess);
+                    }
+                    v
+                }).collect::<Vec<_>>(),
                 "files_edited": scope.files_edited.iter().take(k).map(|f| json!(
                     elide_middle(f, PATH_MAX)
                 )).collect::<Vec<_>>(),
@@ -983,49 +1027,71 @@ pub fn review_context(s: &Session, meta: &SessionMeta) -> Value {
                 // would misrepresent how complete the quoted intent is.
                 "unattributed_turns": scope.unattributed_turns
             },
-            "decisions": decisions.iter().take(k).map(|d| json!({
-                "question": elide_middle(&d.question, QUOTE_MAX),
-                "chosen": d.chosen.as_ref().map(|c| elide_middle(c, QUOTE_MAX)),
-                // Capped and elided like every other transcript-derived
-                // list/string pair here: an AskUserQuestion can carry an
-                // arbitrary number of options, each an arbitrary-length
-                // label, and both were unbounded before this fix.
-                "options_not_chosen": d.options_not_chosen.iter().take(k)
-                    .map(|o| json!(elide_middle(o, QUOTE_MAX)))
-                    .collect::<Vec<_>>(),
-                "options_not_chosen_total": d.options_not_chosen.len(),
-                // idxs, not just a line number: the Global Constraint is that
-                // every item is dereferenceable, and `evidence()` takes Idx.
-                // A bare line number is not something a reviewer can resolve.
-                "idxs": d.idxs.iter().take(FINDING_IDXS_MAX).collect::<Vec<_>>(),
-                "line": d.line_no
-            })).collect::<Vec<_>>(),
+            "decisions": decisions.iter().take(k).map(|d| {
+                let mut v = json!({
+                    "question": elide_middle(&d.question, QUOTE_MAX),
+                    "chosen": d.chosen.as_ref().map(|c| elide_middle(c, QUOTE_MAX)),
+                    // Capped and elided like every other transcript-derived
+                    // list/string pair here: an AskUserQuestion can carry an
+                    // arbitrary number of options, each an arbitrary-length
+                    // label, and both were unbounded before this fix.
+                    "options_not_chosen": d.options_not_chosen.iter().take(k)
+                        .map(|o| json!(elide_middle(o, QUOTE_MAX)))
+                        .collect::<Vec<_>>(),
+                    "options_not_chosen_total": d.options_not_chosen.len(),
+                    // idxs, not just a line number: the Global Constraint is that
+                    // every item is dereferenceable, and `evidence()` takes Idx.
+                    // A bare line number is not something a reviewer can resolve.
+                    "idxs": d.idxs.iter().take(FINDING_IDXS_MAX).collect::<Vec<_>>(),
+                    "line": d.line_no
+                });
+                // Alongside `line` for the same reason as `requests` above:
+                // `idxs` only dereferences when `resolution` is `Resolved`
+                // (see `Resolution`), so `line` (and now `session`) remains
+                // the only citation for a `NotFound` or `Ambiguous` decision.
+                if let Some(sess) = item_session(s, meta, d.session_ix) {
+                    v["session"] = json!(sess);
+                }
+                v
+            }).collect::<Vec<_>>(),
             "incomplete": {
                 "unfinished_tasks": incomplete.unfinished_tasks.iter().take(k)
-                    .map(|t| json!({
-                        "subject": t.subject.as_ref().map(|x| elide_middle(x, QUOTE_MAX)),
-                        // Elided like every other transcript-derived string:
-                        // this is the harness-confirmed `statusChange` (or
-                        // requested status) verbatim from the transcript,
-                        // not a value suMCP controls.
-                        "last_status": elide_middle(&t.last_status, QUOTE_MAX),
-                        "line": t.line_no
-                    })).collect::<Vec<_>>(),
+                    .map(|t| {
+                        let mut v = json!({
+                            "subject": t.subject.as_ref().map(|x| elide_middle(x, QUOTE_MAX)),
+                            // Elided like every other transcript-derived string:
+                            // this is the harness-confirmed `statusChange` (or
+                            // requested status) verbatim from the transcript,
+                            // not a value suMCP controls.
+                            "last_status": elide_middle(&t.last_status, QUOTE_MAX),
+                            "line": t.line_no
+                        });
+                        if let Some(sess) = item_session(s, meta, t.session_ix) {
+                            v["session"] = json!(sess);
+                        }
+                        v
+                    }).collect::<Vec<_>>(),
                 "failing_commands": incomplete.failing_commands.iter().take(k)
                     .map(|c| json!({
                         "command": elide_middle(&c.command, QUOTE_MAX),
                         "idxs": [c.idx]
                     })).collect::<Vec<_>>()
             },
-            "claims": claims.iter().take(k).map(|c| json!({
-                "text": elide_middle(&c.text, QUOTE_MAX),
-                "line": c.line_no,
-                // True when the human turn closing this claim's window was an
-                // interrupt: the text is still real evidence of what the
-                // agent was doing, but it is possible INTENT cut short, not a
-                // completion claim to check against the diff.
-                "window_interrupted": c.window_interrupted
-            })).collect::<Vec<_>>(),
+            "claims": claims.iter().take(k).map(|c| {
+                let mut v = json!({
+                    "text": elide_middle(&c.text, QUOTE_MAX),
+                    "line": c.line_no,
+                    // True when the human turn closing this claim's window was an
+                    // interrupt: the text is still real evidence of what the
+                    // agent was doing, but it is possible INTENT cut short, not a
+                    // completion claim to check against the diff.
+                    "window_interrupted": c.window_interrupted
+                });
+                if let Some(sess) = item_session(s, meta, c.session_ix) {
+                    v["session"] = json!(sess);
+                }
+                v
+            }).collect::<Vec<_>>(),
             "totals": totals,
             "list_cap": k,
             "coverage": coverage,
@@ -1036,7 +1102,18 @@ pub fn review_context(s: &Session, meta: &SessionMeta) -> Value {
             // `coverage` for what it genuinely cannot recover.
             "attributed_intent_via": "session_intent",
             "truncated": longest > k || id_cut || string_cut
-        })
+        });
+        // Same disclosure `session_overview` carries (Important #2's fix):
+        // without this, a multi-transcript `review_context` payload never
+        // says that several transcripts were merged at all, even once the
+        // per-item `session` keys above start appearing.
+        if let Some((block, cut)) = work_unit_block(meta) {
+            out["work_unit"] = block;
+            if cut {
+                out["truncated"] = json!(true);
+            }
+        }
+        out
     })
 }
 
@@ -1124,7 +1201,18 @@ pub fn session_intent(s: &Session, meta: &SessionMeta, max_tokens: Option<usize>
         "note": "requests re-derives the same attributed requests scope() produced, in full; it cannot recover unattributed_turns (unknown-origin turns, never attributed to begin with)"
     });
 
-    let build = |kept: &[Value], omitted_for_size: usize, budget_too_small: bool| {
+    // `min_viable_tokens` is threaded through `build` as a real field (Fix
+    // E / Minor 5), not appended to the returned payload afterward. Before
+    // this fix it was added AFTER every `est_tokens(...) > cap` check below
+    // had already passed, so a budget sitting right at the envelope's true
+    // size could see a payload that measured under `cap` without the field
+    // and then grew past it once the field was tacked on, silently
+    // overshooting a caller's tight budget while still reporting
+    // `budget_too_small: false`.
+    let build = |kept: &[Value],
+                 omitted_for_size: usize,
+                 budget_too_small: bool,
+                 min_viable_tokens: usize| {
         json!({
             "v": 3,
             "session": session.clone(),
@@ -1134,6 +1222,7 @@ pub fn session_intent(s: &Session, meta: &SessionMeta, max_tokens: Option<usize>
             "requests_omitted_for_size": omitted_for_size,
             "request_coverage": request_coverage.clone(),
             "budget_too_small": budget_too_small,
+            "min_viable_tokens": min_viable_tokens,
             "truncated": omitted_for_size > 0 || id_cut || budget_too_small
         })
     };
@@ -1142,12 +1231,24 @@ pub fn session_intent(s: &Session, meta: &SessionMeta, max_tokens: Option<usize>
     // shrink to. `omitted_for_size` is reported as every request here,
     // which is accurate: if even the empty envelope does not fit `cap`, no
     // single request can fit alongside it either.
-    let envelope = build(&[], total, false);
-    let min_viable_tokens = est_tokens(&envelope);
+    //
+    // `min_viable_tokens` is itself part of the envelope it measures, so
+    // this is a small fixed point: seed at 0, remeasure with the field
+    // included, and repeat until the measured size stops changing. This
+    // converges in one or two steps in practice (`est_tokens` only moves
+    // when the field's own digit count crosses a `CHARS_PER_TOKEN`
+    // boundary), and is bounded here so a pathological estimator can never
+    // loop forever.
+    let mut min_viable_tokens = 0usize;
+    for _ in 0..8 {
+        let next = est_tokens(&build(&[], total, false, min_viable_tokens));
+        if next == min_viable_tokens {
+            break;
+        }
+        min_viable_tokens = next;
+    }
     if min_viable_tokens > cap {
-        let mut too_small = build(&[], total, true);
-        too_small["min_viable_tokens"] = json!(min_viable_tokens);
-        return too_small;
+        return build(&[], total, true, min_viable_tokens);
     }
 
     // Fix 1: pack individually. Push each candidate, keep it if the payload
@@ -1155,25 +1256,41 @@ pub fn session_intent(s: &Session, meta: &SessionMeta, max_tokens: Option<usize>
     // size, then move on to the NEXT request rather than giving up. Every
     // request in `scope.requests` is considered; the token budget is the
     // only bound.
+    //
+    // Minor 6: `est_tokens(&build(&kept, ...))` re-serializes the WHOLE
+    // payload (envelope + every request kept so far) on every iteration, so
+    // this loop is quadratic in the number of requests, not linear. Accepted
+    // as-is: real sessions measured ~22 requests, where the quadratic factor
+    // is noise. If this ever shows up in a profile, the fix is an
+    // incremental token accumulator (track the running total's own token
+    // estimate and add each candidate's marginal cost, rather than
+    // re-measuring the JSON string from scratch) threaded alongside `kept`
+    // instead of recomputed here.
     let mut kept: Vec<Value> = Vec::new();
     let mut omitted_for_size = 0usize;
     for r in &scope.requests {
-        kept.push(json!({
+        let mut item = json!({
             // NOT elided: the entire point of this tool is the full text.
             // If a request does not fit, it is dropped whole (below) rather
             // than mutilated.
             "text": r.text,
             "line": r.line_no
-        }));
-        if est_tokens(&build(&kept, omitted_for_size, false)) > cap {
+        });
+        // Same fix as `review_context`'s requests (Important #2): a bare
+        // `line` is per-transcript and collides across members once this
+        // covers a multi-transcript work unit, which is the default scope.
+        // Absent for single-transcript payloads, so that shape is unchanged.
+        if let Some(sess) = item_session(s, meta, r.session_ix) {
+            item["session"] = json!(sess);
+        }
+        kept.push(item);
+        if est_tokens(&build(&kept, omitted_for_size, false, min_viable_tokens)) > cap {
             kept.pop();
             omitted_for_size += 1;
         }
     }
 
-    let mut payload = build(&kept, omitted_for_size, false);
-    payload["min_viable_tokens"] = json!(min_viable_tokens);
-    payload
+    build(&kept, omitted_for_size, false, min_viable_tokens)
 }
 
 fn excerpt(a: &Action) -> String {
@@ -2037,6 +2154,74 @@ mod tests {
         // (session-wide), surfaced alongside their respective blocks.
         assert_eq!(p["scope"]["unattributed_turns"], 0);
         assert_eq!(p["totals"]["agent_texts_excluded"], 0);
+        // Single-transcript byte-stability guard (Important #2): with no
+        // work unit supplied, none of the four blocks may carry a `session`
+        // key, and the payload must not carry a `work_unit` block either.
+        assert!(p.get("work_unit").is_none());
+        assert!(p["scope"]["requests"][0].get("session").is_none());
+        assert!(p["decisions"][0].get("session").is_none());
+        assert!(
+            p["incomplete"]["unfinished_tasks"][0]
+                .get("session")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn review_context_discloses_work_unit_and_stamps_every_block_with_its_transcript() {
+        // Important #2: both MCP tools and bare `sumcp context` cover the
+        // WHOLE work unit by default, where `line_no` collides across
+        // transcripts. This is the multi-transcript counterpart of
+        // `review_context_carries_all_four_blocks_and_true_totals`: same
+        // four blocks, but hand-stamped as transcript 1 of 2 (the same
+        // pattern `blind_spots_stamps_a_finding_with_the_transcript_it_came_from`
+        // uses) so every citation can be checked against `session_ids[1]`.
+        let human = r#"{"type":"user","timestamp":"2026-01-01T00:00:00Z","origin":{"kind":"human"},"message":{"content":"add a cache"}}"#;
+        let ask = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:01Z","message":{"content":[{"type":"tool_use","id":"q1","name":"AskUserQuestion","input":{"questions":[{"question":"Which store?","options":[{"label":"SQLite"},{"label":"JSONL"}]}]}}]}}"#;
+        let ans = r#"{"type":"user","timestamp":"2026-01-01T00:00:02Z","message":{"content":[{"type":"tool_result","tool_use_id":"q1"}]},"toolUseResult":{"answers":{"Which store?":"JSONL"}}}"#;
+        let task = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:03Z","message":{"content":[{"type":"tool_use","id":"t1","name":"TaskCreate","input":{"subject":"Add tests"}}]}}"#;
+        let task_result = r#"{"type":"user","timestamp":"2026-01-01T00:00:04Z","message":{"content":[{"type":"tool_result","tool_use_id":"t1"}]},"toolUseResult":{"task":{"id":"1","subject":"Add tests"}}}"#;
+        let claim = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:05Z","message":{"content":[{"type":"text","text":"Done, nothing to change."}]}}"#;
+        let mut s = crate::ingest::ingest_str(
+            &format!("{human}\n{ask}\n{ans}\n{task}\n{task_result}\n{claim}"),
+            crate::model::Lane::Main,
+        );
+        // Hand-stamp as transcript 1 of 2, exactly as a real work-unit merge
+        // would number a second transcript's records.
+        for a in &mut s.actions {
+            a.session_ix = 1;
+        }
+        for u in &mut s.user_texts {
+            u.session_ix = 1;
+        }
+        for d in &mut s.decisions {
+            d.session_ix = 1;
+        }
+        for t in &mut s.task_events {
+            t.session_ix = 1;
+        }
+        for t in &mut s.agent_texts {
+            t.session_ix = 1;
+        }
+        s.session_ids = vec!["aaaaaaaa".into(), "bbbbbbbb".into()];
+
+        let p = review_context(&s, &meta_with_unit());
+
+        // Same disclosure `session_overview` carries: the payload must say
+        // several transcripts were merged, not just stamp individual items.
+        assert_eq!(p["work_unit"]["sessions"], 2);
+        assert_eq!(p["work_unit"]["session_ids"].as_array().unwrap().len(), 2);
+
+        assert_eq!(
+            p["scope"]["requests"][0]["session"], "bbbbbbbb",
+            "a bare line collides across transcripts; session disambiguates it"
+        );
+        assert_eq!(p["decisions"][0]["session"], "bbbbbbbb");
+        assert_eq!(
+            p["incomplete"]["unfinished_tasks"][0]["session"],
+            "bbbbbbbb"
+        );
+        assert_eq!(p["claims"][0]["session"], "bbbbbbbb");
     }
 
     #[test]
@@ -2297,6 +2482,31 @@ mod tests {
     }
 
     #[test]
+    fn session_intent_stamps_requests_with_their_transcript_only_when_multi_transcript() {
+        // Same fix as `review_context`'s requests (Important #2): a bare
+        // `line` collides across transcripts once the default whole-work-unit
+        // scope covers more than one. Single-transcript call carries no
+        // `session` key (byte-stability); the two-transcript call does.
+        let human = r#"{"type":"user","timestamp":"2026-01-01T00:00:00Z","origin":{"kind":"human"},"message":{"content":"add a cache"}}"#;
+        let s = crate::ingest::ingest_str(human, crate::model::Lane::Main);
+        let meta = SessionMeta {
+            id: "s1".into(),
+            identified_by: "explicit".into(),
+            unit: None,
+        };
+        let single = session_intent(&s, &meta, None);
+        assert!(single["requests"][0].get("session").is_none());
+
+        let mut multi = s;
+        for u in &mut multi.user_texts {
+            u.session_ix = 1;
+        }
+        multi.session_ids = vec!["aaaaaaaa".into(), "bbbbbbbb".into()];
+        let p = session_intent(&multi, &meta_with_unit(), None);
+        assert_eq!(p["requests"][0]["session"], "bbbbbbbb");
+    }
+
+    #[test]
     fn session_intent_max_tokens_can_only_lower_the_cap_never_raise_it() {
         // Item 2 (task-11 brief context): a caller-supplied budget larger
         // than CAP_INTENT must be clamped down, never honored as a bigger
@@ -2523,6 +2733,46 @@ mod tests {
             fits["budget_too_small"], false,
             "a cap exactly at the envelope's size must be honored, not flagged"
         );
+    }
+
+    #[test]
+    fn session_intent_never_overshoots_a_budget_at_the_boundary() {
+        // Minor 5 / Fix E: `min_viable_tokens` used to be appended to the
+        // payload AFTER the packing loop's `est_tokens(...) > cap` check had
+        // already passed, so the field's own tokens were never part of what
+        // was measured against `cap`. A budget sitting exactly at (or just
+        // above) the true envelope size could come back bigger than the cap
+        // it claimed to honor, with `budget_too_small: false`. Now
+        // `min_viable_tokens` is threaded through `build` and included in
+        // every measurement, so this must hold for every cap at or above the
+        // envelope: the returned payload never exceeds the cap it was asked
+        // to fit inside.
+        let mut lines = Vec::new();
+        for i in 0..8 {
+            lines.push(format!(
+                r#"{{"type":"user","timestamp":"2026-01-01T00:00:{i:02}Z","origin":{{"kind":"human"}},"message":{{"content":"request number {i}, please handle it"}}}}"#
+            ));
+        }
+        let s = crate::ingest::ingest_str(&lines.join("\n"), crate::model::Lane::Main);
+        let meta = SessionMeta {
+            id: "s1".into(),
+            identified_by: "explicit".into(),
+            unit: None,
+        };
+
+        let baseline = session_intent(&s, &meta, None);
+        let envelope = baseline["min_viable_tokens"].as_u64().unwrap() as usize;
+
+        for cap in envelope..(envelope + 60) {
+            let p = session_intent(&s, &meta, Some(cap));
+            assert!(
+                est_tokens(&p) <= cap,
+                "cap {cap}: payload measured {} tokens, exceeding the budget it \
+                 claims to honor (min_viable_tokens field must be part of the \
+                 measured envelope, not appended after the fit check)",
+                est_tokens(&p)
+            );
+        }
     }
 
     #[test]

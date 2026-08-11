@@ -249,8 +249,11 @@ pub fn decisions(s: &Session) -> Vec<DecisionOut> {
                     // though the human chose it. See the field's doc
                     // comment on `DecisionOut`. An unanswered question
                     // (answer: None) leaves every option here too, since no
-                    // choice was made at all to compare against.
-                    .filter(|o| d.answer.as_deref().is_some_and(|a| a != o.as_str()))
+                    // choice was made at all to compare against: `is_none_or`
+                    // defaults to `true` (keep the option) when there is no
+                    // answer, rather than `is_some_and`, which defaulted to
+                    // `false` and silently dropped every option instead.
+                    .filter(|o| d.answer.as_deref().is_none_or(|a| a != o.as_str()))
                     .cloned()
                     .collect(),
                 idxs,
@@ -734,6 +737,59 @@ mod tests {
              string; the human chose and refined it, so this is NOT a claim \
              that SQLite was rejected"
         );
+    }
+
+    // ---- FIX A regression: an unanswered decision must not lose its
+    // options. `answer.as_deref().is_some_and(...)` was `false` for every
+    // option whenever `answer` was `None`, silently emptying
+    // options_not_chosen for exactly the case ingest.rs keeps the decision
+    // around for ("the options it offered are still evidence of what was
+    // under consideration"). ----
+
+    #[test]
+    fn an_unanswered_question_still_lists_every_option_as_not_chosen() {
+        let call = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"tool_use","id":"q1","name":"AskUserQuestion","input":{"questions":[{"question":"Which store?","options":[{"label":"SQLite"},{"label":"JSONL"},{"label":"memory"}]}]}}]}}"#;
+        // No result line: the session ended before the question was
+        // answered.
+        let s = ingest_str(call, Lane::Main);
+
+        let d = decisions(&s);
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].chosen, None);
+        assert_eq!(
+            d[0].options_not_chosen,
+            vec![
+                "SQLite".to_string(),
+                "JSONL".to_string(),
+                "memory".to_string()
+            ],
+            "no answer text exists to compare against, so none of the \
+             offered options is excluded; they are all still evidence of \
+             what was under consideration"
+        );
+    }
+
+    #[test]
+    fn an_ambiguous_same_text_decision_still_lists_every_option_as_not_chosen() {
+        // Two questions with identical text in one call: the transcript's
+        // answers map cannot tell them apart, so ingest forces both answers
+        // to None (see ingest.rs's `two_identical_questions_in_one_call_...`
+        // test). The options offered for each are still evidence of what
+        // was under consideration and must not vanish just because the
+        // answer could not be attributed.
+        let call = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"tool_use","id":"q1","name":"AskUserQuestion","input":{"questions":[{"question":"Which store?","options":[{"label":"SQLite"}]},{"question":"Which store?","options":[{"label":"JSONL"}]}]}}]}}"#;
+        let result = r#"{"type":"user","timestamp":"2026-01-01T00:00:05Z","message":{"content":[{"type":"tool_result","tool_use_id":"q1"}]},"toolUseResult":{"answers":{"Which store?":"JSONL"}}}"#;
+        let s = ingest_str(&format!("{call}\n{result}"), Lane::Main);
+        assert_eq!(s.decisions.len(), 2);
+        assert_eq!(s.decisions[0].answer, None, "ambiguous within the call");
+        assert_eq!(s.decisions[1].answer, None, "ambiguous within the call");
+
+        let d = decisions(&s);
+        assert_eq!(d.len(), 2);
+        assert_eq!(d[0].chosen, None);
+        assert_eq!(d[0].options_not_chosen, vec!["SQLite".to_string()]);
+        assert_eq!(d[1].chosen, None);
+        assert_eq!(d[1].options_not_chosen, vec!["JSONL".to_string()]);
     }
 
     // ---- DEFECT 1 regressions: (session_ix, line_no) is not a unique

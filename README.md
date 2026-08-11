@@ -298,11 +298,21 @@ catalog, or [docs/metrics-spec.md](docs/metrics-spec.md) for the authoritative
 spec.
 
 Counting is insured, not assumed: a deliberately naive second implementation
-that shares no code with the extractor must agree exactly on every count, in
-CI for fixtures and on demand for real data. The current extraction agrees
-with its recounter across 625 real transcripts. This exists because a 3x
-undercount once survived 271 green tests whose fixtures shared the code's own
-blind spot.
+must agree exactly on every count, in CI for fixtures and on demand for real
+data. The current extraction agrees with its recounter across 625 real
+transcripts. This exists because a 3x undercount once survived 271 green
+tests whose fixtures shared the code's own blind spot.
+
+That insurance is not uniform, and is worth stating precisely rather than as
+"shares no code with the extractor": the recounter's extraction *rules*
+(claims windowing, task-lifecycle replay, failing-commands replay) are
+re-derived independently from the rule statements, so agreement on those is
+evidence of correctness. A handful of *definitions* underneath them (the
+harness-notice markers, the validation-command needles, the origin mapping)
+are shared constants, re-typed rather than re-derived; agreement there checks
+only that both sides apply the same definition consistently, not that the
+definition itself is right. See the header of
+`crates/sumcp-core/tests/context_recount.rs` for the full breakdown.
 
 ---
 

@@ -125,12 +125,20 @@ The default payload. Small, pushed once at the start of a review.
 |---|---|---|
 | `scope` | the human's request, and the files actually touched in the sessions covered | exact |
 | `decisions` | `AskUserQuestion` question, options, and the option chosen | exact, structured |
-| `constraints` | approaches tried and abandoned, with the recorded failure | **heuristic** |
+| ~~`constraints`~~ | ~~approaches tried and abandoned, with the recorded failure~~ | **cut 2026-08-11, before implementation; see the plan's Task 9** |
 | `incomplete` | tasks created but never completed; test commands failing at session end | exact |
 | `claims` | agent prose asserting what it did, for verification against the diff | exact extraction |
 
-Every entry carries the action indices that prove it, so `evidence(idxs)`
-(already built) resolves any of them to a raw transcript excerpt.
+Citations are not uniform across blocks, which is what actually shipped
+(amended from this section's original claim that every entry carries action
+indices): `decisions` and `incomplete.failing_commands` carry the action
+indices that prove them, so `evidence(idxs)` (already built) resolves those
+two directly to a raw transcript excerpt. `scope.requests`,
+`incomplete.unfinished_tasks`, and `claims` have no action to point at
+(a human turn or a task-status transition is not itself an `Action`), so
+those three carry transcript + line number instead: a short session id
+alongside the source line, dereferenceable by a human or another tool
+reading the transcript directly, not by `evidence()`.
 
 Extraction rules, all deterministic:
 
@@ -147,11 +155,15 @@ Extraction rules, all deterministic:
   `is_error: true`.
 - **claims**: the last assistant `text` block before each human turn.
   Extracted, never interpreted.
-- **constraints**: the only heuristic block. Detected from existing signals:
-  `true_revert` (content changed and changed back), files created then
-  deleted, and errored Bash commands not subsequently repeated. Carries the
-  repo's standard heuristic label and confidence, exactly as
-  `signals/comprehension.rs` does today.
+- ~~**constraints**~~: cut 2026-08-11, before implementation (plan Task 9).
+  Exact-string command matching does not survive real retries (`cargo test`,
+  then `cargo test -p sumcp-core`, then `cargo test --release` would report
+  three abandoned approaches where a developer sees one that eventually
+  passed), and it was the only heuristic block in a design whose entire
+  purpose is reducing false positives, which would have confounded the
+  precision experiment it was meant to feed. Revisit if the experiment shows
+  contextualized review wins and a properly-derived retry rule becomes worth
+  designing.
 
 ### Tool 2: `session_intent(commit_range, [max_tokens])`
 
