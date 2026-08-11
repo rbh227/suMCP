@@ -5,8 +5,8 @@
 //! verbatim, with a citation. It never asserts that anything is acceptable or
 //! risky, because that judgement belongs to the agent consuming this.
 
-use crate::model::{ActionKind, Idx, Session, TurnOrigin};
-use std::collections::BTreeSet;
+use crate::model::{ActionKind, Idx, Lane, Session, TurnOrigin};
+use std::collections::{BTreeMap, BTreeSet};
 
 /// One thing the human asked for, quoted exactly as written.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -260,11 +260,123 @@ pub fn decisions(s: &Session) -> Vec<DecisionOut> {
         .collect()
 }
 
+/// A task's real identity for the replay below.
+///
+/// `TaskEvent::id`'s own doc comment explains why: each transcript's harness
+/// numbers task ids from 1 independently, so a bare `id` is only unique
+/// WITHIN one `(session_ix, lane)` pair, never across a merged work unit. A
+/// main-lane task "1" and a subagent's task "1" are unrelated tasks that
+/// merely happen to share a label; replaying on `id` alone would silently
+/// fold them into one entry.
+type TaskKey = (u16, Lane, String);
+
+/// A task that was planned and never reached `completed`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnfinishedTask {
+    /// The task id, exactly as the harness reported it. See [`TaskKey`] for
+    /// why `session_ix` and `lane` below are needed alongside it to name one
+    /// real task.
+    pub id: String,
+    /// Which transcript of the work unit it came from.
+    pub session_ix: u16,
+    /// Main or subagent lane.
+    pub lane: Lane,
+    /// Its subject, if one was ever recorded.
+    pub subject: Option<String>,
+    /// The last status it reached.
+    pub last_status: String,
+    /// Source line of the last event about it, for citation.
+    pub line_no: usize,
+}
+
+/// A command whose LAST run in the session failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailingCommand {
+    /// The command string, verbatim.
+    pub command: String,
+    /// The failing action's index, for `evidence()`.
+    pub idx: Idx,
+}
+
+/// Work that was planned or attempted and did not finish.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Incomplete {
+    /// Tasks that never reached `completed`.
+    pub unfinished_tasks: Vec<UnfinishedTask>,
+    /// Commands still failing when the session ended.
+    pub failing_commands: Vec<FailingCommand>,
+}
+
+/// Extract work that was planned or attempted and did not finish.
+pub fn incomplete(s: &Session) -> Incomplete {
+    // Replay the event list into a final state per (session_ix, lane, id) --
+    // see `TaskKey`. BTreeMap keeps the output ordered by that key, so two
+    // runs over an unchanged session agree byte for byte, the determinism
+    // rule every extraction in this module follows.
+    let mut final_state: BTreeMap<TaskKey, (Option<String>, String, usize)> = BTreeMap::new();
+    for e in &s.task_events {
+        let key = (e.session_ix, e.lane.clone(), e.id.clone());
+        let entry = final_state.entry(key).or_insert((None, String::new(), 0));
+        // A later event's subject wins only when it has one: a plain status
+        // update carries no subject and must not erase the one from create.
+        if e.subject.is_some() {
+            entry.0 = e.subject.clone();
+        }
+        entry.1 = e.status.clone();
+        entry.2 = e.line_no;
+    }
+    let unfinished_tasks = final_state
+        .into_iter()
+        // "completed" is the only terminal status a TaskUpdate result has
+        // ever been observed to confirm (see ingest.rs's task_events tests).
+        // There is no evidence for a "deleted" or "cancelled" status in this
+        // corpus, so nothing else is treated as finished; inventing a second
+        // terminal state without evidence would risk quietly hiding real
+        // unfinished work.
+        .filter(|(_, (_, status, _))| status != "completed")
+        .map(
+            |((session_ix, lane, id), (subject, last_status, line_no))| UnfinishedTask {
+                id,
+                session_ix,
+                lane,
+                subject,
+                last_status,
+                line_no,
+            },
+        )
+        .collect();
+
+    // Last run wins, per distinct command string. A test that failed and was
+    // then fixed is not unfinished work, so only the final state counts.
+    // `incomplete()` runs on the already-merged session, so `Action::idx` is
+    // the final global index and safe to cite directly, unlike a task event
+    // (which carries none, for the reason `TaskEvent`'s doc gives).
+    let mut last_run: BTreeMap<String, (bool, Idx)> = BTreeMap::new();
+    for a in &s.actions {
+        if a.kind == ActionKind::Bash
+            && let Some(cmd) = a.command.as_deref()
+            && let Some(err) = a.is_error
+        {
+            last_run.insert(cmd.to_string(), (err, a.idx));
+        }
+    }
+    let failing_commands = last_run
+        .into_iter()
+        .filter(|(_, (err, _))| *err)
+        .map(|(command, (_, idx))| FailingCommand { command, idx })
+        .collect();
+
+    Incomplete {
+        unfinished_tasks,
+        failing_commands,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ingest::ingest_str;
-    use crate::merge::merge_work_unit;
+    use crate::merge::{merge_sessions, merge_work_unit};
     use crate::model::{Action, Decision, Lane};
 
     #[test]
@@ -577,5 +689,104 @@ mod tests {
             vec![Idx(1)],
             "idxs must resolve to the post-merge global idx, not the pre-merge local 0"
         );
+    }
+
+    // ---- incomplete() ----
+
+    #[test]
+    fn a_task_never_completed_is_reported_unfinished() {
+        let c1 = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"tool_use","id":"a","name":"TaskCreate","input":{"subject":"Wire the cache"}}]}}"#;
+        let c1_result = r#"{"type":"user","timestamp":"2026-01-01T00:00:01Z","message":{"content":[{"type":"tool_result","tool_use_id":"a"}]},"toolUseResult":{"task":{"id":"1","subject":"Wire the cache"}}}"#;
+        let c2 = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:02Z","message":{"content":[{"type":"tool_use","id":"b","name":"TaskCreate","input":{"subject":"Add tests"}}]}}"#;
+        let c2_result = r#"{"type":"user","timestamp":"2026-01-01T00:00:03Z","message":{"content":[{"type":"tool_result","tool_use_id":"b"}]},"toolUseResult":{"task":{"id":"2","subject":"Add tests"}}}"#;
+        let done = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:04Z","message":{"content":[{"type":"tool_use","id":"c","name":"TaskUpdate","input":{"taskId":"1","status":"completed"}}]}}"#;
+        let done_result = r#"{"type":"user","timestamp":"2026-01-01T00:00:05Z","message":{"content":[{"type":"tool_result","tool_use_id":"c"}]},"toolUseResult":{"success":true,"taskId":"1","statusChange":"completed"}}"#;
+        let s = ingest_str(
+            &format!("{c1}\n{c1_result}\n{c2}\n{c2_result}\n{done}\n{done_result}"),
+            Lane::Main,
+        );
+
+        let inc = incomplete(&s);
+        assert_eq!(inc.unfinished_tasks.len(), 1, "task 2 never completed");
+        assert_eq!(inc.unfinished_tasks[0].subject.as_deref(), Some("Add tests"));
+        assert_eq!(inc.unfinished_tasks[0].last_status, "pending");
+    }
+
+    #[test]
+    fn only_the_last_run_of_a_command_counts_as_failing() {
+        // A test that failed and was then fixed is not unfinished work. Only
+        // the final state of each distinct command matters.
+        let fail = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"tool_use","id":"b1","name":"Bash","input":{"command":"cargo test"}}]}}"#;
+        let fail_r = r#"{"type":"user","timestamp":"2026-01-01T00:00:01Z","message":{"content":[{"type":"tool_result","tool_use_id":"b1","is_error":true}]}}"#;
+        let pass = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:02Z","message":{"content":[{"type":"tool_use","id":"b2","name":"Bash","input":{"command":"cargo test"}}]}}"#;
+        let pass_r = r#"{"type":"user","timestamp":"2026-01-01T00:00:03Z","message":{"content":[{"type":"tool_result","tool_use_id":"b2","is_error":false}]}}"#;
+        let s = ingest_str(&format!("{fail}\n{fail_r}\n{pass}\n{pass_r}"), Lane::Main);
+
+        assert!(
+            incomplete(&s).failing_commands.is_empty(),
+            "the command was rerun and passed"
+        );
+    }
+
+    #[test]
+    fn a_command_still_failing_at_the_end_is_reported() {
+        let pass = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"tool_use","id":"b1","name":"Bash","input":{"command":"cargo test"}}]}}"#;
+        let pass_r = r#"{"type":"user","timestamp":"2026-01-01T00:00:01Z","message":{"content":[{"type":"tool_result","tool_use_id":"b1","is_error":false}]}}"#;
+        let fail = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:02Z","message":{"content":[{"type":"tool_use","id":"b2","name":"Bash","input":{"command":"cargo test"}}]}}"#;
+        let fail_r = r#"{"type":"user","timestamp":"2026-01-01T00:00:03Z","message":{"content":[{"type":"tool_result","tool_use_id":"b2","is_error":true}]}}"#;
+        let s = ingest_str(&format!("{pass}\n{pass_r}\n{fail}\n{fail_r}"), Lane::Main);
+
+        let inc = incomplete(&s);
+        assert_eq!(inc.failing_commands.len(), 1);
+        assert_eq!(inc.failing_commands[0].command, "cargo test");
+    }
+
+    #[test]
+    fn a_main_task_and_a_subagent_task_sharing_id_one_are_not_merged() {
+        // The brief this task was built from replayed task events keyed on
+        // `id` alone -- exactly the bug `TaskEvent::id`'s doc comment warns
+        // about. Each transcript's harness numbers its own tasks from 1, so
+        // a main-lane task "1" and a subagent's task "1" are unrelated
+        // tasks that merely share a label. Keying the replay on the bare id
+        // would silently fold them into one entry: whichever event happened
+        // to come last in `s.task_events` would then decide whether the
+        // completed main task or the still-open subagent task "won", and
+        // the other would vanish. Build one of each, with the main one
+        // completed and the subagent one not, and require exactly one
+        // unfinished task out the other end: not zero (both cancel out) and
+        // not one merged entry with the wrong status.
+        let main_create = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"tool_use","id":"a","name":"TaskCreate","input":{"subject":"Main task"}}]}}"#;
+        let main_create_result = r#"{"type":"user","timestamp":"2026-01-01T00:00:01Z","message":{"content":[{"type":"tool_result","tool_use_id":"a"}]},"toolUseResult":{"task":{"id":"1","subject":"Main task"}}}"#;
+        let main_done = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:02Z","message":{"content":[{"type":"tool_use","id":"b","name":"TaskUpdate","input":{"taskId":"1","status":"completed"}}]}}"#;
+        let main_done_result = r#"{"type":"user","timestamp":"2026-01-01T00:00:03Z","message":{"content":[{"type":"tool_result","tool_use_id":"b"}]},"toolUseResult":{"success":true,"taskId":"1","statusChange":"completed"}}"#;
+        let main = ingest_str(
+            &format!("{main_create}\n{main_create_result}\n{main_done}\n{main_done_result}"),
+            Lane::Main,
+        );
+
+        let sub_create = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"tool_use","id":"a","name":"TaskCreate","input":{"subject":"Subagent task"}}]}}"#;
+        let sub_create_result = r#"{"type":"user","timestamp":"2026-01-01T00:00:01Z","message":{"content":[{"type":"tool_result","tool_use_id":"a"}]},"toolUseResult":{"task":{"id":"1","subject":"Subagent task"}}}"#;
+        let sub = ingest_str(
+            &format!("{sub_create}\n{sub_create_result}"),
+            Lane::Sub("agent-1".to_string()),
+        );
+
+        let merged = merge_sessions(main, vec![sub], 0);
+        let inc = incomplete(&merged);
+
+        assert_eq!(
+            inc.unfinished_tasks.len(),
+            1,
+            "one unfinished task: the subagent's, not zero and not a merged single entry"
+        );
+        assert_eq!(
+            inc.unfinished_tasks[0].subject.as_deref(),
+            Some("Subagent task")
+        );
+        assert_eq!(
+            inc.unfinished_tasks[0].lane,
+            Lane::Sub("agent-1".to_string())
+        );
+        assert_eq!(inc.unfinished_tasks[0].last_status, "pending");
     }
 }
