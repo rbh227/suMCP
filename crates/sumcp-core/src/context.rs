@@ -5,7 +5,7 @@
 //! verbatim, with a citation. It never asserts that anything is acceptable or
 //! risky, because that judgement belongs to the agent consuming this.
 
-use crate::model::{ActionKind, Session};
+use crate::model::{ActionKind, Session, TurnOrigin};
 use std::collections::BTreeSet;
 
 /// One thing the human asked for, quoted exactly as written.
@@ -23,13 +23,39 @@ pub struct Request {
 /// What was asked, and what was actually touched.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Scope {
-    /// Every human turn, in order.
+    /// Every EXPLICITLY human turn, in order. Only `TurnOrigin::Human`
+    /// qualifies: a turn whose origin is merely `Unknown` is NOT quoted
+    /// here, even though `UserText::is_human()` (a different consumer's
+    /// question) would count it as human. This module's whole value is
+    /// that what it quotes is ground truth, never inference, so an
+    /// unattributed turn (measured on real transcripts: things like
+    /// `"[Request interrupted by user]"` or a raw slash-command echo) must
+    /// never be handed to a reviewer as "the human asked for this". See
+    /// `unattributed_turns` below for where those turns are disclosed
+    /// instead of silently dropped.
     pub requests: Vec<Request>,
-    /// Paths actually acted on, deduped and sorted. This is deliberately NOT
-    /// an inference about which files the request "meant" to cover: it is the
-    /// observed set, and a reviewer comparing it against the requests can
-    /// draw its own conclusion about anything out of scope.
-    pub files: Vec<String>,
+    /// Paths this session successfully edited or wrote via Edit/Write tool
+    /// calls, deduped and sorted. This is deliberately NOT an inference
+    /// about which files the request "meant" to cover: it is the observed
+    /// set, and a reviewer comparing it against the requests can draw its
+    /// own conclusion about anything out of scope.
+    ///
+    /// This is NOT the commit's changed-file set. It excludes any file
+    /// touched only through a Bash command (create/delete/rename never go
+    /// through Edit/Write, so they never appear here), and a failed
+    /// Edit/Write is excluded too (see the filter in `scope()`). A reviewer
+    /// comparing this against a diff must read it as "what this session's
+    /// own edit tools touched", a lower bound on session activity, never as
+    /// a complete list of what changed.
+    pub files_edited: Vec<String>,
+    /// How many textual user turns had NO `origin` field at all
+    /// (`TurnOrigin::Unknown`) and were, for that reason, excluded from
+    /// `requests`. Disclosure instead of silence: without this a payload
+    /// could show a suspiciously short request list with no sign that
+    /// turns existed but could not be attributed. Same ethic as
+    /// `Session::subagent_files_missing` and `Session::agent_texts_excluded`.
+    /// A payload can say "N turns of unknown origin were not quoted".
+    pub unattributed_turns: usize,
 }
 
 /// Extract what was asked and what was touched.
@@ -37,10 +63,17 @@ pub fn scope(s: &Session) -> Scope {
     let requests = s
         .user_texts
         .iter()
-        // `is_human` distinguishes a real turn from a harness-injected one
-        // (task notifications, hook output). Quoting a harness turn as human
-        // intent would misrepresent what was requested.
-        .filter(|u| u.is_human)
+        // Only an EXPLICIT `origin.kind == "human"` is quoted as a request.
+        // `TurnOrigin::NonHuman` (task notifications, hook output) is
+        // correctly excluded, but so is `TurnOrigin::Unknown`: unlike
+        // `UserText::is_human()`, this filter must NOT fold Unknown into
+        // Human. Measured on 12 real transcripts (286 textual user turns):
+        // 13.3% carry no `origin` at all, and sampling them shows they are
+        // NOT old-format human requests. They are things like
+        // "[Request interrupted by user]" and a raw slash-command echo.
+        // Quoting those as the human's stated intent would be exactly the
+        // failure this module exists to prevent.
+        .filter(|u| matches!(u.origin, TurnOrigin::Human))
         .map(|u| Request {
             text: u.text.clone(),
             line_no: u.line_no,
@@ -48,18 +81,35 @@ pub fn scope(s: &Session) -> Scope {
         })
         .collect();
 
+    let unattributed_turns = s
+        .user_texts
+        .iter()
+        .filter(|u| matches!(u.origin, TurnOrigin::Unknown))
+        .count();
+
     // BTreeSet gives dedup and sort in one step, which is what makes two runs
     // over an unchanged transcript byte-identical.
-    let files: BTreeSet<String> = s
+    let files_edited: BTreeSet<String> = s
         .actions
         .iter()
         .filter(|a| matches!(a.kind, ActionKind::Edit | ActionKind::Write))
+        // A failed Edit/Write did not touch the file: the tool call was
+        // attempted, not completed, so including it would tell a reviewer
+        // this session changed a file it only tried to change. `is_error`
+        // is `None` when the harness recorded no result at all (no matching
+        // tool_result line, rare, but seen on truncated/streaming
+        // transcripts); that case is INCLUDED here, matching how the rest
+        // of this crate treats an unconfirmed action: absence of a
+        // "failed" signal is not treated as a failure. Only a confirmed
+        // `Some(true)` is excluded.
+        .filter(|a| a.is_error != Some(true))
         .filter_map(|a| a.file_path.clone())
         .collect();
 
     Scope {
         requests,
-        files: files.into_iter().collect(),
+        files_edited: files_edited.into_iter().collect(),
+        unattributed_turns,
     }
 }
 
@@ -82,7 +132,7 @@ mod tests {
         let scope = scope(&s);
         assert_eq!(scope.requests.len(), 1, "only the human turn is a request");
         assert_eq!(scope.requests[0].text, "add a cache to the loader");
-        assert_eq!(scope.files, vec!["/loader.rs".to_string()]);
+        assert_eq!(scope.files_edited, vec!["/loader.rs".to_string()]);
     }
 
     #[test]
@@ -94,6 +144,82 @@ mod tests {
         let e3 = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:02Z","message":{"content":[{"type":"tool_use","id":"e3","name":"Edit","input":{"file_path":"/b.rs","new_string":"z"}}]}}"#;
         let s = ingest_str(&format!("{e1}\n{e2}\n{e3}"), Lane::Main);
 
-        assert_eq!(scope(&s).files, vec!["/a.rs".to_string(), "/b.rs".to_string()]);
+        assert_eq!(
+            scope(&s).files_edited,
+            vec!["/a.rs".to_string(), "/b.rs".to_string()]
+        );
+    }
+
+    // ---- DEFECT 1 regressions: unattributed turns must never be quoted ----
+
+    #[test]
+    fn a_turn_with_no_origin_is_not_quoted_and_is_counted_unattributed() {
+        // The adversarial review's core finding: `origin.kind` absent
+        // entirely (not merely non-human) must not be quoted as the human's
+        // request, because sampling real transcripts shows those lines are
+        // things like interrupt markers and slash-command echoes, not
+        // old-format human requests.
+        let no_origin = r#"{"type":"user","timestamp":"2026-01-01T00:00:00Z","message":{"content":"<command-name>/clear</command-name>"}}"#;
+        let s = ingest_str(no_origin, Lane::Main);
+
+        let scope = scope(&s);
+        assert_eq!(
+            scope.requests.len(),
+            0,
+            "an origin-less turn must not be quoted as a request"
+        );
+        assert_eq!(
+            scope.unattributed_turns, 1,
+            "it must instead be disclosed as unattributed, not silently dropped"
+        );
+    }
+
+    #[test]
+    fn a_task_notification_is_neither_quoted_nor_counted_as_unattributed() {
+        // A task notification HAS an origin: it is known non-human, not
+        // unknown. Conflating "known non-human" with "unattributed" would
+        // make the disclosure count lie about how many turns are genuinely
+        // unaccounted for.
+        let notification = r#"{"type":"user","timestamp":"2026-01-01T00:00:00Z","origin":{"kind":"task-notification"},"message":{"content":"<task-notification>agent done</task-notification>"}}"#;
+        let s = ingest_str(notification, Lane::Main);
+
+        let scope = scope(&s);
+        assert_eq!(scope.requests.len(), 0, "not a human turn, not quoted");
+        assert_eq!(
+            scope.unattributed_turns, 0,
+            "known non-human is not the same fact as unknown origin"
+        );
+    }
+
+    #[test]
+    fn an_interrupt_line_is_not_quoted_as_a_request() {
+        // A real sample from the measurement that motivated this fix: an
+        // interrupt marker carries no `origin` field and must not be handed
+        // to a reviewer as something the human asked for.
+        let interrupt = r#"{"type":"user","timestamp":"2026-01-01T00:00:00Z","message":{"content":"[Request interrupted by user]"}}"#;
+        let s = ingest_str(interrupt, Lane::Main);
+
+        let scope = scope(&s);
+        assert_eq!(
+            scope.requests.len(),
+            0,
+            "an interrupt marker is not a human request"
+        );
+        assert_eq!(scope.unattributed_turns, 1);
+    }
+
+    // ---- DEFECT 2 regression: a failed edit is not a touched file ----
+
+    #[test]
+    fn a_failed_edit_does_not_appear_in_files_edited() {
+        let edit = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"tool_use","id":"e1","name":"Edit","input":{"file_path":"/a.rs","old_string":"x","new_string":"y"}}]}}"#;
+        let failed_result = r#"{"type":"user","timestamp":"2026-01-01T00:00:01Z","message":{"content":[{"type":"tool_result","tool_use_id":"e1","is_error":true,"content":"old_string not found"}]}}"#;
+        let s = ingest_str(&format!("{edit}\n{failed_result}"), Lane::Main);
+
+        assert_eq!(
+            scope(&s).files_edited,
+            Vec::<String>::new(),
+            "a failed Edit was attempted, not completed, so it must not appear as touched"
+        );
     }
 }

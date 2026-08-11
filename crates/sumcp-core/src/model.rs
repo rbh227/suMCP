@@ -356,20 +356,65 @@ pub struct UserText {
     /// together, the same way it does for `Action::session_ix`.
     #[serde(default)]
     pub session_ix: u16,
-    /// Whether this turn came from the human, per the `origin.kind` field.
-    /// A harness-injected turn (e.g. a task notification) is recorded but is
-    /// not a human turn, so it must not reset the review-burden window.
-    /// Absent `origin` means human: the field is newer than the transcripts
-    /// we must keep reading, and defaulting an unknown turn to human keeps
-    /// the pre-existing (wider) windowing on old data. The serde default is
-    /// `true` for the same reason.
-    #[serde(default = "default_true")]
-    pub is_human: bool,
+    /// Where this turn came from, per the transcript's `origin.kind` field.
+    /// See [`TurnOrigin`] for the three states, and [`UserText::is_human`]
+    /// for why the review-burden consumer and the quoting consumer read
+    /// this field differently.
+    #[serde(default)]
+    pub origin: TurnOrigin,
 }
 
-/// Serde default helper: see [`UserText::is_human`].
-fn default_true() -> bool {
-    true
+impl UserText {
+    /// "Was this turn produced by the human, or at least not KNOWN to be
+    /// something else": the review-burden / segment-boundary sense of
+    /// "human turn" (`signals/dynamics.rs::segments`). This treats
+    /// `TurnOrigin::Unknown` as human on purpose: an origin-less turn is
+    /// old transcript data (the `origin` field is newer than transcripts we
+    /// must keep reading), not evidence the turn wasn't human, and counting
+    /// it as a boundary here keeps the pre-existing (wider) review window
+    /// that consumer has always used. This is the ONLY reason the default
+    /// exists; do not reuse this method anywhere that needs to know the
+    /// turn was ACTUALLY said by the human.
+    ///
+    /// `context::scope()` is that other case: it quotes turns to a
+    /// reviewing agent as the human's stated intent, so it must NOT call
+    /// this method. It matches `TurnOrigin::Human` directly instead,
+    /// because quoting an `Unknown` turn risks quoting an interrupt marker
+    /// or a slash-command echo as if the human had asked for it (measured
+    /// on 12 real transcripts: 13.3% of textual user turns carry no
+    /// `origin` at all, and they are not old-format human requests).
+    pub fn is_human(&self) -> bool {
+        matches!(self.origin, TurnOrigin::Human | TurnOrigin::Unknown)
+    }
+}
+
+/// The three things a transcript line's `origin.kind` can tell us about a
+/// user turn.
+///
+/// A plain bool cannot represent this: "definitely not human" (a task
+/// notification) and "we have no idea" (an old transcript with no `origin`
+/// field at all) are different facts, and two different consumers in this
+/// crate need to treat them differently. Review-burden windowing folds
+/// `Unknown` into "human" (the conservative direction for a window that
+/// must not silently narrow on old data); `context::scope()`, which quotes
+/// a turn to a reviewer as the human's stated intent, must NOT. See
+/// [`UserText::is_human`] for the full reasoning.
+///
+/// `Default` (via `#[default]` on `Unknown`) is what lets `#[serde(default)]`
+/// on `UserText::origin` fall back to something when deserializing a disk
+/// cache written before this field existed. `Unknown` is the right
+/// fallback: those old cache entries carry no origin information at all,
+/// which is exactly what `Unknown` means.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TurnOrigin {
+    /// `origin.kind == "human"`, explicitly.
+    Human,
+    /// `origin` was present with some other `kind` (e.g.
+    /// `"task-notification"`): known, on direct evidence, not to be human.
+    NonHuman,
+    /// No `origin` field at all on the transcript line.
+    #[default]
+    Unknown,
 }
 
 /// One question the agent put to the human, the options it offered, and what

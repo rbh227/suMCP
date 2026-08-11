@@ -15,7 +15,7 @@
 
 use crate::model::{
     Action, ActionKind, AgentText, Decision, Idx, Lane, Session, Spawn, TaskEvent, Tokens,
-    UserText,
+    TurnOrigin, UserText,
 };
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -184,17 +184,22 @@ pub fn ingest_str(raw: &str, default_lane: Lane) -> Session {
                 // stamps the real value later (see `UserText::session_ix`).
                 session_ix: 0,
                 // `origin.kind` distinguishes a real human turn from a
-                // harness-injected one. Absent means human: the field is
-                // newer than the transcripts we must keep reading, and
-                // defaulting an unknown turn to human keeps the review-burden
-                // window at its pre-existing (wider) behaviour rather than
-                // silently narrowing it on old data.
-                is_human: v
+                // harness-injected one, or from a line where the field is
+                // simply absent (a transcript older than the field, or an
+                // interrupt/slash-command echo that never carries one).
+                // Exactly "human" maps to Human; any other present value is
+                // known non-human evidence; an absent `origin` is Unknown,
+                // not assumed human. See `TurnOrigin` for why the two
+                // consumers of this need different defaults for "unknown".
+                origin: match v
                     .get("origin")
                     .and_then(|o| o.get("kind"))
                     .and_then(Value::as_str)
-                    .map(|k| k == "human")
-                    .unwrap_or(true),
+                {
+                    Some("human") => TurnOrigin::Human,
+                    Some(_) => TurnOrigin::NonHuman,
+                    None => TurnOrigin::Unknown,
+                },
             });
         }
 
@@ -1093,20 +1098,39 @@ mod tests {
         );
         let s = ingest_str(raw, Lane::Main);
         assert_eq!(s.user_texts.len(), 2, "both are recorded");
-        assert!(s.user_texts[0].is_human);
-        assert!(!s.user_texts[1].is_human);
+        // `.is_human()` is the "Human or Unknown" method (review-burden's
+        // sense); a task notification is the one case that fails it because
+        // it is KNOWN non-human, not merely unattributed.
+        assert!(s.user_texts[0].is_human());
+        assert!(!s.user_texts[1].is_human());
+        assert_eq!(s.user_texts[1].origin, crate::model::TurnOrigin::NonHuman);
     }
 
     #[test]
     fn an_absent_origin_defaults_to_human() {
         // Transcripts written before the `origin` field existed must keep the
-        // old, WIDER review window: defaulting unknown to human means those
-        // turns still draw segment boundaries exactly as they always did.
+        // old, WIDER review window: defaulting unknown to human (via
+        // `.is_human()`) means those turns still draw segment boundaries
+        // exactly as they always did.
         let raw =
             r#"{"type":"user","timestamp":"2026-01-01T00:00:01Z","message":{"content":"hi"}}"#;
         let s = ingest_str(raw, Lane::Main);
         assert_eq!(s.user_texts.len(), 1);
-        assert!(s.user_texts[0].is_human, "no origin field means human");
+        assert!(s.user_texts[0].is_human(), "no origin field means human");
+    }
+
+    #[test]
+    fn an_absent_origin_is_unknown_not_explicitly_human() {
+        // DEFECT 1 regression: `.is_human()` folds Unknown into "human" for
+        // the review-burden consumer (see the test above), but the raw
+        // `origin` must stay Unknown, not Human. `context::scope()` reads
+        // this field directly, and it must be able to tell "the human said
+        // this" apart from "we don't know who said this" so it never quotes
+        // the latter as intent.
+        let raw =
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:01Z","message":{"content":"hi"}}"#;
+        let s = ingest_str(raw, Lane::Main);
+        assert_eq!(s.user_texts[0].origin, crate::model::TurnOrigin::Unknown);
     }
 
     #[test]

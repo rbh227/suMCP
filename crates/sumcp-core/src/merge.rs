@@ -356,14 +356,14 @@ mod tests {
 
     #[test]
     fn keeps_only_main_user_texts_and_ors_nothing_for_auto_accept() {
-        use crate::model::UserText;
+        use crate::model::{TurnOrigin, UserText};
         let mut main = one(Lane::Main, "2026-01-01T00:00:02Z", 5, "/a");
         main.user_texts = vec![UserText {
             line_no: 1,
             text: "human says".into(),
             effective_ts: "2026-01-01T00:00:00Z".into(),
             session_ix: 0,
-            is_human: true,
+            origin: TurnOrigin::Human,
         }];
         main.auto_accept = false;
         let mut sub = one(Lane::Sub("x".into()), "2026-01-01T00:00:01Z", 3, "/b");
@@ -372,7 +372,7 @@ mod tests {
             text: "orchestrator prompt".into(),
             effective_ts: "2026-01-01T00:00:00Z".into(),
             session_ix: 0,
-            is_human: true,
+            origin: TurnOrigin::Human,
         }];
         sub.auto_accept = true; // a sub in auto-accept must NOT flip the merged flag
 
@@ -553,7 +553,7 @@ mod tests {
 
     #[test]
     fn work_unit_merge_ors_auto_accept_and_keeps_every_user_text() {
-        use crate::model::UserText;
+        use crate::model::{TurnOrigin, UserText};
         // Unlike the subagent merge, which deliberately ignores a subagent's
         // user turns and auto-accept, every transcript in a work unit is a
         // real human-facing session, so both must carry.
@@ -563,7 +563,7 @@ mod tests {
             text: "first".into(),
             effective_ts: "2026-01-01T00:00:00Z".into(),
             session_ix: 0,
-            is_human: true,
+            origin: TurnOrigin::Human,
         }];
         a.auto_accept = false;
         let mut b = one(Lane::Main, "2026-01-01T00:00:02Z", 1, "/b");
@@ -572,7 +572,7 @@ mod tests {
             text: "second".into(),
             effective_ts: "2026-01-01T00:00:02Z".into(),
             session_ix: 0,
-            is_human: true,
+            origin: TurnOrigin::Human,
         }];
         b.auto_accept = true;
 
@@ -593,7 +593,7 @@ mod tests {
         // pushback_between would silently find nothing and Flip detection
         // would die for those transcripts with no error and no failing test
         // elsewhere: this test is the only thing pinning that behavior down.
-        use crate::model::UserText;
+        use crate::model::{TurnOrigin, UserText};
         let a = one(Lane::Main, "2026-01-01T00:00:01Z", 1, "/a");
         let mut b = one(Lane::Main, "2026-01-01T00:00:02Z", 1, "/b");
         b.user_texts = vec![UserText {
@@ -601,7 +601,7 @@ mod tests {
             text: "second transcript's user turn".into(),
             effective_ts: "2026-01-01T00:00:02Z".into(),
             session_ix: 0, // as ingest always leaves it; the merge must restamp
-            is_human: true,
+            origin: TurnOrigin::Human,
         }];
 
         let merged = merge_work_unit(vec![("a".into(), a), ("b".into(), b)]);
