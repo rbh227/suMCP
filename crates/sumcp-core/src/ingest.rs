@@ -168,6 +168,30 @@ pub fn ingest_str(raw: &str, default_lane: Lane) -> Session {
 
         let message = v.get("message");
 
+        // Positive agent-authorship check for the `text` blocks handled
+        // below. Claude Code injects harness notices (a dropped connection,
+        // a monthly spend limit, a 529 overload, an unrequested-response
+        // stub) as `type: "assistant"` records carrying a plain `text`
+        // block, the exact shape genuine agent prose uses. Left unchecked, a
+        // notice becomes a false claim, and because `context::claims()`
+        // keeps only the LAST prose block in a window, it can also displace
+        // the agent's real summary right before a human turn.
+        //
+        // Checked against every `message.model == "<synthetic>"` record in
+        // the live `~/.claude/projects` corpus (42 records, 4 wordings): all
+        // 42 were harness notices, none were genuine prose, so `model` alone
+        // is a sufficient marker. `isApiErrorMessage` and the top-level
+        // `error` field agreed on every record that set them, but neither
+        // covers the "No response requested." notice (it sets `model` only,
+        // with `isApiErrorMessage: false` and no `error` field), so `model`
+        // is the one marker that must be checked, not merely one of a set.
+        // All three are still checked so a future notice shape that omits
+        // `model` is still caught by one of the others.
+        let is_harness_notice = message.and_then(|m| m.get("model")).and_then(Value::as_str)
+            == Some("<synthetic>")
+            || v.get("isApiErrorMessage").and_then(Value::as_bool) == Some(true)
+            || v.get("error").is_some();
+
         // Capture real user text (prompts, interrupts) — not tool_result echoes
         // or meta lines. Placed in time so signals can ask "did the user push
         // back between edit A and edit B?".
@@ -512,7 +536,17 @@ pub fn ingest_str(raw: &str, default_lane: Lane) -> Session {
                         // is what was validated as non-empty.
                         if let Some(t) = block.get("text").and_then(Value::as_str) {
                             let trimmed = t.trim();
-                            if !trimmed.is_empty() {
+                            // A harness notice is not agent-authored prose at
+                            // all: it is dropped here, before an `AgentText`
+                            // ever exists, rather than filtered later at
+                            // claim-selection time. It is not counted toward
+                            // `agent_texts_excluded` either -- that counter's
+                            // contract is specifically "subagent-lane prose
+                            // that existed but was not kept" (see its own
+                            // declaration below), and a harness notice is
+                            // neither agent prose nor evidence of anything a
+                            // reviewer needs disclosed as missing.
+                            if !trimmed.is_empty() && !is_harness_notice {
                                 // Subagent prose (non-main lane) is never kept:
                                 // `merge_sessions` drops every subagent
                                 // AgentText unconditionally, so pushing it here
@@ -1403,6 +1437,92 @@ mod tests {
             s.agent_texts_excluded, 0,
             "skipped on the main lane, not excluded (exclusion is a non-main-lane count)"
         );
+    }
+
+    /// Builds two consecutive assistant lines: a genuine prose block, then a
+    /// harness notice with the given fields (any absent marker is passed as
+    /// `None`/`false`, matching the "No response requested." shape which
+    /// carries none of `isApiErrorMessage`/`error`).
+    fn genuine_then_notice(
+        notice_text: &str,
+        model: &str,
+        is_api_error_message: Option<bool>,
+        error: Option<&str>,
+    ) -> String {
+        let genuine = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"model":"claude-fable-5","content":[{"type":"text","text":"Ran the migration and the tests pass."}]}}"#.to_string();
+        let is_api_error_message_field = match is_api_error_message {
+            Some(b) => format!(r#","isApiErrorMessage":{b}"#),
+            None => String::new(),
+        };
+        let error_field = match error {
+            Some(e) => format!(r#","error":"{e}""#),
+            None => String::new(),
+        };
+        let notice = format!(
+            r#"{{"type":"assistant","timestamp":"2026-01-01T00:00:01Z","message":{{"model":"{model}","content":[{{"type":"text","text":"{notice_text}"}}]}}{is_api_error_message_field}{error_field}}}"#
+        );
+        format!("{genuine}\n{notice}")
+    }
+
+    /// Asserts a harness notice built by `genuine_then_notice` neither
+    /// becomes a claim itself (it never even becomes an `AgentText`) NOR
+    /// displaces the genuine block that came before it.
+    fn assert_notice_excluded_and_genuine_survives(raw: &str) {
+        let s = ingest_str(raw, Lane::Main);
+        assert_eq!(
+            s.agent_texts.len(),
+            1,
+            "the notice must not become an AgentText at all"
+        );
+        assert_eq!(
+            s.agent_texts[0].text, "Ran the migration and the tests pass.",
+            "the genuine block must survive as the last (and only) prose block"
+        );
+    }
+
+    #[test]
+    fn a_connection_closed_notice_is_not_agent_prose() {
+        // DEFECT 1 regression (the case reproduced live): the FIRST claim a
+        // real run returned was this exact notice text.
+        let raw = genuine_then_notice(
+            "API Error: Connection closed mid-response. The response above may be incomplete.",
+            "<synthetic>",
+            Some(true),
+            Some("server_error"),
+        );
+        assert_notice_excluded_and_genuine_survives(&raw);
+    }
+
+    #[test]
+    fn a_529_overload_notice_is_not_agent_prose() {
+        let raw = genuine_then_notice(
+            "API Error: 529 Overloaded. This is a server-side issue, usually temporary, try again in a moment.",
+            "<synthetic>",
+            Some(true),
+            Some("server_error"),
+        );
+        assert_notice_excluded_and_genuine_survives(&raw);
+    }
+
+    #[test]
+    fn a_spend_limit_notice_is_not_agent_prose() {
+        let raw = genuine_then_notice(
+            "You've hit your monthly spend limit. Run /usage-credits to manage your limit.",
+            "<synthetic>",
+            Some(true),
+            Some("rate_limit"),
+        );
+        assert_notice_excluded_and_genuine_survives(&raw);
+    }
+
+    #[test]
+    fn a_no_response_requested_notice_is_not_agent_prose() {
+        // The one case with neither `isApiErrorMessage: true` nor an `error`
+        // field: `message.model == "<synthetic>"` is the only marker that
+        // catches it, which is why `model` must be checked, not just offered
+        // as one option among the three.
+        let raw = genuine_then_notice("No response requested.", "<synthetic>", Some(false), None);
+        assert_notice_excluded_and_genuine_survives(&raw);
     }
 
     #[test]

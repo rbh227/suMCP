@@ -226,13 +226,21 @@ fn tool_list() -> Vec<Tool> {
         ),
         tool(
             "review_context",
-            "Recorded session context for reviewing a change: what was asked, what the human decided (and the options rejected), what was left unfinished, and what the agent claimed it did. Facts with citations, never judgments. Call session_intent for the full request text.",
+            "Recorded session context for reviewing a change: what was asked, what the human decided (and the other options that were offered), what was left unfinished, and what the agent claimed it did. Facts with citations, never judgments.",
             serde_json::json!({}),
             &[],
         ),
+        // Deliberately no change-scoped selector argument (e.g. "only
+        // requests touching these files/commits"). A reviewer raised it and
+        // it is a real idea, but it needs a design decision this fix wave
+        // does not make: what a selector would key on (file paths? a commit
+        // range, which the server has no repo access to resolve, per
+        // f4085cf's commit message? something else?). Adding one here would
+        // be a new feature riding along on a bug-fix commit. Considered and
+        // deferred.
         tool(
             "session_intent",
-            "The full verbatim human requests for the session. Pull this only when reasoning about a specific change; it is large by design and is deliberately not included in review_context.",
+            "The full verbatim human requests for the session, large and unfiltered. Call this only after the diff and review_context have both been read and a specific ambiguity remains that neither one resolves. Loading it speculatively adds noise and degrades review quality rather than improving it.",
             serde_json::json!({"max_tokens": {"type": "integer", "description": "Optional smaller budget. Can only lower the default cap, never raise it."}}),
             &[],
         ),
