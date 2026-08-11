@@ -78,16 +78,6 @@ const QUOTE_MAX: usize = 500;
 /// reviewer that has decided it needs the full request text, not pushed at
 /// one that did not ask.
 const CAP_INTENT: usize = 20_000;
-/// Ordinary cardinality cap on `session_intent`'s request list: at most this
-/// many requests are ever CONSIDERED for packing, applied before the
-/// size-based packing in `session_intent` runs. High enough that a normal
-/// session is never trimmed by it; it exists to bound the packing loop's
-/// work (each step re-serializes the running payload) against a session
-/// with a pathological number of human turns, not to shrink ordinary
-/// output. Distinct from, and reported separately from, the size-based
-/// per-request skip: a request beyond this window is dropped by count, not
-/// because its own text failed to fit.
-const INTENT_LIST_MAX: usize = 200;
 
 /// The grouping rule, printed verbatim in every work-unit payload so a reader
 /// never has to consult the source to audit a grouping.
@@ -1087,9 +1077,10 @@ pub fn review_context(s: &Session, meta: &SessionMeta) -> Value {
 /// doing so keeps it within `cap`, and otherwise skip just that one and
 /// keep walking. `requests_included` and `requests_omitted_for_size` are
 /// reported unconditionally so a reviewer can always tell how much was
-/// withheld and that the reason was size, distinct from `INTENT_LIST_MAX`
-/// (an ordinary cardinality cap on how many requests are even considered,
-/// ahead of packing, purely to bound the packing loop's own work).
+/// withheld and that the reason was size. Every request in `scope.requests`
+/// is considered; the token budget is the only bound on how many come back,
+/// so `requests_omitted_for_size` accounts for every one that did not make
+/// it in.
 ///
 /// # Fix 2: `max_tokens` is honored as a real ceiling, not overshot
 ///
@@ -1133,12 +1124,6 @@ pub fn session_intent(s: &Session, meta: &SessionMeta, max_tokens: Option<usize>
         "note": "requests re-derives the same attributed requests scope() produced, in full; it cannot recover unattributed_turns (unknown-origin turns, never attributed to begin with)"
     });
 
-    // Fix 1's ordinary cardinality cap: at most `INTENT_LIST_MAX` requests
-    // are ever considered for packing. Separate from, and reported
-    // separately from, the size-based skip below.
-    let considered = &scope.requests[..total.min(INTENT_LIST_MAX)];
-    let list_capped = total > considered.len();
-
     let build = |kept: &[Value], omitted_for_size: usize, budget_too_small: bool| {
         json!({
             "v": 3,
@@ -1149,28 +1134,30 @@ pub fn session_intent(s: &Session, meta: &SessionMeta, max_tokens: Option<usize>
             "requests_omitted_for_size": omitted_for_size,
             "request_coverage": request_coverage.clone(),
             "budget_too_small": budget_too_small,
-            "truncated": omitted_for_size > 0 || list_capped || id_cut || budget_too_small
+            "truncated": omitted_for_size > 0 || id_cut || budget_too_small
         })
     };
 
     // Fix 2: the zero-request envelope is the floor this payload can ever
-    // shrink to. `omitted_for_size` is reported as every considered request
-    // here, which is accurate: if even the empty envelope does not fit
-    // `cap`, no single request can fit alongside it either.
-    let envelope = build(&[], considered.len(), false);
+    // shrink to. `omitted_for_size` is reported as every request here,
+    // which is accurate: if even the empty envelope does not fit `cap`, no
+    // single request can fit alongside it either.
+    let envelope = build(&[], total, false);
     let min_viable_tokens = est_tokens(&envelope);
     if min_viable_tokens > cap {
-        let mut too_small = build(&[], considered.len(), true);
+        let mut too_small = build(&[], total, true);
         too_small["min_viable_tokens"] = json!(min_viable_tokens);
         return too_small;
     }
 
     // Fix 1: pack individually. Push each candidate, keep it if the payload
     // still fits, otherwise pop it back off and count it as omitted for
-    // size, then move on to the NEXT request rather than giving up.
+    // size, then move on to the NEXT request rather than giving up. Every
+    // request in `scope.requests` is considered; the token budget is the
+    // only bound.
     let mut kept: Vec<Value> = Vec::new();
     let mut omitted_for_size = 0usize;
-    for r in considered {
+    for r in &scope.requests {
         kept.push(json!({
             // NOT elided: the entire point of this tool is the full text.
             // If a request does not fit, it is dropped whole (below) rather
@@ -2420,6 +2407,43 @@ mod tests {
         );
         assert_eq!(p["requests_included"], 5);
         assert_eq!(p["truncated"], true);
+    }
+
+    #[test]
+    fn session_intent_considers_every_request_no_hidden_cardinality_cap() {
+        // Residual 2: a pre-slice to INTENT_LIST_MAX (200) requests used to
+        // run BEFORE packing, so a 201st+ request was never considered, not
+        // even counted in requests_omitted_for_size, only folded into the
+        // generic `truncated` flag. That is a silent cap in a payload whose
+        // whole discipline is that nothing shown can be mistaken for
+        // everything. With the pre-slice gone, the token budget is the only
+        // real bound; a generous budget must return every one of 210 tiny
+        // requests, proving no hidden cardinality cap survives.
+        let mut lines = Vec::new();
+        for i in 0..210 {
+            lines.push(format!(
+                r#"{{"type":"user","timestamp":"2026-01-01T00:{:02}:00Z","origin":{{"kind":"human"}},"message":{{"content":"r{i}"}}}}"#,
+                i % 60
+            ));
+        }
+        let s = crate::ingest::ingest_str(&lines.join("\n"), crate::model::Lane::Main);
+        let meta = SessionMeta {
+            id: "s1".into(),
+            identified_by: "explicit".into(),
+            unit: None,
+        };
+
+        let p = session_intent(&s, &meta, None);
+
+        assert_eq!(p["totals"]["requests"], 210);
+        assert_eq!(
+            p["requests"].as_array().unwrap().len(),
+            210,
+            "no hidden cardinality cap: all 210 requests must be considered and fit"
+        );
+        assert_eq!(p["requests_included"], 210);
+        assert_eq!(p["requests_omitted_for_size"], 0);
+        assert_eq!(p["truncated"], false);
     }
 
     #[test]

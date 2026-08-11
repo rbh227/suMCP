@@ -26,15 +26,9 @@ pub struct Idx(pub u32);
 /// The derived `Ord` orders variants by declaration order, so `Main` sorts
 /// before every `Sub(..)` — exactly the "main first" tie-break the ordering
 /// contract wants. `Sub`s then order by their id string.
-// `Default` (via `#[default]` on `Main`) is what lets `#[serde(default)]` on
-// `TaskEvent::lane` fall back to something when deserializing a disk cache
-// written before that field existed. `Main` is the right fallback: those old
-// cache entries only ever came from a main-lane ingest (no subagent
-// transcript has ever created a task in the live corpus).
-#[derive(Debug, Default, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Lane {
     /// The primary session transcript.
-    #[default]
     Main,
     /// A subagent transcript, identified by its agent id.
     Sub(String),
@@ -483,7 +477,6 @@ pub struct TaskEvent {
     /// 1, so a subagent's task "1" and the main lane's task "1" would
     /// otherwise share an identity. Task identity is therefore
     /// `(session_ix, lane, id)`, not `id` alone.
-    #[serde(default)]
     pub lane: Lane,
     // Deliberately no `Idx` field here, same reasoning as `Decision` above:
     // both merge functions renumber every action's `Idx` globally, so an
