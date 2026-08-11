@@ -13,7 +13,9 @@
 //! that is the more robust choice: a surprising shape in one field costs us
 //! that field, not the whole line's type/uuid/timestamp.
 
-use crate::model::{Action, ActionKind, Decision, Idx, Lane, Session, Spawn, Tokens, UserText};
+use crate::model::{
+    Action, ActionKind, Decision, Idx, Lane, Session, Spawn, TaskEvent, Tokens, UserText,
+};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -69,6 +71,12 @@ pub fn ingest_str(raw: &str, default_lane: Lane) -> Session {
         String,
         std::collections::BTreeMap<String, String>,
     > = std::collections::BTreeMap::new();
+    // Task ids are assigned by the harness and only echoed back as free text,
+    // so we number creates ourselves in the order they appear. The harness
+    // numbers them the same way, which is why a later TaskUpdate's taskId
+    // matches.
+    let mut task_events: Vec<TaskEvent> = Vec::new();
+    let mut creates_seen: u32 = 0;
 
     for (line_no, line) in raw.lines().enumerate() {
         if line.trim().is_empty() {
@@ -285,6 +293,44 @@ pub fn ingest_str(raw: &str, default_lane: Lane) -> Session {
                             }
                         }
 
+                        // Task lifecycle. TaskCreate always starts a task at
+                        // pending; TaskUpdate is a lifecycle event only when
+                        // it carries a status (it is also used for renames
+                        // and dependency edits, which are not evidence of
+                        // anything unfinished).
+                        if name == "TaskCreate" {
+                            creates_seen += 1;
+                            task_events.push(TaskEvent {
+                                id: creates_seen.to_string(),
+                                subject: input
+                                    .and_then(|i| i.get("subject"))
+                                    .and_then(Value::as_str)
+                                    .map(str::to_string),
+                                status: "pending".to_string(),
+                                line_no,
+                                session_ix: 0,
+                            });
+                        } else if name == "TaskUpdate"
+                            && let Some(status) = input
+                                .and_then(|i| i.get("status"))
+                                .and_then(Value::as_str)
+                        {
+                            task_events.push(TaskEvent {
+                                id: input
+                                    .and_then(|i| i.get("taskId"))
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("?")
+                                    .to_string(),
+                                subject: input
+                                    .and_then(|i| i.get("subject"))
+                                    .and_then(Value::as_str)
+                                    .map(str::to_string),
+                                status: status.to_string(),
+                                line_no,
+                                session_ix: 0,
+                            });
+                        }
+
                         pending.push(PendingAction {
                             tool_use_id: tool_id.map(str::to_string),
                             effective_ts: effective_ts.clone(),
@@ -485,6 +531,7 @@ pub fn ingest_str(raw: &str, default_lane: Lane) -> Session {
         auto_accept,
         spawns,
         decisions,
+        task_events,
         // A single `ingest_str` call has no idea what its own transcript id
         // is (that lives outside the raw JSONL text it was handed), so it
         // cannot fill this in. It leaves the table empty; the merge/assembly
@@ -931,6 +978,33 @@ mod tests {
             Some("SQLite"),
             "second call's own answer, not the first call's"
         );
+    }
+
+    #[test]
+    fn task_events_record_creation_and_final_status() {
+        // Unfinished work is invisible in a diff: a task created and never
+        // completed means the commit is partial, and no reviewer can tell that
+        // from the code.
+        let create = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"tool_use","id":"t1","name":"TaskCreate","input":{"subject":"Wire the cache"}}]}}"#;
+        let update = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:10Z","message":{"content":[{"type":"tool_use","id":"t2","name":"TaskUpdate","input":{"taskId":"1","status":"in_progress"}}]}}"#;
+        let s = ingest_str(&format!("{create}\n{update}"), Lane::Main);
+
+        assert_eq!(s.task_events.len(), 2);
+        assert_eq!(s.task_events[0].subject.as_deref(), Some("Wire the cache"));
+        assert_eq!(s.task_events[0].status, "pending", "a create starts pending");
+        assert_eq!(s.task_events[0].id, "1", "creates are numbered in order");
+        assert_eq!(s.task_events[1].id, "1");
+        assert_eq!(s.task_events[1].status, "in_progress");
+    }
+
+    #[test]
+    fn a_task_update_without_a_status_is_ignored() {
+        // TaskUpdate also renames and reassigns. Only status transitions are
+        // lifecycle events; a rename is not evidence of anything unfinished.
+        let update = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:10Z","message":{"content":[{"type":"tool_use","id":"t2","name":"TaskUpdate","input":{"taskId":"1","subject":"Renamed"}}]}}"#;
+        let s = ingest_str(update, Lane::Main);
+
+        assert!(s.task_events.is_empty());
     }
 
     #[test]

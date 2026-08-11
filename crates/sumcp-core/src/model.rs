@@ -401,6 +401,36 @@ pub struct Decision {
     // not re-add `idx` here without solving the staleness problem first.
 }
 
+/// One transition in a task's lifecycle: its creation, or a status change.
+///
+/// Kept as an event LIST rather than a final-state map because the payload
+/// needs to cite the action that left a task unfinished, and a map would
+/// have thrown that index away.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TaskEvent {
+    /// The task id. Creates are numbered in the order they appear (`"1"`,
+    /// `"2"`, ...) because the create's assigned id comes back only as free
+    /// text in the result, which is not a field we can rely on. Updates use
+    /// the `taskId` they were given, which matches that numbering.
+    pub id: String,
+    /// The subject, present on creates and on renames, absent on plain
+    /// status updates.
+    pub subject: Option<String>,
+    /// `"pending"` for a create, otherwise the status the update set.
+    pub status: String,
+    /// Source line (total-order tiebreak).
+    pub line_no: usize,
+    /// Which transcript of the work unit this came from.
+    #[serde(default)]
+    pub session_ix: u16,
+    // Deliberately no `Idx` field here, same reasoning as `Decision` above:
+    // both merge functions renumber every action's `Idx` globally, so an
+    // index captured at ingest time would go stale the moment a merge ran.
+    // `line_no` + `session_ix` are stable across merges; a later task
+    // resolves the real, current `Idx` from the MERGED session by matching
+    // on that pair.
+}
+
 /// A fully parsed session: ordered actions plus parse-health counters.
 ///
 /// `Default` is `#[cfg(test)]`-only, same reasoning as `Action`'s: it lets a
@@ -446,6 +476,11 @@ pub struct Session {
     /// existed still deserialize.
     #[serde(default)]
     pub decisions: Vec<Decision>,
+    /// Task lifecycle transitions, in source order. Replayed by the context
+    /// module into a final state per task, so the payload can report work
+    /// that was planned and never finished.
+    #[serde(default)]
+    pub task_events: Vec<TaskEvent>,
     /// The transcript ids making up this session, oldest first. An action's
     /// `session_ix` indexes into this. A single-transcript analysis has
     /// exactly one entry, so `session_ids[0]` is always the id being reported.

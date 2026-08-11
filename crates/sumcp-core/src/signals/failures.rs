@@ -326,6 +326,7 @@ mod tests {
             auto_accept: false,
             spawns: vec![],
             decisions: vec![],
+            task_events: vec![],
             session_ids: vec![],
             subagent_files_missing: 0,
         };
