@@ -75,12 +75,15 @@ enum Command {
         /// they never disagree about what "this session" means).
         #[arg(long)]
         file: Option<PathBuf>,
-        /// A git revision range (e.g. `HEAD~3..HEAD`) whose commit times
-        /// are reported as a sanity check on the session picked above.
-        /// Resolved with `git`, run in the current directory; an
-        /// unresolvable range is a hard error, never a silent fall back to
-        /// reporting the whole session, because answering about the wrong
-        /// sessions is the exact failure this feature exists to prevent.
+        /// A git revision range (e.g. `HEAD~3..HEAD`), resolved with `git`
+        /// run in the current directory, and used as a scope GUARD on the
+        /// session picked above: if the session's own time span does not
+        /// overlap the range's commit window, this is a hard error and
+        /// nothing is printed to stdout. An unresolvable range is likewise a
+        /// hard error. This does not filter the session's contents down to
+        /// the overlapping part; the payload always covers the whole
+        /// session. Answering about the wrong session is the exact failure
+        /// this feature exists to prevent.
         #[arg(long)]
         range: Option<String>,
         /// Emit the `session_intent` payload (what the human asked for)
@@ -380,26 +383,46 @@ fn main() -> ExitCode {
 /// [`resolve_target`], the exact function bare `sumcp` uses, so the two
 /// paths never disagree about what "this session" means.
 ///
-/// A `--range` is resolved into a Unix-epoch time window purely to REPORT
-/// it as a sanity check on the session picked above; nothing here compares
-/// it against the transcript's own timestamps. `work_unit::to_epoch_secs`,
-/// the one converter from a transcript's RFC 3339 string onto the same
-/// epoch-second footing [`sumcp_core::git::range_window`] returns, is
-/// `pub(crate)` to `sumcp-core` and unreachable from this crate. A hand
-/// rolled second comparison here (say, formatting the epoch bounds back to
-/// RFC 3339 and comparing strings) would risk exactly the silent wrong
-/// order bug that function's own doc comment warns about: two RFC 3339
-/// strings only sort chronologically when they share one exact width and
-/// format, and a hand rolled formatter has no guarantee of that against
-/// transcript timestamps it never parsed. So this function resolves and
-/// reports the window and stops there; it does not select or exclude
-/// anything by it.
+/// A `--range` is resolved into a Unix-epoch time window (`git::range_window`)
+/// and used as a SCOPE GUARD, not a filter: once the session is loaded, its
+/// own epoch span (earliest/latest `effective_ts`, via
+/// `work_unit::session_epoch_span`) is checked for overlap against the
+/// window, and a session that does not overlap is a hard error with nothing
+/// on stdout. This is deliberately not action-level filtering of the
+/// session's contents down to the overlapping part; the commit-to-session
+/// mapping semantics that would require are an open design question (see
+/// `docs/superpowers/specs/2026-08-10-review-context-design.md`), not
+/// something to invent inside a bug fix. When the session does overlap, the
+/// payload printed still covers the WHOLE session, and stderr says so
+/// explicitly so a reader cannot mistake "overlaps" for "filtered to".
+///
+/// Both bounds this compares are epoch seconds, never formatted timestamp
+/// strings: git emits local time with a UTC offset and transcripts emit UTC
+/// with milliseconds, so lexical string comparison across the two is not a
+/// time comparison at all (see `git::range_window`'s doc comment).
 ///
 /// An unresolvable range is still a hard error, never a silent fall back to
-/// reporting the whole session: reporting context from the wrong sessions
-/// is the precise failure this feature exists to prevent, and
-/// `range_window` already errors rather than guessing, so this function
-/// must not undo that by papering over the failure.
+/// reporting the whole session: reporting context from the wrong session is
+/// the precise failure this feature exists to prevent, and `range_window`
+/// already errors rather than guessing, so this function must not undo that
+/// by papering over the failure.
+/// Whether a session's own epoch span (`[start, end]`, both ends included:
+/// the session was genuinely running at either instant) overlaps a
+/// `--range` window (`(start, end]`, half-open per `git::range_window`'s
+/// doc comment: it opens the instant the PREVIOUS commit landed and closes
+/// the instant the range's own last commit landed).
+///
+/// Two conditions, both required: the session must still have been going
+/// strictly AFTER the window opened (`s_end > w_start`; touching the open
+/// start instant exactly does not count), and must have started at or
+/// before the window closed (`s_start <= w_end`; touching the closed end
+/// instant exactly does count).
+fn window_overlaps_session(window: (i64, i64), session: (i64, i64)) -> bool {
+    let (w_start, w_end) = window;
+    let (s_start, s_end) = session;
+    s_end > w_start && s_start <= w_end
+}
+
 fn cmd_context(
     file: Option<PathBuf>,
     range: Option<String>,
@@ -436,29 +459,30 @@ fn cmd_context(
         }
     };
 
-    // A range narrows nothing yet if git cannot answer; that is a hard
-    // error rather than a silent full-session answer (see this function's
-    // doc comment).
-    if let Some(r) = range.as_deref() {
-        let Some(dir) = cwd else {
-            eprintln!(
-                "sumcp: --range needs a readable current directory to run git in, and none was found"
-            );
-            return ExitCode::FAILURE;
-        };
-        match sumcp_core::git::range_window(dir, r) {
-            Ok((start, end)) => {
-                // Reported, not compared: see this function's doc comment.
+    // A bad range is a hard error rather than a silent full-session answer
+    // (see this function's doc comment). Resolved here, before the session
+    // even loads, so a bad range fails fast with nothing on stdout. The
+    // window itself is held onto rather than acted on yet: whether it is a
+    // GUARD that passes or fails can only be known once the session below
+    // has loaded and its own epoch span is known.
+    let window: Option<(i64, i64)> = match range.as_deref() {
+        Some(r) => {
+            let Some(dir) = cwd else {
                 eprintln!(
-                    "sumcp: range {r} covers work done strictly after epoch {start}s, up to and including epoch {end}s"
+                    "sumcp: --range needs a readable current directory to run git in, and none was found"
                 );
-            }
-            Err(e) => {
-                eprintln!("sumcp: could not resolve range '{r}': {e}");
                 return ExitCode::FAILURE;
+            };
+            match sumcp_core::git::range_window(dir, r) {
+                Ok(w) => Some(w),
+                Err(e) => {
+                    eprintln!("sumcp: could not resolve range '{r}': {e}");
+                    return ExitCode::FAILURE;
+                }
             }
         }
-    }
+        None => None,
+    };
 
     // The user never named this file, so say which session we picked. Goes
     // to stderr on purpose: stdout must stay pipeable JSON.
@@ -513,6 +537,43 @@ fn cmd_context(
         let meta = unit_meta_from(&assembled);
         (assembled.session, meta)
     };
+
+    // The range guard: only reachable when `--range` was given, in which
+    // case `window` is always `Some` (an unresolvable range already
+    // returned above). A session that does not overlap the window, or whose
+    // span cannot even be determined, is a hard error with nothing on
+    // stdout: the same "wrong session" failure an unresolvable range
+    // guards against, just discovered one step later. A session that does
+    // overlap proceeds, but the note on stderr says plainly that overlap is
+    // all that was checked: the payload still covers the whole session.
+    if let Some(r) = range.as_deref() {
+        let (w_start, w_end) =
+            window.expect("Some(range) implies window was resolved above, or we already returned");
+        let session_id = stem_id(&target.path);
+        let Some((s_start, s_end)) = sumcp_core::work_unit::session_epoch_span(&session.actions)
+        else {
+            eprintln!(
+                "sumcp: session {session_id} has no timestamped actions, so whether it overlaps \
+                 range {r} cannot be verified. Nothing printed: an unverifiable scope is treated \
+                 the same as a wrong one."
+            );
+            return ExitCode::FAILURE;
+        };
+        if !window_overlaps_session((w_start, w_end), (s_start, s_end)) {
+            eprintln!(
+                "sumcp: session {session_id} spans epoch [{s_start}, {s_end}], which does not \
+                 overlap range {r}'s window (strictly after epoch {w_start}, up to and including \
+                 epoch {w_end}). Nothing printed: reporting context from a session outside the \
+                 requested range is the exact failure this feature exists to prevent."
+            );
+            return ExitCode::FAILURE;
+        }
+        eprintln!(
+            "sumcp: session {session_id} (epoch [{s_start}, {s_end}]) overlaps range {r}'s window \
+             (epoch ({w_start}, {w_end}]). This confirms only that overlap: the payload below \
+             still covers the WHOLE session, not filtered down to the overlapping part."
+        );
+    }
 
     let meta = SessionMeta {
         id: stem_id(&target.path),
@@ -619,5 +680,39 @@ mod tests {
             Some(PathBuf::from("/Users/dev/.claude"))
         );
         assert_eq!(claude_home_from(None, None), None);
+    }
+
+    #[test]
+    fn a_session_entirely_before_the_window_does_not_overlap() {
+        assert!(!window_overlaps_session((100, 200), (0, 50)));
+    }
+
+    #[test]
+    fn a_session_entirely_after_the_window_does_not_overlap() {
+        assert!(!window_overlaps_session((100, 200), (250, 300)));
+    }
+
+    #[test]
+    fn a_session_spanning_the_whole_window_overlaps() {
+        assert!(window_overlaps_session((100, 200), (0, 300)));
+    }
+
+    #[test]
+    fn touching_only_the_windows_open_start_instant_does_not_overlap() {
+        // The window is (start, end]: open at the start. A session whose
+        // entire span is that one instant was not itself happening AFTER
+        // the window opened, so this must not count as overlap. This is
+        // the boundary the whole half-open/closed distinction exists for;
+        // flipping `>` to `>=` in `window_overlaps_session` would make this
+        // test fail.
+        assert!(!window_overlaps_session((100, 200), (100, 100)));
+    }
+
+    #[test]
+    fn touching_only_the_windows_closed_end_instant_does_overlap() {
+        // The window is (start, end]: closed at the end. A session whose
+        // entire span is that one instant DOES count as overlap. Flipping
+        // `<=` to `<` in `window_overlaps_session` would make this fail.
+        assert!(window_overlaps_session((100, 200), (200, 200)));
     }
 }
