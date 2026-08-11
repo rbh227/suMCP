@@ -185,7 +185,7 @@ fn tool(
     )
 }
 
-/// The six tools of the v1 contract (`docs/payload-schema.md`).
+/// The eight tools of the v1 contract (`docs/payload-schema.md`).
 fn tool_list() -> Vec<Tool> {
     vec![
         tool(
@@ -224,6 +224,18 @@ fn tool_list() -> Vec<Tool> {
             serde_json::json!({"idxs": {"type": "array", "items": {"type": "integer"}, "description": "Action indices from a finding's idxs field."}}),
             &["idxs"],
         ),
+        tool(
+            "review_context",
+            "Recorded session context for reviewing a change: what was asked, what the human decided (and the options rejected), what was left unfinished, and what the agent claimed it did. Facts with citations, never judgments. Call session_intent for the full request text.",
+            serde_json::json!({}),
+            &[],
+        ),
+        tool(
+            "session_intent",
+            "The full verbatim human requests for the session. Pull this only when reasoning about a specific change; it is large by design and is deliberately not included in review_context.",
+            serde_json::json!({"max_tokens": {"type": "integer", "description": "Optional smaller budget. Can only lower the default cap, never raise it."}}),
+            &[],
+        ),
     ]
 }
 
@@ -238,7 +250,7 @@ impl ServerHandler for SumcpServer {
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
         info.server_info = server_info;
         info.instructions = Some(
-            "Post-session forensics for Claude Code transcripts. Six read-only tools \
+            "Post-session forensics for Claude Code transcripts. Eight read-only tools \
              return compact JSON evidence (never narration). If a call returns \
              ambiguous_session, retry with an explicit session_id from the candidates."
                 .into(),
@@ -319,6 +331,14 @@ impl ServerHandler for SumcpServer {
             "evidence" => {
                 let idxs = parse_idxs(&args).map_err(|msg| ErrorData::invalid_params(msg, None))?;
                 payloads::evidence(session, &idxs, &meta)
+            }
+            "review_context" => payloads::review_context(session, &meta),
+            "session_intent" => {
+                let max = args
+                    .get("max_tokens")
+                    .and_then(|v| v.as_u64())
+                    .map(|n| n as usize);
+                payloads::session_intent(session, &meta, max)
             }
             other => {
                 return Err(ErrorData::invalid_params(
@@ -401,6 +421,14 @@ mod tests {
                 "evidence" => {
                     let idxs = parse_idxs(args)?;
                     payloads::evidence(&loaded.session, &idxs, &meta)
+                }
+                "review_context" => payloads::review_context(&loaded.session, &meta),
+                "session_intent" => {
+                    let max = args
+                        .get("max_tokens")
+                        .and_then(|v| v.as_u64())
+                        .map(|n| n as usize);
+                    payloads::session_intent(&loaded.session, &meta, max)
                 }
                 other => return Err(format!("unknown tool '{other}'")),
             };
@@ -491,7 +519,7 @@ mod tests {
     #[test]
     fn every_tool_is_read_only_and_accepts_session_id() {
         let tools = tool_list();
-        assert_eq!(tools.len(), 6);
+        assert_eq!(tools.len(), 8);
         for t in &tools {
             let a = t.annotations.as_ref().unwrap();
             assert_eq!(a.read_only_hint, Some(true), "{} must be read-only", t.name);

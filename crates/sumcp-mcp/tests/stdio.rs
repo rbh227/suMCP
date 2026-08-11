@@ -5,7 +5,7 @@
 //! stdin/stdout (exactly what Claude Code does) and checks the v1
 //! contract on real fixture data:
 //!
-//! - handshake works, six tools listed, every one `readOnlyHint: true`;
+//! - handshake works, eight tools listed, every one `readOnlyHint: true`;
 //! - every tool answers under its token cap with `v`, provenance, `truncated`;
 //! - `evidence(idxs)` dereferences a Finding taken from `struggle_areas`;
 //! - self-identification verifies a forwarded tool_use id (ADR A4);
@@ -96,7 +96,7 @@ impl Rpc {
         init
     }
 
-    /// Call one of our six tools; returns the payload parsed from the text
+    /// Call one of our eight tools; returns the payload parsed from the text
     /// content, plus the isError flag.
     fn tool(&mut self, name: &str, args: serde_json::Value) -> (serde_json::Value, bool) {
         self.tool_with_meta(name, args, None)
@@ -211,7 +211,7 @@ fn cap_ok(name: &str, payload: &serde_json::Value, cap: usize) {
 }
 
 #[test]
-fn six_tools_answer_the_frozen_contract_over_stdio() {
+fn eight_tools_answer_the_frozen_contract_over_stdio() {
     let tmp = tempfile::tempdir().unwrap();
     let (home, cwd) = fixture_home(tmp.path());
     let mut rpc = Rpc::spawn(&home, &cwd);
@@ -219,10 +219,10 @@ fn six_tools_answer_the_frozen_contract_over_stdio() {
     let init = rpc.handshake();
     assert_eq!(init["serverInfo"]["name"], "sumcp");
 
-    // --- tools/list: six tools, all read-only ---
+    // --- tools/list: eight tools, all read-only ---
     let listed = rpc.call("tools/list", serde_json::json!({}));
     let tools = listed["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 6);
+    assert_eq!(tools.len(), 8);
     for t in tools {
         assert_eq!(
             t["annotations"]["readOnlyHint"], true,
@@ -280,6 +280,28 @@ fn six_tools_answer_the_frozen_contract_over_stdio() {
     assert!(!actions.is_empty(), "finding idxs must dereference");
     assert!(actions[0]["idx"].is_number());
     cap_ok("evidence", &evidence, 1500);
+}
+
+#[test]
+fn review_context_and_session_intent_answer_over_stdio() {
+    // The two new tools must be listed AND callable, since a tool that lists
+    // but errors on call is worse than one that does not exist.
+    let tmp = tempfile::tempdir().unwrap();
+    let (home, cwd) = fixture_home(tmp.path());
+    let mut rpc = Rpc::spawn(&home, &cwd);
+    rpc.handshake();
+
+    let sid = serde_json::json!({"session_id": SESSION_ID});
+
+    let (ctx, err) = rpc.tool("review_context", sid.clone());
+    assert!(!err, "review_context must not error: {ctx}");
+    assert_eq!(ctx["v"], 3);
+    assert!(ctx["totals"].is_object(), "totals always present");
+
+    let (intent, err) = rpc.tool("session_intent", sid.clone());
+    assert!(!err, "session_intent must not error: {intent}");
+    assert_eq!(intent["v"], 3);
+    assert!(intent["requests"].is_array());
 }
 
 #[test]
