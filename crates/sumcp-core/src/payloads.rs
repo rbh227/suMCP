@@ -73,6 +73,14 @@ const CONTEXT_LIST_MAX: usize = 12;
 /// Longest single quoted string in `review_context`. A quote longer than this
 /// belongs in `session_intent`, which the reviewer pulls deliberately.
 const QUOTE_MAX: usize = 500;
+/// Token cap for `session_intent`. Far larger than every other payload,
+/// `review_context` included, because this one is PULLED deliberately by a
+/// reviewer that has decided it needs the full request text, not pushed at
+/// one that did not ask.
+const CAP_INTENT: usize = 20_000;
+/// Starting request count for `session_intent`, walked down by
+/// `shrink_to_fit`. High enough that a normal session is never trimmed.
+const INTENT_LIST_MAX: usize = 200;
 
 /// The grouping rule, printed verbatim in every work-unit payload so a reader
 /// never has to consult the source to audit a grouping.
@@ -1024,6 +1032,66 @@ pub fn review_context(s: &Session, meta: &SessionMeta) -> Value {
             // `coverage` for what it genuinely cannot recover.
             "attributed_intent_via": "session_intent",
             "truncated": longest > k || id_cut || string_cut
+        })
+    })
+}
+
+/// The full verbatim human requests for the session (`v: 3`).
+///
+/// Deliberately a separate tool from `review_context`: supplying a reviewer
+/// with requirements up front and asking it to check conformance induces
+/// OVERCORRECTION, where the model starts assuming flaws exist and flags
+/// correct code, and the effect gets worse the more you ask it to explain
+/// and repair (arXiv:2603.00539). So the full intent is deliberately NOT in
+/// the pushed `review_context` payload; making a reviewer ask for it here is
+/// the entire point of this tool existing separately.
+///
+/// Request text is NEVER elided, unlike every other transcript-derived
+/// string this crate echoes. If the budget is exceeded, `shrink_to_fit`
+/// drops WHOLE requests and `truncated` says so, rather than cutting each
+/// one down: a half-quoted request is worse than a missing one for a tool
+/// whose entire premise is exact quoting.
+///
+/// `max_tokens` lets a caller request a smaller budget than `CAP_INTENT`. A
+/// caller-supplied budget can only ever LOWER the cap, never raise it
+/// (`.min(CAP_INTENT)`), so this tool can't be pointed at itself to buy back
+/// the room `review_context` deliberately withholds.
+///
+/// `scope.requests` is the SAME attributed-only set `review_context` shows,
+/// in full rather than as a capped sample: neither payload can recover a
+/// turn whose origin could not be attributed (`Scope::unattributed_turns`,
+/// see its doc comment in `context.rs`). This payload has the identical
+/// exposure `review_context` does, so it discloses it the same way: a
+/// top-level `coverage` object, mirroring that payload's shape rather than
+/// inventing a different one, so a reviewer pulling "the full intent" is
+/// told plainly that some turns are not in it.
+pub fn session_intent(s: &Session, meta: &SessionMeta, max_tokens: Option<usize>) -> Value {
+    let scope = crate::context::scope(s);
+    let (session, id_cut) = session_block(meta);
+    let cap = max_tokens.unwrap_or(CAP_INTENT).min(CAP_INTENT);
+    let total = scope.requests.len();
+
+    let coverage_incomplete = scope.unattributed_turns > 0;
+    let coverage = json!({
+        "coverage_incomplete": coverage_incomplete,
+        "unattributed_turns": scope.unattributed_turns,
+        "note": "requests re-derives the same attributed requests scope() produced, in full; it cannot recover unattributed_turns (unknown-origin turns, never attributed to begin with)"
+    });
+
+    shrink_to_fit(cap, INTENT_LIST_MAX.min(total.max(1)), |k| {
+        json!({
+            "v": 3,
+            "session": session,
+            "requests": scope.requests.iter().take(k).map(|r| json!({
+                // NOT elided: the entire point of this tool is the full
+                // text. If it does not fit, whole requests are dropped
+                // (below) rather than each one being mutilated.
+                "text": r.text,
+                "line": r.line_no
+            })).collect::<Vec<_>>(),
+            "totals": {"requests": total},
+            "coverage": coverage,
+            "truncated": total > k || id_cut
         })
     })
 }
@@ -2114,6 +2182,88 @@ mod tests {
             p["truncated"], true,
             "an elided field must flip truncated even when no list hit its cap"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // session_intent (v3)
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn session_intent_returns_full_requests_and_honours_a_smaller_budget() {
+        let mut lines = Vec::new();
+        for i in 0..30 {
+            let text = "q".repeat(300);
+            lines.push(format!(
+                r#"{{"type":"user","timestamp":"2026-01-01T00:00:{i:02}Z","origin":{{"kind":"human"}},"message":{{"content":"{text}"}}}}"#
+            ));
+        }
+        let s = crate::ingest::ingest_str(&lines.join("\n"), crate::model::Lane::Main);
+        let meta = SessionMeta {
+            id: "s1".into(),
+            identified_by: "explicit".into(),
+            unit: None,
+        };
+
+        let big = session_intent(&s, &meta, None);
+        let small = session_intent(&s, &meta, Some(300));
+
+        assert_eq!(big["totals"]["requests"], 30);
+        assert_eq!(small["totals"]["requests"], 30, "total never shrinks");
+        assert!(
+            small["requests"].as_array().unwrap().len() < big["requests"].as_array().unwrap().len(),
+            "a smaller budget returns fewer requests"
+        );
+        assert!(est_tokens(&small) <= 300);
+    }
+
+    #[test]
+    fn session_intent_max_tokens_can_only_lower_the_cap_never_raise_it() {
+        // Item 2 (task-11 brief context): a caller-supplied budget larger
+        // than CAP_INTENT must be clamped down, never honored as a bigger
+        // cap. Verified indirectly: a session whose full text would already
+        // fit CAP_INTENT must not swell past it just because the caller
+        // asked for more room.
+        let mut lines = Vec::new();
+        for i in 0..5 {
+            lines.push(format!(
+                r#"{{"type":"user","timestamp":"2026-01-01T00:00:{i:02}Z","origin":{{"kind":"human"}},"message":{{"content":"hello {i}"}}}}"#
+            ));
+        }
+        let s = crate::ingest::ingest_str(&lines.join("\n"), crate::model::Lane::Main);
+        let meta = SessionMeta {
+            id: "s1".into(),
+            identified_by: "explicit".into(),
+            unit: None,
+        };
+
+        let uncapped = session_intent(&s, &meta, None);
+        let over_capped = session_intent(&s, &meta, Some(CAP_INTENT * 10));
+        assert_eq!(
+            uncapped, over_capped,
+            "a max_tokens above CAP_INTENT must not raise the effective cap"
+        );
+    }
+
+    #[test]
+    fn session_intent_reports_coverage_incomplete_when_turns_go_unattributed() {
+        // The same coverage disclosure review_context carries (item 3,
+        // task-11 brief context): session_intent re-derives from the SAME
+        // attributed requests scope() already produced, so it cannot recover
+        // a turn scope() excluded as unattributed either.
+        let unattributed = r#"{"type":"user","timestamp":"2026-01-01T00:00:00Z","message":{"content":"[Request interrupted by user]"}}"#;
+        let s = crate::ingest::ingest_str(unattributed, crate::model::Lane::Main);
+        let meta = SessionMeta {
+            id: "s1".into(),
+            identified_by: "explicit".into(),
+            unit: None,
+        };
+
+        let p = session_intent(&s, &meta, None);
+        assert!(
+            p["coverage"]["unattributed_turns"].as_u64().unwrap() > 0,
+            "the fixture must actually produce an unattributed turn"
+        );
+        assert_eq!(p["coverage"]["coverage_incomplete"], true);
     }
 
     #[test]
