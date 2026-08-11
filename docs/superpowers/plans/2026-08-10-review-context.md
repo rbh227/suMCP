@@ -2528,6 +2528,54 @@ knows the arm produces a bias indistinguishable from the effect."
 
 ---
 
+## Execution Protocol
+
+Standard subagent-driven development with **one substitution, decided by the
+human partner on 2026-08-11**: the per-task review gate is a **Codex
+adversarial review**, not a Claude task-reviewer subagent.
+
+Per task N:
+
+1. **Record the base.** `BASE=$(git rev-parse HEAD)` before dispatching
+   anything. Never use `HEAD~1` as the base: a task that lands more than one
+   commit would silently have all but the last dropped from review.
+2. **Extract the brief.** `scripts/task-brief docs/superpowers/plans/2026-08-10-review-context.md N`,
+   which prints a file path. The implementer reads that file; the plan is
+   never pasted into a dispatch prompt.
+3. **Dispatch one implementer subagent** with the brief path, a report-file
+   path, and the interfaces from earlier tasks that the brief cannot know.
+   One subagent at a time, never parallel: these tasks touch overlapping
+   files (`model.rs`, `ingest.rs`, `merge.rs`, `payloads.rs`).
+4. **Codex adversarial review of that task only:**
+
+   ```bash
+   node "$CODEX_COMPANION" adversarial-review --base "$BASE" <focus text>
+   ```
+
+   Scoping to `$BASE` is what makes this a per-task gate rather than a
+   whole-branch review. A working-tree target reviews nothing once the
+   implementer has committed, which is exactly how the first attempt at this
+   returned a vacuous `approve` on an empty diff.
+5. **Receive the review under `superpowers:receiving-code-review`.** Codex's
+   output is a set of suggestions to evaluate, not orders to follow. For each
+   finding: verify it against this codebase, check whether it breaks existing
+   behaviour, check whether the plan or spec deliberately chose otherwise.
+   Push back with technical reasoning where it is wrong. Dispatch a fix
+   subagent only for findings that survive that check.
+6. **A finding that contradicts the plan is the human's call.** Present the
+   finding beside the plan text that mandates it and ask which governs. Do
+   not let a fix silently overrule the plan, and do not dismiss a finding
+   because the plan mandated the behaviour.
+7. **Append one line to the ledger** at `.superpowers/sdd/progress.md`:
+   `Task N: complete (commits <base7>..<head7>, codex review <verdict>)`.
+
+**Codex has a conflict of interest here and it must be named.** This plan's
+entire thesis is that a reviewing agent produces better findings when given
+recorded session context. Codex is that reviewing agent. Its verdicts on the
+tool built to feed it are not disinterested, and an `approve` from it is not
+evidence the design works. Treat its findings as useful and its verdicts as
+uninformative.
+
 ## Verification
 
 After Task 16, before reporting completion:
