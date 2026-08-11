@@ -5,7 +5,8 @@
 //! verbatim, with a citation. It never asserts that anything is acceptable or
 //! risky, because that judgement belongs to the agent consuming this.
 
-use crate::model::{ActionKind, Idx, Lane, Session, TurnOrigin};
+use crate::ingest::INTERRUPT_PREFIX;
+use crate::model::{ActionKind, Idx, Lane, Session, TurnOrigin, UserText};
 use crate::signals::failures::is_validation;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -409,6 +410,22 @@ pub struct Claim {
     pub line_no: usize,
     /// Which transcript of the work unit it came from.
     pub session_ix: u16,
+    /// True when the human turn that closed this claim's window was an
+    /// interrupt (recognized the same way `ingest::INTERRUPT_PREFIX` is used
+    /// to count `Session::interrupts`), rather than an ordinary turn.
+    ///
+    /// The selection rule assumes the last block before a human turn is a
+    /// completion summary, because mid-turn narration is normally followed
+    /// by more prose. An interruption is exactly the case where that
+    /// assumption fails: the human cuts the turn off before the agent gets
+    /// to write a summary, so the "last block before the boundary" is
+    /// whatever the agent was narrating at that moment ("Let me check the
+    /// tests"), not a claim of completed work. This field does not suppress
+    /// that text -- it is still real evidence of what the agent was doing --
+    /// it only tells a reviewer to read it as possible INTENT rather than a
+    /// completion claim. `false` for the trailing window (no human turn
+    /// closed it) and for a window closed by an ordinary human turn.
+    pub window_interrupted: bool,
 }
 
 /// Extract the agent's claims about what it did.
@@ -425,8 +442,28 @@ pub struct Claim {
 /// rules engine and TikTok driver:"), so length does not separate assertion
 /// from chatter. Measured on 4 real sessions, this positional rule yields 18
 /// claims from 172 blocks, 3 from 22, and 4 from 6.
+///
+/// WHY THIS IS SCOPED PER TRANSCRIPT (decided after an adversarial review of
+/// the first version): `line_no` is only meaningful WITHIN one transcript's
+/// own file. The first version walked `s.user_texts` and `s.agent_texts` with
+/// one shared cursor comparing bare `line_no` values, discarding
+/// `session_ix`. After `merge_work_unit`, both vectors span several
+/// transcripts, so a prose block from transcript A could cross a boundary
+/// that numerically belonged to transcript B, emitting A's mid-turn
+/// narration as a claim while A's real boundary was never crossed and its
+/// real claim was dropped. This is the same bug class `segments`,
+/// `pushback_between`, and `evidence_between` in `signals/dynamics.rs` had to
+/// be fixed for, for the identical reason. The fix here follows their
+/// approach: partition both the human boundaries and the prose blocks by
+/// `session_ix`, run the last-block-before-each-boundary selection
+/// independently within each transcript, then combine the per-transcript
+/// results and sort by `(session_ix, line_no)` so two runs over an unchanged
+/// work unit agree byte for byte.
 pub fn claims(s: &Session) -> Vec<Claim> {
-    // Human turn boundaries, as source line numbers.
+    // Human turn boundaries, grouped by transcript and sorted by line_no
+    // within each group. Kept as full `&UserText` (not just `line_no`) so
+    // the boundary that actually closes a window can be inspected for
+    // `window_interrupted` below.
     //
     // Deliberately `is_human()`, not the explicit-`Human`-only filter
     // `scope()` uses -- and that asymmetry is intentional, not an
@@ -440,43 +477,87 @@ pub fn claims(s: &Session) -> Vec<Claim> {
     // human with certainty. Requiring that certainty here would merge two
     // windows together and promote mid-turn narration into a claim, exactly
     // the failure mode this rule exists to avoid.
-    let mut boundaries: Vec<usize> = s
-        .user_texts
-        .iter()
-        .filter(|u| u.is_human())
-        .map(|u| u.line_no)
-        .collect();
-    boundaries.sort_unstable();
+    let mut boundaries_by_session: BTreeMap<u16, Vec<&UserText>> = BTreeMap::new();
+    for u in s.user_texts.iter().filter(|u| u.is_human()) {
+        boundaries_by_session
+            .entry(u.session_ix)
+            .or_default()
+            .push(u);
+    }
+    for v in boundaries_by_session.values_mut() {
+        v.sort_by_key(|u| u.line_no);
+    }
 
-    let mut out = Vec::new();
-    let mut last: Option<&crate::model::AgentText> = None;
-    let mut next_boundary = 0usize;
-
+    // Prose blocks, grouped by transcript and sorted by line_no within each
+    // group, for the same reason: `merge_work_unit` concatenates each part's
+    // `agent_texts` in that part's own order but never re-sorts across parts,
+    // so grouping (rather than assuming a global order) is what makes this
+    // correct regardless of how many transcripts are in the work unit.
+    let mut prose_by_session: BTreeMap<u16, Vec<&crate::model::AgentText>> = BTreeMap::new();
     for t in &s.agent_texts {
-        // Cross every boundary this block sits after, emitting the block
-        // that was last before each one. A window with no prose in it emits
-        // nothing, which is correct: the agent said nothing to claim.
-        while next_boundary < boundaries.len() && t.line_no > boundaries[next_boundary] {
-            if let Some(prev) = last.take() {
-                out.push(Claim {
-                    text: prev.text.clone(),
-                    line_no: prev.line_no,
-                    session_ix: prev.session_ix,
-                });
+        prose_by_session.entry(t.session_ix).or_default().push(t);
+    }
+    for v in prose_by_session.values_mut() {
+        v.sort_by_key(|t| t.line_no);
+    }
+
+    let empty_boundaries: Vec<&UserText> = Vec::new();
+    let mut out = Vec::new();
+    for (session_ix, blocks) in &prose_by_session {
+        let boundaries = boundaries_by_session
+            .get(session_ix)
+            .unwrap_or(&empty_boundaries);
+        let mut last: Option<&crate::model::AgentText> = None;
+        let mut next_boundary = 0usize;
+
+        for t in blocks {
+            // Cross every boundary this block sits after, emitting the block
+            // that was last before each one. A window with no prose in it
+            // emits nothing, which is correct: the agent said nothing to
+            // claim. Both vectors are already scoped to this ONE transcript,
+            // so comparing their `line_no` values here is comparing numbers
+            // that mean the same thing.
+            while next_boundary < boundaries.len() && t.line_no > boundaries[next_boundary].line_no
+            {
+                if let Some(prev) = last.take() {
+                    out.push(Claim {
+                        text: prev.text.clone(),
+                        line_no: prev.line_no,
+                        session_ix: prev.session_ix,
+                        window_interrupted: boundaries[next_boundary]
+                            .text
+                            .starts_with(INTERRUPT_PREFIX),
+                    });
+                }
+                next_boundary += 1;
             }
-            next_boundary += 1;
+            last = Some(t);
         }
-        last = Some(t);
+        // The trailing window: prose after the final boundary this
+        // transcript ever crossed in the loop above, or a transcript that
+        // never had one. `next_boundary` can still point at a real,
+        // never-crossed boundary here (when no prose followed it), so that
+        // boundary -- not "no boundary at all" -- is what actually closed
+        // this window; `boundaries.get(next_boundary)` recovers it instead
+        // of assuming `window_interrupted` is always false.
+        if let Some(prev) = last {
+            let window_interrupted = boundaries
+                .get(next_boundary)
+                .is_some_and(|b| b.text.starts_with(INTERRUPT_PREFIX));
+            out.push(Claim {
+                text: prev.text.clone(),
+                line_no: prev.line_no,
+                session_ix: prev.session_ix,
+                window_interrupted,
+            });
+        }
     }
-    // The trailing window: prose after the final human turn, or a session
-    // that never had one.
-    if let Some(prev) = last {
-        out.push(Claim {
-            text: prev.text.clone(),
-            line_no: prev.line_no,
-            session_ix: prev.session_ix,
-        });
-    }
+    // Deterministic combination across transcripts: `BTreeMap` iteration is
+    // already `session_ix`-ascending and each group was built in
+    // `line_no`-ascending order, but sorting explicitly is the actual
+    // guarantee two runs agree byte for byte, not an implementation detail
+    // of `BTreeMap` this function should rely on silently.
+    out.sort_by_key(|c| (c.session_ix, c.line_no));
     out
 }
 
@@ -1033,5 +1114,96 @@ mod tests {
         let s = ingest_str(only, Lane::Main);
 
         assert_eq!(claims(&s).len(), 1);
+    }
+
+    // ---- DEFECT 1 regression: claims() must not compare line numbers
+    // across transcripts. `line_no` is only meaningful WITHIN one
+    // transcript's own file, exactly like the reasoning already documented
+    // on `signals::dynamics::segments`, `pushback_between`, and
+    // `evidence_between`. Transcript A has prose at line 1 (mid-turn
+    // narration) and line 9 (its real summary), then a human turn at line
+    // 10. Transcript B has an unrelated human turn at line 2. Before this
+    // fix, boundaries were pooled across both transcripts and sorted purely
+    // numerically ([2, 10]), so A's line-9 block "crossed" B's line-2
+    // boundary and wrongly emitted A's line-1 narration as a claim, while
+    // A's real line-10 boundary never got the chance to be the thing that
+    // closed A's window.
+    #[test]
+    fn a_claim_never_crosses_a_boundary_from_another_transcript() {
+        let a_raw = [
+            "", // line 0: filler
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:01Z","message":{"content":[{"type":"text","text":"Let me check the tests."}]}}"#, // line 1: mid-turn narration
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "", // lines 2-8: filler
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:09Z","message":{"content":[{"type":"text","text":"Added the cache and its tests, 5 passing."}]}}"#, // line 9: A's real claim
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:10Z","origin":{"kind":"human"},"message":{"content":"continue"}}"#, // line 10: A's human turn
+        ]
+        .join("\n");
+        let b_raw = [
+            "",
+            "", // lines 0-1: filler
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:02Z","origin":{"kind":"human"},"message":{"content":"unrelated transcript's own turn"}}"#, // line 2: B's human turn
+        ]
+        .join("\n");
+
+        let a = ingest_str(&a_raw, Lane::Main);
+        let b = ingest_str(&b_raw, Lane::Main);
+        let merged = merge_work_unit(vec![("a".to_string(), a), ("b".to_string(), b)]);
+
+        let c = claims(&merged);
+        assert_eq!(
+            c.len(),
+            1,
+            "only A's real claim, not A's narration wrongly closed by B's boundary: got {c:?}"
+        );
+        assert_eq!(
+            c[0].text, "Added the cache and its tests, 5 passing.",
+            "A's line-9 block is A's claim"
+        );
+        assert_eq!(c[0].line_no, 9);
+        assert_eq!(c[0].session_ix, 0);
+    }
+
+    // ---- DEFECT 2 regressions: an interrupted turn tags the claim it
+    // closes, rather than silently promoting mid-turn narration into an
+    // ordinary completion claim. ----
+
+    #[test]
+    fn a_block_closed_by_an_interrupt_is_tagged_window_interrupted() {
+        // No summary was ever written -- the human cut the turn off mid-way.
+        // The narration is still emitted (it is real evidence of what the
+        // agent was doing), but tagged so a reviewer reads it as possible
+        // intent, not a completion claim.
+        let n1 = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"text","text":"Let me check the tests."}]}}"#;
+        let interrupt = r#"{"type":"user","timestamp":"2026-01-01T00:00:01Z","message":{"content":"[Request interrupted by user]"}}"#;
+        let s = ingest_str(&format!("{n1}\n{interrupt}"), Lane::Main);
+
+        let c = claims(&s);
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].text, "Let me check the tests.");
+        assert!(
+            c[0].window_interrupted,
+            "the closing turn was an interrupt marker"
+        );
+    }
+
+    #[test]
+    fn a_block_closed_by_an_ordinary_human_turn_is_not_tagged_interrupted() {
+        let sum = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"text","text":"Wired into the loader."}]}}"#;
+        let human = r#"{"type":"user","timestamp":"2026-01-01T00:00:01Z","origin":{"kind":"human"},"message":{"content":"now do the next thing"}}"#;
+        let s = ingest_str(&format!("{sum}\n{human}"), Lane::Main);
+
+        let c = claims(&s);
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].text, "Wired into the loader.");
+        assert!(
+            !c[0].window_interrupted,
+            "an ordinary human turn is not an interrupt"
+        );
     }
 }

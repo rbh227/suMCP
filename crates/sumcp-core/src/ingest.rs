@@ -24,7 +24,11 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 /// paste from bloating the model while still allowing equality comparison.
 const EDIT_CAP: usize = 2000;
 /// Prefix Claude Code writes when the user interrupts a turn.
-const INTERRUPT_PREFIX: &str = "[Request interrupted by user";
+///
+/// `pub(crate)` so `context::claims()` can reuse this exact rule to tag a
+/// claim whose closing turn was an interrupt, instead of writing a second,
+/// possibly-drifting definition of "what counts as an interrupt".
+pub(crate) const INTERRUPT_PREFIX: &str = "[Request interrupted by user";
 /// Longest prose block stored. Unlike `EDIT_CAP`, truncating here cannot skew
 /// any metric: nothing counts these characters, they are only quoted.
 ///
