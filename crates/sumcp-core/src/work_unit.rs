@@ -119,7 +119,7 @@ fn secs_between(a: &str, b: &str) -> Option<i64> {
 /// into whole eras plus a remainder ("year of era", `yoe`, 0..=399) lets the
 /// leap-year corrections (`/4`, `/100`) be done once per era with plain
 /// integer division, instead of needing a lookup table or a loop.
-fn to_epoch_secs(ts: &str) -> Option<i64> {
+pub(crate) fn to_epoch_secs(ts: &str) -> Option<i64> {
     let b = ts.as_bytes();
     if b.len() < 19 || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' {
         return None;
