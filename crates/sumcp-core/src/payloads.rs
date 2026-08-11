@@ -843,6 +843,24 @@ pub fn evidence(s: &Session, idxs: &[Idx], meta: &SessionMeta) -> Value {
 /// fifth heuristic `constraints` block was cut before implementation; see the
 /// plan's Task 9.) Every list is a capped sample and every corresponding
 /// total is unconditional, so "3 shown" can never be read as "3 happened".
+/// The same discipline reaches one level down: `options_not_chosen`, nested
+/// inside each decision, is itself a capped sample with an unconditional
+/// `options_not_chosen_total`, and EVERY transcript-derived string this
+/// payload echoes (requests, file paths, questions, answers, option labels,
+/// task subjects, statuses, commands, claim text) is elided before it is
+/// emitted, never raw. `truncated` reflects every one of those elisions
+/// (see `would_elide`), not just list cardinality and the session id, so a
+/// single oversized field can never be dropped invisibly.
+///
+/// This is a fix for an adversarial review of the original commit: two
+/// fields (`options_not_chosen`, `last_status`) were echoed verbatim with no
+/// per-string cap, and because `shrink_to_fit` walks ONE shared `k` down
+/// across all six lists, a single oversized value forced `k` all the way to
+/// 0, emptying every OTHER block too. Splitting `shrink_to_fit` so each
+/// block got its own budget was considered and rejected here: it is a
+/// larger change to a helper five other payloads share, and it is
+/// unnecessary once every nested string is capped, since that is what let
+/// one field force the shared `k` to 0 in the first place.
 pub fn review_context(s: &Session, meta: &SessionMeta) -> Value {
     let scope = crate::context::scope(s);
     let decisions = crate::context::decisions(s);
@@ -873,7 +891,68 @@ pub fn review_context(s: &Session, meta: &SessionMeta) -> Value {
         .max(incomplete.unfinished_tasks.len())
         .max(incomplete.failing_commands.len());
 
+    // Top-level, not nested a level down where the disclosure went unread
+    // (the review's actual finding): a reviewer that only checks
+    // `truncated` and `attributed_intent_via` must still see this.
+    // `attributed_intent_via` re-derives from the SAME attributed requests
+    // already shown in `scope.requests` above; it CANNOT recover a turn
+    // `requests` excluded (`unattributed_turns`, never attributed to begin
+    // with) or subagent prose `claims` excluded (`agent_texts_excluded`,
+    // never eligible for `claims` to begin with). `coverage_incomplete` is
+    // the one boolean a reviewer needs to know that gap exists at all.
+    let coverage_incomplete = scope.unattributed_turns > 0 || s.agent_texts_excluded > 0;
+    let coverage = json!({
+        "coverage_incomplete": coverage_incomplete,
+        "unattributed_turns": scope.unattributed_turns,
+        "agent_texts_excluded": s.agent_texts_excluded,
+        "note": "attributed_intent_via re-derives the same attributed requests shown above, in full; it cannot recover unattributed_turns (unknown-origin turns, never attributed) or agent_texts_excluded (excluded subagent prose, never eligible for claims)"
+    });
+
     shrink_to_fit(CAP_REVIEW_CONTEXT, CONTEXT_LIST_MAX, |k| {
+        // Would any string actually rendered at this `k` need eliding? Each
+        // check is scoped to the same `.take(k)` the render below uses, so
+        // this reflects what the payload is ABOUT to emit, not the full
+        // unshown data. Folded into `truncated` below: a single oversized
+        // field must flip it exactly like a capped list does.
+        let requests_cut = scope
+            .requests
+            .iter()
+            .take(k)
+            .any(|r| would_elide(&r.text, QUOTE_MAX));
+        let files_cut = scope
+            .files_edited
+            .iter()
+            .take(k)
+            .any(|f| would_elide(f, PATH_MAX));
+        let decisions_cut = decisions.iter().take(k).any(|d| {
+            would_elide(&d.question, QUOTE_MAX)
+                || d.chosen
+                    .as_deref()
+                    .is_some_and(|c| would_elide(c, QUOTE_MAX))
+                || d.options_not_chosen.len() > k
+                || d.options_not_chosen
+                    .iter()
+                    .take(k)
+                    .any(|o| would_elide(o, QUOTE_MAX))
+        });
+        let tasks_cut = incomplete.unfinished_tasks.iter().take(k).any(|t| {
+            t.subject
+                .as_deref()
+                .is_some_and(|x| would_elide(x, QUOTE_MAX))
+                || would_elide(&t.last_status, QUOTE_MAX)
+        });
+        let commands_cut = incomplete
+            .failing_commands
+            .iter()
+            .take(k)
+            .any(|c| would_elide(&c.command, QUOTE_MAX));
+        let claims_cut = claims
+            .iter()
+            .take(k)
+            .any(|c| would_elide(&c.text, QUOTE_MAX));
+        let string_cut =
+            requests_cut || files_cut || decisions_cut || tasks_cut || commands_cut || claims_cut;
+
         json!({
             "v": 3,
             "session": session,
@@ -895,7 +974,14 @@ pub fn review_context(s: &Session, meta: &SessionMeta) -> Value {
             "decisions": decisions.iter().take(k).map(|d| json!({
                 "question": elide_middle(&d.question, QUOTE_MAX),
                 "chosen": d.chosen.as_ref().map(|c| elide_middle(c, QUOTE_MAX)),
-                "options_not_chosen": d.options_not_chosen,
+                // Capped and elided like every other transcript-derived
+                // list/string pair here: an AskUserQuestion can carry an
+                // arbitrary number of options, each an arbitrary-length
+                // label, and both were unbounded before this fix.
+                "options_not_chosen": d.options_not_chosen.iter().take(k)
+                    .map(|o| json!(elide_middle(o, QUOTE_MAX)))
+                    .collect::<Vec<_>>(),
+                "options_not_chosen_total": d.options_not_chosen.len(),
                 // idxs, not just a line number: the Global Constraint is that
                 // every item is dereferenceable, and `evidence()` takes Idx.
                 // A bare line number is not something a reviewer can resolve.
@@ -906,7 +992,11 @@ pub fn review_context(s: &Session, meta: &SessionMeta) -> Value {
                 "unfinished_tasks": incomplete.unfinished_tasks.iter().take(k)
                     .map(|t| json!({
                         "subject": t.subject.as_ref().map(|x| elide_middle(x, QUOTE_MAX)),
-                        "last_status": t.last_status,
+                        // Elided like every other transcript-derived string:
+                        // this is the harness-confirmed `statusChange` (or
+                        // requested status) verbatim from the transcript,
+                        // not a value suMCP controls.
+                        "last_status": elide_middle(&t.last_status, QUOTE_MAX),
                         "line": t.line_no
                     })).collect::<Vec<_>>(),
                 "failing_commands": incomplete.failing_commands.iter().take(k)
@@ -926,10 +1016,14 @@ pub fn review_context(s: &Session, meta: &SessionMeta) -> Value {
             })).collect::<Vec<_>>(),
             "totals": totals,
             "list_cap": k,
-            // The reviewer must know the full intent is available rather than
-            // guessing that what it received is everything there was.
-            "full_intent_via": "session_intent",
-            "truncated": longest > k || id_cut
+            "coverage": coverage,
+            // Renamed from `full_intent_via`: it returns the same ATTRIBUTED
+            // requests already shown in `scope.requests`, in full, not the
+            // unattributed ones. It was never "full intent" and calling it
+            // that implied a completeness this tool cannot deliver; see
+            // `coverage` for what it genuinely cannot recover.
+            "attributed_intent_via": "session_intent",
+            "truncated": longest > k || id_cut || string_cut
         })
     })
 }
@@ -1927,5 +2021,127 @@ mod tests {
             "the shown list is a sample, strictly smaller than the true total"
         );
         assert!(est_tokens(&p) <= CAP_REVIEW_CONTEXT);
+    }
+
+    // ---------------------------------------------------------------------
+    // review_context fix wave (adversarial review of b74ca15)
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn review_context_survives_an_oversized_option_label_without_starving_other_blocks() {
+        // Fix 1: `options_not_chosen` and `last_status` used to be echoed
+        // verbatim with no per-string elision. `shrink_to_fit` walks ONE
+        // shared `k` down until the payload fits; with an oversized string
+        // still present in the payload at every k > 0, the loop had no
+        // choice but to walk all the way to k = 0, which empties requests,
+        // decisions, incomplete work AND claims together, not just the one
+        // oversized decision. This is the property that must survive: a
+        // hostile option label or status elsewhere in the payload must not
+        // starve the other blocks. RED on the pre-fix code (requests and
+        // claims come back empty).
+        let huge = "x".repeat(8000);
+        let human = r#"{"type":"user","timestamp":"2026-01-01T00:00:00Z","origin":{"kind":"human"},"message":{"content":"add a cache"}}"#;
+        let prose = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:01Z","message":{"content":[{"type":"text","text":"Done, added the cache"}]}}"#;
+        let ask = format!(
+            r#"{{"type":"assistant","timestamp":"2026-01-01T00:00:02Z","message":{{"content":[{{"type":"tool_use","id":"q1","name":"AskUserQuestion","input":{{"questions":[{{"question":"Which store?","options":[{{"label":"safe"}},{{"label":"{huge}"}}]}}]}}}}]}}}}"#
+        );
+        let ans = r#"{"type":"user","timestamp":"2026-01-01T00:00:03Z","message":{"content":[{"type":"tool_result","tool_use_id":"q1"}]},"toolUseResult":{"answers":{"Which store?":"safe"}}}"#;
+        let task = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:04Z","message":{"content":[{"type":"tool_use","id":"t1","name":"TaskCreate","input":{"subject":"Add tests"}}]}}"#;
+        let task_result = r#"{"type":"user","timestamp":"2026-01-01T00:00:05Z","message":{"content":[{"type":"tool_result","tool_use_id":"t1"}]},"toolUseResult":{"task":{"id":"1","subject":"Add tests"}}}"#;
+        let update = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:06Z","message":{"content":[{"type":"tool_use","id":"t2","name":"TaskUpdate","input":{"taskId":"1","status":"blocked"}}]}}"#;
+        let update_result = format!(
+            r#"{{"type":"user","timestamp":"2026-01-01T00:00:07Z","message":{{"content":[{{"type":"tool_result","tool_use_id":"t2"}}]}},"toolUseResult":{{"success":true,"taskId":"1","statusChange":"{huge}"}}}}"#
+        );
+        let s = crate::ingest::ingest_str(
+            &format!(
+                "{human}\n{prose}\n{ask}\n{ans}\n{task}\n{task_result}\n{update}\n{update_result}"
+            ),
+            crate::model::Lane::Main,
+        );
+        let meta = SessionMeta {
+            id: "s1".into(),
+            identified_by: "explicit".into(),
+            unit: None,
+        };
+
+        let p = review_context(&s, &meta);
+        assert!(
+            est_tokens(&p) <= CAP_REVIEW_CONTEXT,
+            "must hold its cap even with a hostile option label and status, got {}",
+            est_tokens(&p)
+        );
+        assert!(
+            !p["scope"]["requests"].as_array().unwrap().is_empty(),
+            "a human request must survive an oversized string elsewhere in the payload: {p}"
+        );
+        assert!(
+            !p["claims"].as_array().unwrap().is_empty(),
+            "a claim must survive an oversized string elsewhere in the payload: {p}"
+        );
+        assert_eq!(
+            p["totals"]["unfinished_tasks"], 1,
+            "the true total is unaffected by the cap either way"
+        );
+    }
+
+    #[test]
+    fn review_context_flags_truncated_when_a_single_field_is_elided_but_no_list_is_capped() {
+        // Fix 2: `truncated` used to reflect only list cardinality and the
+        // session id, so a single oversized field was elided invisibly. One
+        // request, one field over `QUOTE_MAX`, no list anywhere near
+        // `CONTEXT_LIST_MAX`.
+        let text = "y".repeat(QUOTE_MAX + 1);
+        let human = format!(
+            r#"{{"type":"user","timestamp":"2026-01-01T00:00:00Z","origin":{{"kind":"human"}},"message":{{"content":"{text}"}}}}"#
+        );
+        let s = crate::ingest::ingest_str(&human, crate::model::Lane::Main);
+        let meta = SessionMeta {
+            id: "s1".into(),
+            identified_by: "explicit".into(),
+            unit: None,
+        };
+
+        let p = review_context(&s, &meta);
+        assert_eq!(p["totals"]["requests"], 1, "no list was capped");
+        assert!(
+            p["scope"]["requests"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("chars elided"),
+            "the field itself must actually be elided"
+        );
+        assert_eq!(
+            p["truncated"], true,
+            "an elided field must flip truncated even when no list hit its cap"
+        );
+    }
+
+    #[test]
+    fn review_context_reports_coverage_incomplete_when_turns_go_unattributed() {
+        // Fix 3: the payload could emit `truncated: false` and point a
+        // reviewer at `attributed_intent_via` while `unattributed_turns` or
+        // `agent_texts_excluded` was positive, implying a gap that tool
+        // could close. It cannot: `attributed_intent_via` re-derives from
+        // the SAME attributed requests already shown, never the excluded
+        // ones. `coverage` is TOP-LEVEL so this can't be missed a level
+        // down.
+        let unattributed = r#"{"type":"user","timestamp":"2026-01-01T00:00:00Z","message":{"content":"[Request interrupted by user]"}}"#;
+        let s = crate::ingest::ingest_str(unattributed, crate::model::Lane::Main);
+        let meta = SessionMeta {
+            id: "s1".into(),
+            identified_by: "explicit".into(),
+            unit: None,
+        };
+
+        let p = review_context(&s, &meta);
+        assert!(
+            p["scope"]["unattributed_turns"].as_u64().unwrap() > 0,
+            "the fixture must actually produce an unattributed turn"
+        );
+        assert_eq!(p["coverage"]["coverage_incomplete"], true);
+        assert_eq!(
+            p["coverage"]["unattributed_turns"],
+            p["scope"]["unattributed_turns"]
+        );
     }
 }
