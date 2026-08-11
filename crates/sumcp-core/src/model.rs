@@ -520,6 +520,16 @@ pub struct Session {
     /// the diff.
     #[serde(default)]
     pub agent_texts: Vec<AgentText>,
+    /// How many non-empty prose blocks were seen on a NON-main lane and, for
+    /// that reason, never made it into `agent_texts` (`merge_sessions` keeps
+    /// only main's prose, see that function's comment for why). The string
+    /// itself is not worth retaining, but its existence is: without this
+    /// counter a payload could report a claim count with no sign that a
+    /// subagent's own account of its work went unrecorded. Honest scope
+    /// disclosure, same precedent as `subagent_files_missing`; a payload can
+    /// say "N subagent prose blocks were not captured".
+    #[serde(default)]
+    pub agent_texts_excluded: u64,
     /// The transcript ids making up this session, oldest first. An action's
     /// `session_ix` indexes into this. A single-transcript analysis has
     /// exactly one entry, so `session_ids[0]` is always the id being reported.

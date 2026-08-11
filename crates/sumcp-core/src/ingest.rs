@@ -92,10 +92,19 @@ pub fn ingest_str(raw: &str, default_lane: Lane) -> Session {
     // stays a single ordered `Vec` rather than separate create/update lists
     // that would need re-interleaving afterward.
     let mut pending_task_events: Vec<PendingTaskEvent> = Vec::new();
-    // Every non-empty prose block the agent wrote, in source order. Ingest
-    // makes no judgment about which blocks are worth keeping (see
-    // AGENT_TEXT_CAP's doc comment): that selection is Task 8's job.
+    // Every non-empty prose block the agent wrote ON THE MAIN LANE, in source
+    // order. Ingest makes no judgment about which blocks are worth keeping
+    // (see AGENT_TEXT_CAP's doc comment): that selection is Task 8's job.
+    // Subagent prose is never pushed here at all: `merge_sessions` discards
+    // it unconditionally (subagent prose is internal reasoning the human
+    // never saw), so capturing it would only allocate strings that are
+    // guaranteed to be thrown away.
     let mut agent_texts: Vec<AgentText> = Vec::new();
+    // How many non-empty prose blocks were seen on a non-main lane and
+    // therefore never pushed above. The count survives even though the
+    // string does not, so a payload can disclose that a subagent's account
+    // of its own work went unrecorded (see `Session::agent_texts_excluded`).
+    let mut agent_texts_excluded = 0u64;
 
     for (line_no, line) in raw.lines().enumerate() {
         if line.trim().is_empty() {
@@ -481,19 +490,44 @@ pub fn ingest_str(raw: &str, default_lane: Lane) -> Session {
                         if v.get("type").and_then(Value::as_str) == Some("assistant") =>
                     {
                         // Whitespace-only blocks carry nothing and would only
-                        // pad the list Task 8 selects from.
-                        if let Some(t) = block.get("text").and_then(Value::as_str)
-                            && !t.trim().is_empty()
-                        {
-                            agent_texts.push(AgentText {
-                                // `chars().take()` not `[..n]`: slicing a
-                                // String by byte index panics if it lands
-                                // mid-character, and prose is full of
-                                // multi-byte characters.
-                                text: t.chars().take(AGENT_TEXT_CAP).collect(),
-                                line_no,
-                                session_ix: 0,
-                            });
+                        // pad the list Task 8 selects from. `str::trim` uses
+                        // Unicode `White_Space`, not just ASCII, so a block of
+                        // e.g. U+3000 (ideographic space) is caught here too.
+                        //
+                        // Trim BEFORE capping, not after: a block can carry
+                        // more than AGENT_TEXT_CAP leading whitespace
+                        // characters followed by real text. Capping the raw
+                        // string first would keep only whitespace (the real
+                        // text sits past the cut), passing this check on the
+                        // full string while storing a blank block, exactly
+                        // the kind of blank that could later stand in as the
+                        // "last block before a human turn" and displace a
+                        // real claim. Trimming first means what gets stored
+                        // is what was validated as non-empty.
+                        if let Some(t) = block.get("text").and_then(Value::as_str) {
+                            let trimmed = t.trim();
+                            if !trimmed.is_empty() {
+                                // Subagent prose (non-main lane) is never kept:
+                                // `merge_sessions` drops every subagent
+                                // AgentText unconditionally, so pushing it here
+                                // would allocate a string that is always
+                                // thrown away. Its existence is still counted
+                                // (see `agent_texts_excluded`'s declaration)
+                                // so the exclusion is disclosed, not hidden.
+                                if default_lane == Lane::Main {
+                                    agent_texts.push(AgentText {
+                                        // `chars().take()` not `[..n]`: slicing
+                                        // a String by byte index panics if it
+                                        // lands mid-character, and prose is
+                                        // full of multi-byte characters.
+                                        text: trimmed.chars().take(AGENT_TEXT_CAP).collect(),
+                                        line_no,
+                                        session_ix: 0,
+                                    });
+                                } else {
+                                    agent_texts_excluded += 1;
+                                }
+                            }
                         }
                     }
                     _ => {}
@@ -665,6 +699,7 @@ pub fn ingest_str(raw: &str, default_lane: Lane) -> Session {
         decisions,
         task_events,
         agent_texts,
+        agent_texts_excluded,
         // A single `ingest_str` call has no idea what its own transcript id
         // is (that lives outside the raw JSONL text it was handed), so it
         // cannot fill this in. It leaves the table empty; the merge/assembly
@@ -1280,6 +1315,65 @@ mod tests {
         let s = ingest_str(&line, Lane::Main);
 
         assert_eq!(s.agent_texts[0].text.chars().count(), AGENT_TEXT_CAP);
+    }
+
+    #[test]
+    fn a_subagent_lanes_prose_is_not_retained_but_is_counted_as_excluded() {
+        // merge_sessions drops every subagent AgentText unconditionally, so
+        // keeping it here at ingest time would only allocate a string that is
+        // always thrown away. Its existence must still be disclosed: the
+        // count survives even though the text does not.
+        let line = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"text","text":"I refactored the parser to handle the new shape."}]}}"#;
+        let s = ingest_str(line, Lane::Sub("x".into()));
+
+        assert!(
+            s.agent_texts.is_empty(),
+            "subagent prose must not be retained"
+        );
+        assert_eq!(
+            s.agent_texts_excluded, 1,
+            "but its existence must be counted"
+        );
+    }
+
+    #[test]
+    fn leading_whitespace_past_the_cap_still_stores_the_real_text() {
+        // A block can carry more leading whitespace than AGENT_TEXT_CAP,
+        // followed by real prose. Capping the raw string BEFORE trimming
+        // would keep only whitespace (the real text sits past the cut),
+        // which would pass the old "is this blank" check on the full string
+        // while storing a blank block. Trimming first means what's stored is
+        // what was validated as non-empty.
+        let padding = " ".repeat(AGENT_TEXT_CAP + 500);
+        let text = format!("{padding}real claim here");
+        let line = format!(
+            r#"{{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{{"content":[{{"type":"text","text":"{text}"}}]}}}}"#
+        );
+        let s = ingest_str(&line, Lane::Main);
+
+        assert_eq!(s.agent_texts.len(), 1);
+        assert_eq!(
+            s.agent_texts[0].text, "real claim here",
+            "the trimmed real text must be stored, not a capped run of blanks"
+        );
+    }
+
+    #[test]
+    fn unicode_whitespace_only_block_is_still_skipped() {
+        // U+3000 (ideographic space) is Unicode whitespace, not ASCII, so an
+        // ASCII-only blank check would wrongly keep this block. `str::trim`
+        // uses Unicode `White_Space`, which does cover it.
+        let line = "{\"type\":\"assistant\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"\u{3000}\u{3000}\u{3000}\"}]}}";
+        let s = ingest_str(line, Lane::Main);
+
+        assert!(
+            s.agent_texts.is_empty(),
+            "Unicode-whitespace-only block must be skipped, not stored"
+        );
+        assert_eq!(
+            s.agent_texts_excluded, 0,
+            "skipped on the main lane, not excluded (exclusion is a non-main-lane count)"
+        );
     }
 
     #[test]

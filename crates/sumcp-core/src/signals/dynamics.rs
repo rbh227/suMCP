@@ -744,6 +744,7 @@ mod tests {
             decisions: vec![],
             task_events: vec![],
             agent_texts: vec![],
+            agent_texts_excluded: 0,
             session_ids: vec![],
             subagent_files_missing: 0,
         };
@@ -821,6 +822,7 @@ mod tests {
             decisions: vec![],
             task_events: vec![],
             agent_texts: vec![],
+            agent_texts_excluded: 0,
             session_ids: vec![],
             subagent_files_missing: 0,
         };

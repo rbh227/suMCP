@@ -36,6 +36,10 @@ pub fn merge_sessions(main: Session, subs: Vec<Session>, files_missing: u64) -> 
     // and folding it in would multiply the payload's largest block for no
     // reviewer benefit.
     let agent_texts = main.agent_texts;
+    // Unlike agent_texts itself, the excluded COUNT is additive: every
+    // subagent's tally of prose it couldn't keep is real, disclosable scope,
+    // the same way subagent_files_missing sums across subagents below.
+    let mut agent_texts_excluded = main.agent_texts_excluded;
 
     // Fold every subagent's actions and additive counters in.
     for sub in subs {
@@ -51,6 +55,7 @@ pub fn merge_sessions(main: Session, subs: Vec<Session>, files_missing: u64) -> 
         parse_errors += sub.parse_errors;
         untimestamped_lines += sub.untimestamped_lines;
         interrupts += sub.interrupts;
+        agent_texts_excluded += sub.agent_texts_excluded;
         // sub.user_texts, sub.auto_accept, sub.spawns intentionally ignored.
     }
 
@@ -82,6 +87,7 @@ pub fn merge_sessions(main: Session, subs: Vec<Session>, files_missing: u64) -> 
         decisions,
         task_events,
         agent_texts,
+        agent_texts_excluded,
         // This merge combines a main transcript with its own subagents into a
         // single work unit's worth of data, so it does not own the transcript id
         // table. The assembly step fills in session_ids when it merges multiple
@@ -126,6 +132,11 @@ pub fn merge_work_unit(parts: Vec<(String, Session)>) -> Session {
     let mut decisions = Vec::new();
     let mut task_events = Vec::new();
     let mut agent_texts = Vec::new();
+    // Summed across parts the same way every other additive counter in this
+    // loop is: each part's own count of subagent prose it could not keep is
+    // real, disclosable scope regardless of which transcript in the unit it
+    // came from.
+    let mut agent_texts_excluded = 0u64;
     // Strictly the sum of the parts' own subagent-missing counts. A work-unit
     // MEMBER that failed to load is a different kind of gap (it is not a
     // subagent spawn) and is disclosed as `work_unit.members_unreadable`
@@ -194,6 +205,7 @@ pub fn merge_work_unit(parts: Vec<(String, Session)>) -> Session {
         auto_accept |= part.auto_accept;
         spawns.extend(part.spawns);
         subagent_files_missing += part.subagent_files_missing;
+        agent_texts_excluded += part.agent_texts_excluded;
     }
 
     // One sort of the whole concatenation: O(n log n) total, done once. Never
@@ -254,6 +266,7 @@ pub fn merge_work_unit(parts: Vec<(String, Session)>) -> Session {
         decisions,
         task_events,
         agent_texts,
+        agent_texts_excluded,
         subagent_files_missing,
         session_ids,
     }
@@ -302,6 +315,7 @@ mod tests {
             decisions: vec![],
             task_events: vec![],
             agent_texts: vec![],
+            agent_texts_excluded: 0,
             session_ids: vec![],
             subagent_files_missing: 0,
         }
@@ -421,6 +435,24 @@ mod tests {
     }
 
     #[test]
+    fn merge_sessions_sums_a_subagents_excluded_count_into_main() {
+        // agent_texts_excluded is additive, unlike agent_texts itself (which
+        // stays main-only). A subagent's tally of prose it couldn't keep is
+        // real, disclosable scope and must survive the merge even though the
+        // strings behind it never do.
+        let mut main = one(Lane::Main, "2026-01-01T00:00:02Z", 5, "/a");
+        main.agent_texts_excluded = 2;
+        let mut sub = one(Lane::Sub("x".into()), "2026-01-01T00:00:01Z", 3, "/b");
+        sub.agent_texts_excluded = 5;
+
+        let merged = merge_sessions(main, vec![sub], 0);
+        assert_eq!(
+            merged.agent_texts_excluded, 7,
+            "main's own count plus the subagent's, summed"
+        );
+    }
+
+    #[test]
     fn determinism_independent_of_subs_order() {
         let main = one(Lane::Main, "2026-01-01T00:00:03Z", 5, "/a");
         let s1 = one(Lane::Sub("a".into()), "2026-01-01T00:00:01Z", 1, "/b");
@@ -450,6 +482,7 @@ mod tests {
             decisions: vec![],
             task_events: vec![],
             agent_texts: vec![],
+            agent_texts_excluded: 0,
             session_ids: vec![],
             subagent_files_missing: 0,
         };
