@@ -2,49 +2,86 @@
   <img src="docs/assets/wordmark.svg" alt="suMCP" width="420">
 </p>
 
-<p align="center"><b>The agent tells you what it built. suMCP tells you what it actually did.</b></p>
+<p align="center"><b>One agent writes the code. Another reviews it. suMCP hands the reviewer the context only the session had.</b></p>
 
 <p align="center">
   <img alt="license: MIT OR Apache-2.0" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue">
   <img alt="Rust" src="https://img.shields.io/badge/Rust-edition%202024-orange">
   <img alt="deterministic, no LLM, no network" src="https://img.shields.io/badge/deterministic-no%20LLM%20%C2%B7%20no%20network-2ea44f">
-  <img alt="release: v0.1.0" src="https://img.shields.io/badge/release-v0.1.0-000080">
+  <img alt="release: v0.2.0" src="https://img.shields.io/badge/release-v0.2.0-000080">
   <img alt="platforms: macOS, Linux, Windows" src="https://img.shields.io/badge/platforms-macOS%20%C2%B7%20Linux%20%C2%B7%20Windows-555555">
 </p>
 
-<p align="center">
-  <img src="docs/assets/report-hero.png" alt="suMCP HTML report: needs-review directives, session timeline with finding spans, and ranked struggle areas with plain-language signals" width="820">
-</p>
-
-> **v0.1.0 is released.** Prebuilt archives for macOS (Apple Silicon and Intel),
+> **v0.2.0 is released.** Prebuilt archives for macOS (Apple Silicon and Intel),
 > Linux (glibc and static musl), and Windows are on the
 > [releases page](https://github.com/rbh227/suMCP/releases/latest), each with a
-> SHA-256 checksum. Not on crates.io: the unit of distribution is an archive
-> carrying both binaries, because `install` needs them side by side.
+> SHA-256 checksum.
 >
-> **What is and is not established.** The flags are predictive: on a 43-session
-> corpus, files suMCP flagged recurred at roughly 8 to 9 times the rate of
-> unflagged ones. The ordering is a rule you can verify by hand, not a tuned
-> model, because a tuned model was measured and did not beat counting edits.
-> The corpus so far is the author's own, so external validation is the next
-> milestone. See [Findings and roadmap](#findings-and-roadmap).
+> **The v0.3 line (in this repository, not yet in a release archive) changes
+> who suMCP is for.** The consumer is no longer a human deciding what to read.
+> It is the *reviewing agent* you run after your coding agent commits, and the
+> goal is precision: fewer false findings, not more places to look. See
+> [What is and is not established](#what-is-and-is-not-established) before
+> trusting any claim on this page.
 
 ---
 
-## Why I built this
+## The problem, measured
 
-I ship code an agent wrote faster than I can fully review it. The question
-at the end of a session is not "what did we do?" but "which of this do I
-actually need to look at before I trust it?"
+A common workflow now: one agent (say, Claude Code) writes and commits, a
+second agent (say, Codex) reviews the commit. The reviewer holds the diff and
+nothing else. It can check whether the code is internally consistent, but not
+whether it does what was *wanted*, because it infers the intent from the very
+code it is reviewing.
 
-Ask the agent and it answers from a lossy, self-flattering memory of its own
-context, or it re-reads an enormous transcript. The transcript is the real
-evidence: every edit, every failed command, every time I pushed back, ordered
-and timestamped. suMCP reads that record deterministically, in Rust, with no
-LLM and no network, and turns it into review targeting: the files the session
-actually struggled with, why, and the exact actions that prove it. The tool
-does not judge; it shows its work, so your limited review time goes where the
-risk is.
+The measured cost of that blindness is not missed bugs. It is noise. In a
+study of 31,073 agentic review comments across 10,191 pull requests,
+**56.3% were rejected** by developers, mostly for being *out of scope* or
+*misaligned with what the developer intended*
+([arXiv:2607.03316](https://arxiv.org/abs/2607.03316)). Scope and intent are
+not properties of code. They are properties of the conversation, and the
+conversation is sitting on disk in `~/.claude/projects/`, deleted after 30
+days, read by nobody.
+
+suMCP reads it. Deterministically, in Rust, no LLM, no network. It hands the
+reviewing agent, over MCP or the CLI, the recorded facts a diff cannot carry:
+
+- **what was asked**, the human's requests, quoted verbatim, never summarized
+- **what was decided**, each question the agent put to the human, the answer
+  chosen, and the other options that were offered
+- **what was left unfinished**, tasks created and never completed, and
+  validation commands still failing when the session ended
+- **what the agent claimed it did**, the summary it wrote before handing back,
+  for the reviewer to check against the diff
+
+Every item carries a citation into the transcript. Every list is a capped
+sample with an unconditional total, so "3 shown" is never readable as
+"3 happened". And when coverage is incomplete (turns whose origin could not
+be attributed, subagent prose that was excluded), the payload says so in a
+top-level `coverage` block instead of implying completeness.
+
+**The invariant: suMCP retrieves, the agent judges.** It never says "this is
+fine" or "this is risky", only "here is what was recorded, at this index".
+That is why it needs no LLM, has nothing to calibrate, and can be wrong about
+nothing except whether it found the right passage.
+
+### Why quoting beats inferring
+
+Meta's ARCTIC ([arXiv:2607.29516](https://arxiv.org/html/2607.29516v1))
+validated this thesis at production scale: intent derived from developer-agent
+conversation logs, over a million requests, 90.2% engineer approval. It is
+also Meta-internal and legally unreleasable, and it *infers* intent with an
+LLM at 0.86 F1, roughly one intent in seven wrong. suMCP is the local, open,
+transcript-native complement: it *quotes*. A quote is right always, which is
+the first time this project's no-LLM rule has been an advantage rather than
+a ceiling.
+
+One research finding shapes the tool split below: pushing a full set of
+requirements at an LLM reviewer and asking it to check conformance induces
+*overcorrection*, where the model starts flagging correct code
+([arXiv:2603.00539](https://arxiv.org/pdf/2603.00539)). So the pushed payload
+is small and framed as facts that rule findings *out*, and the full verbatim
+intent lives behind a second tool the reviewer must deliberately pull.
 
 ---
 
@@ -83,7 +120,7 @@ Download for your platform from the
 ```bash
 # macOS, Apple Silicon. Swap the target for x86_64-apple-darwin (Intel Mac),
 # x86_64-unknown-linux-gnu (Linux), or x86_64-pc-windows-msvc (Windows).
-V=v0.1.0; T=aarch64-apple-darwin
+V=v0.2.0; T=aarch64-apple-darwin
 curl -LO https://github.com/rbh227/suMCP/releases/download/$V/sumcp-$V-$T.tar.gz
 curl -LO https://github.com/rbh227/suMCP/releases/download/$V/sumcp-$V-$T.tar.gz.sha256
 
@@ -94,6 +131,9 @@ tar -xzf sumcp-$V-$T.tar.gz && cd sumcp-$V-$T
 ./sumcp install          # dry-run: prints exactly what it will write
 ./sumcp install --apply  # register the MCP server, debrief skill, and Stop hook (Unix)
 ```
+
+The review-context tools described on this page are in the v0.3 line: build
+from source until a v0.3 archive is published.
 
 **macOS signing.** The binaries carry only the ad-hoc signature Rust applies at
 link time. That is enough for them to run, but it carries no developer identity,
@@ -110,10 +150,6 @@ Verify what you got, rather than taking the above on trust:
 ```bash
 codesign -dvv ./sumcp   # expect "Signature=adhoc" until a Developer ID is set up
 ```
-
-Notarization needs a paid Apple Developer ID, which this project does not have,
-so it is not planned. In practice this matters only if you download through a
-browser: the `curl` commands above are never quarantined.
 
 **Both platforms are exercised before publishing.** Every archive's `sumcp` is
 executed in CI and made to analyze a real fixture, including the Intel macOS
@@ -151,9 +187,33 @@ sumcp uninstall --apply   # removes exactly what install added; restores backups
 Restart Claude Code so it picks up the new user-scope server. See
 [docs/](docs/) for the write contract (ADR A8).
 
+### Wiring the reviewing agent
+
+Any MCP-capable reviewer can call the tools. For Codex, register the server in
+`~/.codex/config.toml` (or a project's `.codex/config.toml`):
+
+```toml
+[mcp_servers.sumcp]
+command = "/path/to/sumcp-mcp"
+```
+
+A reviewer with no MCP wiring at all uses the CLI instead and reads JSON:
+
+```bash
+sumcp context                       # review context for the current session
+sumcp context --intent              # the full verbatim requests (large, on purpose)
+sumcp context --range HEAD~3..HEAD  # assert the session overlaps those commits
+```
+
+`--range` is a scope guard, not a filter: if the analyzed session does not
+overlap the window in which those commits were made, the command exits
+non-zero and prints nothing to stdout, because context from the wrong session
+is worse than none. When it does overlap, the payload still covers the whole
+session and the stderr note says exactly that.
+
 ---
 
-## Quickstart
+## Quickstart (the forensic layer)
 
 Run it with no arguments in a project you have worked in. It finds that
 project's most recent session and debriefs the **whole stretch of work** it
@@ -176,186 +236,140 @@ sumcp --html > report.html                    # a self-contained HTML report
 
 sumcp --work-unit <path/to/session.jsonl>     # the whole stretch containing that transcript
 sumcp --file <path/to/session.jsonl>          # that single transcript only
-sumcp --file <path/to/session.jsonl> --json   # the session_overview payload
-sumcp --file <path/to/session.jsonl> --html   # a self-contained HTML report
 ```
 
 `--file` stays single-transcript on purpose (an explicit path is an explicit
 scope) and prints a stderr note when the transcript is part of a larger
 stretch, so a partial report is never silent about being partial.
 
-Once installed, at the end of a session the Stop hook nudges you to run the
-**debrief skill**, which calls the tools below and narrates the result. On
-Windows there is no hook, so run the debrief yourself; see
-[Install](#install).
-
 ---
 
-## The six tools
+## The eight tools
 
-All read-only; all return compact JSON evidence, never narration.
+All read-only; all return compact JSON evidence, never narration. The first
+six are the forensic layer (payload `v: 2`); the last two are the
+review-context layer (payload `v: 3`).
 
 | Tool | What it returns |
 |------|-----------------|
-| `session_overview` | Totals, token economics, and top-3 struggle files. **Start here.** |
-| `struggle_areas` | Ranked struggle files with each file's class, edit count, per-category breakdown, the ranking rule that ordered them, and evidence-backed findings. |
+| `session_overview` | Totals, token economics, and top-3 struggle files. |
+| `struggle_areas` | Ranked struggle files with class, edit count, per-category breakdown, the ranking rule that ordered them, and evidence-backed findings. |
 | `file_story` | Chronological event story for one file (head + tail kept, middle elided). |
-| `blind_spots` | Secrets-file touches, blind-write attempts, review-burden findings, and large-write-instant-accept outliers, with suppression status for heuristic metrics. |
+| `blind_spots` | Secrets-file touches, blind-write attempts, review-burden findings, and instant-accept outliers, with suppression status for heuristic metrics. |
 | `context_health` | Cache hit ratio and token economics (informational). |
-| `evidence` | Dereference a finding's `idxs` into the raw actions that prove them (≤10 actions, excerpts ≤600 chars). |
+| `evidence` | Dereference a finding's `idxs` into the raw actions that prove them. |
+| `review_context` | **Start here for review.** What was asked, what the human decided and the other options offered, what was left unfinished, what the agent claimed it did. Facts with citations, never judgments. |
+| `session_intent` | The full verbatim human requests. Large by design, deliberately excluded from `review_context`, to be pulled only when a specific ambiguity survives the diff and the compact context. |
+
+What `review_context` will not do, on purpose:
+
+- It reports `options_not_chosen`, never "options rejected". A free-text
+  answer like "SQLite with WAL" affirms an option it does not literally match,
+  and the tool does not pretend to know the difference.
+- Claims carry `window_interrupted`, so a summary the human cut off mid-turn
+  is never mistaken for a completion claim.
+- Harness notices ("API Error...", overload and spend-limit messages,
+  "No response requested.") are excluded from claims by provenance markers.
+  Driving an early build against a real session returned one of those as the
+  first "claim", which is exactly the false positive this layer exists to
+  remove, so the filter is regression-tested against each notice class.
+- Turns whose origin cannot be attributed to the human (interrupt markers,
+  slash-command echoes; 13% of textual turns in the measured corpus) are
+  counted and disclosed, never quoted as intent.
 
 ---
 
 ## How it works
 
 <p align="center">
-  <img src="docs/assets/diagram-pipeline.svg" alt="session.jsonl to a deterministic Rust parser to a session graph to 6 MCP tools to your agent, cited. No LLM, no network, read-only." width="760">
+  <img src="docs/assets/diagram-pipeline.svg" alt="session.jsonl to a deterministic Rust parser to a session graph to MCP tools to your agent, cited. No LLM, no network, read-only." width="760">
 </p>
 
-`locate → ingest → model → signals → rank → Report`. suMCP parses transcripts
-permissively (a bad line never fails a file), merges every transcript in the
-work unit plus their subagent transcripts into one totally-ordered timeline,
-then runs pure functions that look for
-edit-shape churn, rework, re-reads, failure loops, reverts, and comprehension
-signals. Every finding carries a **tier**, an **exact-vs-heuristic** flag, a
-**confidence**, and the action indices that prove it. Findings explain and cite;
-they do not vote on a score. See
-[docs/metrics.md](docs/metrics.md) for the reader-facing catalog, or
-[docs/metrics-spec.md](docs/metrics-spec.md) for the authoritative spec.
+`locate → ingest → model → signals/context → rank → payloads`. suMCP parses
+transcripts permissively (a bad line never fails a file), merges every
+transcript in the work unit plus their subagent transcripts into one
+totally-ordered timeline, then runs pure functions over it. The forensic layer
+looks for edit-shape churn, rework, re-reads, failure loops, reverts, and
+comprehension signals. The context layer extracts requests, decisions,
+unfinished work, and claims. Every finding carries a **tier**, an
+**exact-vs-heuristic** flag, a **confidence**, and the action indices that
+prove it. See [docs/metrics.md](docs/metrics.md) for the reader-facing
+catalog, or [docs/metrics-spec.md](docs/metrics-spec.md) for the authoritative
+spec.
 
-### How it ranks
-
-<p align="center">
-  <img src="docs/assets/diagram-ranking.svg" alt="Four ordering keys checked in turn: edited files before never-edited ones, then file class with code and web ahead of notes, docs, and config, then edit count highest first, then path alphabetically so ties are stable." width="760">
-</p>
-
-There is no score. Every ranked entry carries `class`, `edits`, the per-category
-breakdown of findings about it, and `ranking_rule`: that sentence, shipped
-alongside the order it produced. You can check any report by hand.
-
-The reason there is no score is the next section.
+Counting is insured, not assumed: a deliberately naive second implementation
+that shares no code with the extractor must agree exactly on every count, in
+CI for fixtures and on demand for real data. The current extraction agrees
+with its recounter across 625 real transcripts. This exists because a 3x
+undercount once survived 271 green tests whose fixtures shared the code's own
+blind spot.
 
 ---
 
-## The numbers
+## What is and is not established
 
-**Do the flags mean anything?** Yes. **Did the clever weighting produce that?**
-No, and the weighting is gone because of it.
+Honesty about which claims have evidence behind them, by layer.
 
-On the author's own corpus (43 sessions, 552 file-sessions, one project held
-out), files suMCP flagged for review were **8.9x more likely** to show renewed
-struggle (failure loops, user corrections, reverts, or re-qualifying for review)
-in the next 3 sessions than unflagged edited files.
+**The forensic layer (v0.2, released) is measured, and the measurement cuts
+both ways.** On the author's own corpus (43 sessions, 552 file-sessions, one
+project held out), files suMCP flagged for review were 8.9x more likely to
+show renewed struggle in the next 3 sessions than unflagged edited files. The
+same study put the ranking against one-line baselines and it lost: sorting
+files by edit count and taking the top 3 did at least as well on relative
+risk, precision, and miss rate at once, so the weighted score was deleted and
+the shipped ordering is a four-key rule you can verify by hand. File class
+survived measurement (a fifth fewer false alarms at identical recall); the
+rest is a usability claim, not an accuracy claim. Method, tables, and caveats
+in [the predictive-validity study](docs/validation/2026-07-22-predictive-validity.md)
+and [the file-class note](docs/validation/2026-07-26-file-class-measurement.md).
 
-**The same study put that ranking against one-line baselines, and it lost.**
-Sorting files by edit count and taking the top 3 did at least as well on
-relative risk, precision, and miss rate at once. The reason is structural: the
-product's flags fired on zero files edited fewer than twice, so the weighted
-score was a refinement of edit count rather than an independent signal.
-
-So the obvious next move was to tune the weights. That was tried, and the result
-is why this section is short. Weights were fitted to maximize hits **with the
-outcomes already in hand**, which is cheating and therefore an upper bound on
-any honest rule. Cheating bought at most **4 more hits out of 39**, and the fit
-put maximum weight on edit count anyway. There was nothing to tune into, so the
-score was deleted rather than adjusted.
-
-What did survive the measurement was file class:
-
-<p align="center">
-  <img src="docs/assets/diagram-file-class.svg" alt="Recurrence rate by file class on 552 file-sessions: code 34 outcomes of 285, a rate of 0.119; docs 1 of 192, a rate of 0.005; config 0 of 37. Notes and web omitted as too thin at 19 and 7 file-sessions." width="620">
-</p>
-
-Documentation was 35% of the population and carried 1 of 39 outcomes. Config
-carried none. Ranking code ahead of both cut flagged files from 65 to 52 for an
-**identical hit count**: a fifth fewer false alarms at no cost to recall. That is
-the whole basis for the class key, and the only tier boundary the data actually
-supports. Full breakdown, thin cells and all, in
-[the measurement note](docs/validation/2026-07-26-file-class-measurement.md).
-
-So the honest claim is narrow: **suMCP surfaces a genuinely predictive signal,
-orders it by a rule you can verify by hand, and attaches citable evidence to
-every entry.** That is a usability claim, not an accuracy claim. Single author,
-39 outcomes total, so it is equally underpowered to claim the baseline is
-*better*. Method, comparison tables, confidence intervals and caveats in
-[the predictive-validity study](docs/validation/2026-07-22-predictive-validity.md).
-
-<p align="center">
-  <img src="docs/assets/diagram-tokens.svg" alt="A full transcript of tens of thousands to about one million tokens versus a suMCP payload of about 150 to 290 tokens: a median 800x reduction." width="520">
-</p>
-
-A supporting point: the evidence arrives cheap. On 15 real sessions across 6
-project types (Rust, Python/ML, TS/React, prose, and more), the core debrief
-payload was about 150 to 290 tokens against raw transcripts of tens of
-thousands to about 1,000,000 tokens: a median ~800x reduction.[^tok] Same
-answer, a fraction of the context.
-
-[^tok]: Measured as the `session_overview` payload vs the full transcript at
-`chars/3.5`. A full debrief that also reads `struggle_areas` plus a few
-`evidence` calls is a small multiple of that, still one to three orders of
-magnitude smaller than re-reading the transcript.
+**The review-context layer (v0.3, unreleased) is built and unvalidated, and
+says so.** The claim that recorded context raises a reviewing agent's
+precision is externally supported (ARCTIC, above) but not yet demonstrated
+for this tool. The validation experiment is designed with kill criteria fixed
+in advance, and its first honest result is about itself: a pilot of 20 blind
+Codex reviews on this repository measured **1.65 findings per commit** (30%
+of commits yield zero), where the initial power estimate had assumed 3 to 6.
+At the measured yield, the naive two-arm design needs more commits than this
+repository has, so the experiment is being redesigned around paired
+per-finding adjudication and simulation-based power before any headline
+number is produced. The 33 findings already collected are the blind arm of
+the real experiment. Until that experiment reports, treat `review_context` as
+plumbing with disclosed semantics, not as a proven precision improvement.
 
 ---
 
 ## Findings and roadmap
 
-Building this produced findings as well as a tool. Each one below states what
-the measurement established and what happens to it next. The first two set the
-frame for how much weight a ranking should carry.
-
-- **The signal is real on the corpus measured; external validation is the next
-  milestone.** Flagged files recurred at 8.9x the rate of unflagged ones on 43
-  of the author's own sessions, which establishes internal consistency. Running
-  suMCP against other people's sessions is the top post-v0.1 item, and the step
-  that turns these figures into evidence of usefulness rather than coherence.
-- **The sample is one author, one machine, 39 outcomes.** Within it the effect
-  holds and precision is moderate: roughly a third of flags recur, so a ranking
-  is a measured hint rather than ground truth. That same sample size is why this
-  README does not claim the edit-count baseline is worse, either. Growing the
-  corpus is what sharpens both directions, and is the reason external users come
-  first on the roadmap.
-- **A stated rule beat a fitted model, so the rule shipped.** Tuning the weights
-  against outcomes already in hand bought at most 4 more hits out of 39 and put
-  maximum weight on edit count anyway, so the score was deleted. The trade is
-  deliberate: you can verify any ordering by hand, and in exchange the ranking
-  inherits the blind spots of its keys. A file changed once, carefully and
-  wrongly, ranks low, because nothing here knows what your code means. New keys
-  get added when data supports them, which is exactly how file class got in.
-- **File class earned its place; the finer tiers have not yet.** The code versus
-  docs-and-config boundary rests on adequate data and cut false alarms by a fifth
-  at no cost to recall. The remaining tiers are declared judgments on thin cells,
-  and the extension table is fixed, so a project whose layout it misreads is the
-  first thing to check when an ordering looks off. Filling in those thin cells is
-  what would promote them from judgment to measurement.
-- **Heuristic signals are labeled and suppressed rather than dressed up.**
-  Approval latency and instant-accept infer intent from edit shape and timing,
-  so they carry the heuristic flag, and they go silent under auto-accept
-  instead of reporting a meaningless number. The suppression is per action:
-  the transcript's own `mode` events say which permission mode each action ran
-  under, so the stretches of a session that ran under normal mode still
-  produce signals instead of being thrown away with the rest.
-- **The secrets blind spot is a policy signal by design.** It postdates the
-  measured corpus, so it carries no predictive validation yet, and its table is
-  deliberately narrow because one false positive there teaches you to ignore the
-  whole signal. It widens in response to reported misses, not ahead of them.
-- **The reporting unit was wrong in v0.1, and the miss was measured at roughly
-  3x.** A single transcript is not how people work: one stretch of work in
-  this project's own corpus spanned 7 transcripts and 275 file operations,
-  split [88, 0, 0, 51, 49, 86, 1], so a debrief of "the most recent session"
-  showed at most 88 of 275, and landing on the wrong transcript showed zero.
-  v0.2 corrects the unit: reports now cover the whole stretch, the payload
-  disclosed the grouping, and an independent recount (a second, deliberately
-  naive counter in CI) holds every countable quantity to exact agreement,
-  because the undercount had survived 271 green tests whose fixtures shared
-  the code's own blind spot.
-- **Scope today is one stretch of work at a time.** Cross-session and
-  cross-project memory is the remaining v0.2 direction. Every payload carries
-  a `v` field (now `2`, for the work-unit contract) so a consumer can tell
-  the shapes apart as that lands.
+- **The consumer changed, and the goal inverted.** v0.1 and v0.2 targeted a
+  human deciding what to read, and the honest lesson of their own validation
+  was that "which files to look at" is a question a one-line rule answers as
+  well as a product. v0.3 targets the reviewing agent, where the measured
+  bottleneck is false findings, and where the transcript holds exactly the
+  facts (scope, intent, decisions, incompleteness) whose absence produces
+  them.
+- **suMCP retrieves; the agent judges.** The layer that survived every
+  redesign is deterministic extraction with citations. Every attempt at a
+  judgment layer (weighted scores, heuristic "abandoned approach" detection)
+  has either lost to a trivial baseline or been cut before shipping for
+  false-positive risk. That is now a design rule rather than a lesson.
+- **Precision discipline is enforced in the payload shape.** Capped lists with
+  unconditional totals, elision reflected in `truncated`, coverage gaps
+  disclosed at top level, quotes only from explicitly attributed human turns,
+  and no field name that claims more than the extraction can prove.
+- **The experiment gates the roadmap.** A project memory layer is designed
+  (per-file index of decisions, dismissed findings, and history, serving both
+  the reviewer and the builder) and deliberately unbuilt until the precision
+  experiment says the context helps. Durable storage for an unproven signal
+  would compound noise while looking authoritative.
+- **Known dependencies and risks, stated.** The transcript format is
+  undocumented and owned by Anthropic; any release can break the parser. The
+  approach is absorbable by whoever owns the format. And single-author data
+  underlies every number on this page, so external corpora remain the
+  standing next step.
 - **Two things differ on Windows**, both by design and both detailed under
   [Install](#install): no end-of-session nudge, and installed files are not
-  permission-restricted. ACL handling would mean a new dependency, so it is
-  queued behind evidence that someone needs it.
+  permission-restricted.
 
 ---
 
