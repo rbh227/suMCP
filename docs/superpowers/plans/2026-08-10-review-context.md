@@ -989,19 +989,35 @@ Expected: FAIL, `cannot find function 'decisions'`.
 pub struct DecisionOut {
     /// The question, verbatim.
     pub question: String,
-    /// What the human chose. `None` when the session ended unanswered.
+    /// What the human chose. `None` when the session ended unanswered, or
+    /// when one call asked two questions with identical text and its answers
+    /// map therefore cannot disambiguate them.
     pub chosen: Option<String>,
     /// The options that were turned down. When the answer was free text
     /// matching no option, every option is here, which is the correct
     /// reading: nothing on the menu was picked.
     pub rejected: Vec<String>,
-    /// Source line, for citation.
+    /// The asking action's index, so `evidence(idxs)` resolves this decision
+    /// to the raw transcript. Empty when no action matches, which is
+    /// possible if the asking call was deduped away as a replay.
+    pub idxs: Vec<Idx>,
+    /// Source line, kept alongside `idxs` because it is the key the index was
+    /// resolved from and it stays meaningful if resolution fails.
     pub line_no: usize,
     /// Which transcript of the work unit it came from.
     pub session_ix: u16,
 }
 
 /// Extract the recorded human decisions.
+///
+/// WHY THE INDEX IS RESOLVED HERE AND NOT AT INGEST (decided 2026-08-11 after
+/// an adversarial review): both `merge_sessions` and `merge_work_unit`
+/// globally renumber `Action::idx` after interleaving, so an index captured
+/// during parsing would be stale by the time anything read it, and a stale
+/// citation is worse than an absent one. `Decision` therefore stores only
+/// `(session_ix, line_no)`, which never changes, and the index is looked up
+/// here against the already-merged session. Correct by construction, with no
+/// remapping step to forget.
 pub fn decisions(s: &Session) -> Vec<DecisionOut> {
     s.decisions
         .iter()
@@ -1016,6 +1032,12 @@ pub fn decisions(s: &Session) -> Vec<DecisionOut> {
                 // no choice was made at all.
                 .filter(|o| d.answer.as_deref().is_some_and(|a| a != o.as_str()))
                 .cloned()
+                .collect(),
+            idxs: s
+                .actions
+                .iter()
+                .filter(|a| a.session_ix == d.session_ix && a.line_no == d.line_no)
+                .map(|a| a.idx)
                 .collect(),
             line_no: d.line_no,
             session_ix: d.session_ix,
@@ -1550,6 +1572,10 @@ pub fn review_context(s: &Session, meta: &SessionMeta) -> Value {
                 "question": elide_middle(&d.question, QUOTE_MAX),
                 "chosen": d.chosen.as_ref().map(|c| elide_middle(c, QUOTE_MAX)),
                 "rejected": d.rejected,
+                // idxs, not just a line number: the Global Constraint is that
+                // every item is dereferenceable, and `evidence()` takes Idx.
+                // A bare line number is not something a reviewer can resolve.
+                "idxs": d.idxs.iter().take(FINDING_IDXS_MAX).collect::<Vec<_>>(),
                 "line": d.line_no
             })).collect::<Vec<_>>(),
             "incomplete": {
