@@ -448,6 +448,23 @@ pub struct TaskEvent {
     // on that pair.
 }
 
+/// One block of agent prose: what it said it did.
+///
+/// The review payload hands these to the reviewer as CLAIMS to verify against
+/// the diff. suMCP never checks them itself, because checking a natural
+/// language assertion against code requires understanding both, which is the
+/// consuming agent's job and not this tool's.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AgentText {
+    /// The prose, capped at `AGENT_TEXT_CAP` characters.
+    pub text: String,
+    /// Source line (total-order tiebreak).
+    pub line_no: usize,
+    /// Which transcript of the work unit this came from.
+    #[serde(default)]
+    pub session_ix: u16,
+}
+
 /// A fully parsed session: ordered actions plus parse-health counters.
 ///
 /// `Default` is `#[cfg(test)]`-only, same reasoning as `Action`'s: it lets a
@@ -498,6 +515,11 @@ pub struct Session {
     /// that was planned and never finished.
     #[serde(default)]
     pub task_events: Vec<TaskEvent>,
+    /// Agent prose blocks, in source order: what the agent said it did. The
+    /// payload presents these as claims for the reviewer to check against
+    /// the diff.
+    #[serde(default)]
+    pub agent_texts: Vec<AgentText>,
     /// The transcript ids making up this session, oldest first. An action's
     /// `session_ix` indexes into this. A single-transcript analysis has
     /// exactly one entry, so `session_ids[0]` is always the id being reported.

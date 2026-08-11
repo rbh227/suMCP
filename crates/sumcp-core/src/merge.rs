@@ -32,6 +32,10 @@ pub fn merge_sessions(main: Session, subs: Vec<Session>, files_missing: u64) -> 
     // can create tasks, and a task a subagent left unfinished is exactly as
     // unfinished as one the main lane abandoned.
     let mut task_events = main.task_events;
+    // Main only: subagent prose is internal reasoning the human never saw,
+    // and folding it in would multiply the payload's largest block for no
+    // reviewer benefit.
+    let agent_texts = main.agent_texts;
 
     // Fold every subagent's actions and additive counters in.
     for sub in subs {
@@ -77,6 +81,7 @@ pub fn merge_sessions(main: Session, subs: Vec<Session>, files_missing: u64) -> 
         spawns,
         decisions,
         task_events,
+        agent_texts,
         // This merge combines a main transcript with its own subagents into a
         // single work unit's worth of data, so it does not own the transcript id
         // table. The assembly step fills in session_ids when it merges multiple
@@ -120,6 +125,7 @@ pub fn merge_work_unit(parts: Vec<(String, Session)>) -> Session {
     let mut spawns = Vec::new();
     let mut decisions = Vec::new();
     let mut task_events = Vec::new();
+    let mut agent_texts = Vec::new();
     // Strictly the sum of the parts' own subagent-missing counts. A work-unit
     // MEMBER that failed to load is a different kind of gap (it is not a
     // subagent spawn) and is disclosed as `work_unit.members_unreadable`
@@ -162,6 +168,13 @@ pub fn merge_work_unit(parts: Vec<(String, Session)>) -> Session {
         for mut t in part.task_events {
             t.session_ix = ix;
             task_events.push(t);
+        }
+        // Stamped like decisions and task_events: an agent-text block must be
+        // attributable to the transcript it came from, or the payload cannot
+        // cite it correctly in a multi-transcript work unit.
+        for mut at in part.agent_texts {
+            at.session_ix = ix;
+            agent_texts.push(at);
         }
         // First non-None cwd wins; every transcript in a unit is in the same
         // project, so they agree, but a synthetic session can have None.
@@ -240,6 +253,7 @@ pub fn merge_work_unit(parts: Vec<(String, Session)>) -> Session {
         spawns,
         decisions,
         task_events,
+        agent_texts,
         subagent_files_missing,
         session_ids,
     }
@@ -287,6 +301,7 @@ mod tests {
             spawns: vec![],
             decisions: vec![],
             task_events: vec![],
+            agent_texts: vec![],
             session_ids: vec![],
             subagent_files_missing: 0,
         }
@@ -434,6 +449,7 @@ mod tests {
             spawns: vec![],
             decisions: vec![],
             task_events: vec![],
+            agent_texts: vec![],
             session_ids: vec![],
             subagent_files_missing: 0,
         };

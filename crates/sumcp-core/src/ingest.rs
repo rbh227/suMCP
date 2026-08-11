@@ -14,7 +14,8 @@
 //! that field, not the whole line's type/uuid/timestamp.
 
 use crate::model::{
-    Action, ActionKind, Decision, Idx, Lane, Session, Spawn, TaskEvent, Tokens, UserText,
+    Action, ActionKind, AgentText, Decision, Idx, Lane, Session, Spawn, TaskEvent, Tokens,
+    UserText,
 };
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -24,6 +25,15 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 const EDIT_CAP: usize = 2000;
 /// Prefix Claude Code writes when the user interrupts a turn.
 const INTERRUPT_PREFIX: &str = "[Request interrupted by user";
+/// Longest prose block stored. Unlike `EDIT_CAP`, truncating here cannot skew
+/// any metric: nothing counts these characters, they are only quoted.
+///
+/// There is deliberately no MINIMUM. A length floor was measured as a proxy
+/// for "is this a verifiable claim" and rejected: across 8 real sessions the
+/// 80-159 character band is mostly narration ("Now the rules engine and
+/// TikTok driver:"), not assertion. Selection happens in `context::claims`
+/// using the spec's rule instead.
+pub(crate) const AGENT_TEXT_CAP: usize = 4000;
 
 /// Parse raw transcript text (one JSON object per line) into a [`Session`].
 ///
@@ -82,6 +92,10 @@ pub fn ingest_str(raw: &str, default_lane: Lane) -> Session {
     // stays a single ordered `Vec` rather than separate create/update lists
     // that would need re-interleaving afterward.
     let mut pending_task_events: Vec<PendingTaskEvent> = Vec::new();
+    // Every non-empty prose block the agent wrote, in source order. Ingest
+    // makes no judgment about which blocks are worth keeping (see
+    // AGENT_TEXT_CAP's doc comment): that selection is Task 8's job.
+    let mut agent_texts: Vec<AgentText> = Vec::new();
 
     for (line_no, line) in raw.lines().enumerate() {
         if line.trim().is_empty() {
@@ -463,6 +477,25 @@ pub fn ingest_str(raw: &str, default_lane: Lane) -> Session {
                             );
                         }
                     }
+                    Some("text")
+                        if v.get("type").and_then(Value::as_str) == Some("assistant") =>
+                    {
+                        // Whitespace-only blocks carry nothing and would only
+                        // pad the list Task 8 selects from.
+                        if let Some(t) = block.get("text").and_then(Value::as_str)
+                            && !t.trim().is_empty()
+                        {
+                            agent_texts.push(AgentText {
+                                // `chars().take()` not `[..n]`: slicing a
+                                // String by byte index panics if it lands
+                                // mid-character, and prose is full of
+                                // multi-byte characters.
+                                text: t.chars().take(AGENT_TEXT_CAP).collect(),
+                                line_no,
+                                session_ix: 0,
+                            });
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -631,6 +664,7 @@ pub fn ingest_str(raw: &str, default_lane: Lane) -> Session {
         spawns,
         decisions,
         task_events,
+        agent_texts,
         // A single `ingest_str` call has no idea what its own transcript id
         // is (that lives outside the raw JSONL text it was handed), so it
         // cannot fill this in. It leaves the table empty; the merge/assembly
@@ -1214,6 +1248,38 @@ mod tests {
 
         assert_eq!(s.task_events.len(), 1);
         assert_eq!(s.task_events[0].status, "in_progress");
+    }
+
+    #[test]
+    fn every_non_empty_agent_prose_block_is_captured() {
+        // No length filter here on purpose: selecting which prose is a claim is
+        // Task 8's job, using the spec's rule (last block before a human turn).
+        // Measurement showed length is a bad proxy, so ingest makes no judgment
+        // and keeps everything with text in it.
+        let long = "x".repeat(100);
+        let line = format!(
+            r#"{{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{{"content":[{{"type":"text","text":"{long}"}},{{"type":"text","text":"ok"}},{{"type":"text","text":"   "}}]}}}}"#
+        );
+        let s = ingest_str(&line, Lane::Main);
+
+        assert_eq!(s.agent_texts.len(), 2, "both blocks with text, not the blank");
+        assert_eq!(s.agent_texts[0].text.chars().count(), 100);
+        assert_eq!(s.agent_texts[1].text, "ok");
+    }
+
+    #[test]
+    fn a_runaway_prose_block_is_capped() {
+        use crate::ingest::AGENT_TEXT_CAP;
+        // One block must not be able to dominate memory. The cap is on the
+        // stored copy only; nothing downstream counts characters for a metric,
+        // so truncation here cannot skew a number the way EDIT_CAP would have.
+        let huge = "y".repeat(AGENT_TEXT_CAP + 500);
+        let line = format!(
+            r#"{{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{{"content":[{{"type":"text","text":"{huge}"}}]}}}}"#
+        );
+        let s = ingest_str(&line, Lane::Main);
+
+        assert_eq!(s.agent_texts[0].text.chars().count(), AGENT_TEXT_CAP);
     }
 
     #[test]

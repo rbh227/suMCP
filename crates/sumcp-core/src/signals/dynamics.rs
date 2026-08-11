@@ -743,6 +743,7 @@ mod tests {
             spawns: vec![],
             decisions: vec![],
             task_events: vec![],
+            agent_texts: vec![],
             session_ids: vec![],
             subagent_files_missing: 0,
         };
@@ -819,6 +820,7 @@ mod tests {
             spawns: vec![],
             decisions: vec![],
             task_events: vec![],
+            agent_texts: vec![],
             session_ids: vec![],
             subagent_files_missing: 0,
         };
