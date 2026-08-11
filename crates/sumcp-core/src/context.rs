@@ -113,6 +113,35 @@ pub fn scope(s: &Session) -> Scope {
     }
 }
 
+/// How `decisions()` resolved a decision's asking action.
+///
+/// `(session_ix, line_no)` alone is not a unique key into `Session::actions`:
+/// one assistant JSONL record can carry several `tool_use` blocks (an
+/// AskUserQuestion call sitting next to an unrelated Bash or Edit in the
+/// same message), and ingest creates one `Action` per block, all sharing
+/// that record's `line_no`. Narrowing the search by kind too
+/// (`ActionKind::Other("AskUserQuestion")`, since there is no dedicated
+/// variant) makes a match unique in the overwhelmingly common case, but not
+/// always: nothing stops two separate AskUserQuestion blocks landing on one
+/// message, or the asking call being deduped away entirely as a replay. Zero
+/// matches and more than one match are real, distinct outcomes, not bugs,
+/// and collapsing either into a silently empty `idxs` would look exactly
+/// like a clean resolution to a caller that only checks `is_empty()`. This
+/// enum makes all three outcomes explicit instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Resolution {
+    /// Exactly one action matched `(session_ix, line_no, AskUserQuestion)`.
+    /// `idxs` holds that one index.
+    Resolved,
+    /// No action matched. Possible if the asking call was deduped away as a
+    /// replay. `idxs` is empty.
+    NotFound,
+    /// More than one action matched: two or more AskUserQuestion blocks were
+    /// issued on the very same JSONL line, so the key cannot say which one
+    /// this decision belongs to. `idxs` is empty rather than guessing.
+    Ambiguous,
+}
+
 /// A recorded human choice, rendered for the payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecisionOut {
@@ -122,19 +151,38 @@ pub struct DecisionOut {
     /// when one call asked two questions with identical text and its answers
     /// map therefore cannot disambiguate them.
     pub chosen: Option<String>,
-    /// The options that were turned down. When the answer was free text
-    /// matching no option, every option is here, which is the correct
-    /// reading: nothing on the menu was picked.
-    pub rejected: Vec<String>,
-    /// The asking action's index, so `evidence(idxs)` resolves this decision
-    /// to the raw transcript. Empty when no action matches, which is
-    /// possible if the asking call was deduped away as a replay.
+    /// Options that were offered and are not the answer text. This is NOT a
+    /// claim that the human rejected them: `answer` can be arbitrary free
+    /// text (the "Other" escape hatch lets the human answer outside the
+    /// menu), so an answer like "SQLite with WAL" against an offered option
+    /// "SQLite" still lands "SQLite" here, even though the human affirmed
+    /// and refined that option rather than turning it down. Read this field
+    /// as "not the literal answer string", never as "the human said no to
+    /// this".
+    pub options_not_chosen: Vec<String>,
+    /// The asking action's index within the merged session: WHERE in the
+    /// session timeline this decision happened, so a reviewer can order it
+    /// against the edits and other actions around it.
+    ///
+    /// This is NOT a citation that `evidence()` can turn into excerpt text.
+    /// `evidence()` only excerpts an action's `command`, `error`, or
+    /// `edit_new`, and an AskUserQuestion action carries none of those, so
+    /// `evidence(idxs)` on a decision returns the action's identity (idx,
+    /// timestamp, tool name) with an empty excerpt string. That is fine:
+    /// the decision block above is already self-contained (question,
+    /// answer, and options verbatim), so nothing here needs to substantiate
+    /// it further, only to place it in time.
+    ///
+    /// Empty exactly when `resolution` is not `Resolved`; see [`Resolution`]
+    /// for what an empty `idxs` here actually means.
     pub idxs: Vec<Idx>,
     /// Source line, kept alongside `idxs` because it is the key the index was
     /// resolved from and it stays meaningful if resolution fails.
     pub line_no: usize,
     /// Which transcript of the work unit it came from.
     pub session_ix: u16,
+    /// How `idxs` was resolved. See [`Resolution`].
+    pub resolution: Resolution,
 }
 
 /// Extract the recorded human decisions.
@@ -147,29 +195,67 @@ pub struct DecisionOut {
 /// `(session_ix, line_no)`, which never changes, and the index is looked up
 /// here against the already-merged session. Correct by construction, with no
 /// remapping step to forget.
+///
+/// WHY THE LOOKUP ALSO FILTERS BY KIND (decided 2026-08-11, second
+/// adversarial review): `(session_ix, line_no)` on its own is not a unique
+/// action key. One assistant JSONL record can carry several `tool_use`
+/// blocks, and ingest gives each block its own `Action`, all sharing that
+/// record's `line_no`. Without a kind filter, a decision would cite the
+/// AskUserQuestion action AND every unrelated Bash or Edit issued in the
+/// same message. There is no dedicated `ActionKind` variant for this tool,
+/// so it lives in `Other("AskUserQuestion".to_string())`, matched by exact
+/// string. `Action` deliberately does NOT also carry `tool_use_id` to make
+/// this uniqueness airtight: that id is dropped after the ingest join, and
+/// re-adding it costs one `String` per action across tens of thousands of
+/// actions, just to cover the rare case (two AskUserQuestion blocks on one
+/// line) that `Resolution::Ambiguous` already reports honestly instead.
 pub fn decisions(s: &Session) -> Vec<DecisionOut> {
     s.decisions
         .iter()
-        .map(|d| DecisionOut {
-            question: d.question.clone(),
-            chosen: d.answer.clone(),
-            rejected: d
-                .options
-                .iter()
-                // Everything that is not the answer was turned down. An
-                // unanswered question (answer: None) rejects nothing, since
-                // no choice was made at all.
-                .filter(|o| d.answer.as_deref().is_some_and(|a| a != o.as_str()))
-                .cloned()
-                .collect(),
-            idxs: s
+        .map(|d| {
+            let matches: Vec<Idx> = s
                 .actions
                 .iter()
-                .filter(|a| a.session_ix == d.session_ix && a.line_no == d.line_no)
+                .filter(|a| {
+                    a.session_ix == d.session_ix
+                        && a.line_no == d.line_no
+                        && a.kind == ActionKind::Other("AskUserQuestion".to_string())
+                })
                 .map(|a| a.idx)
-                .collect(),
-            line_no: d.line_no,
-            session_ix: d.session_ix,
+                .collect();
+            // Exactly one match is the only case treated as resolved. Zero
+            // and "more than one" are represented explicitly rather than
+            // both collapsing into an empty idxs, which would look like an
+            // ordinary (if unlucky) resolution to any caller that only
+            // checks is_empty().
+            let (idxs, resolution) = match matches.len() {
+                1 => (matches, Resolution::Resolved),
+                0 => (Vec::new(), Resolution::NotFound),
+                _ => (Vec::new(), Resolution::Ambiguous),
+            };
+            DecisionOut {
+                question: d.question.clone(),
+                chosen: d.answer.clone(),
+                options_not_chosen: d
+                    .options
+                    .iter()
+                    // Not the literal answer string. This is arithmetic, not
+                    // a judgement about intent: a free-text answer (the
+                    // "Other" escape hatch) can affirm and refine an option
+                    // ("SQLite with WAL" against offered option "SQLite"),
+                    // in which case that option still lands here even
+                    // though the human chose it. See the field's doc
+                    // comment on `DecisionOut`. An unanswered question
+                    // (answer: None) leaves every option here too, since no
+                    // choice was made at all to compare against.
+                    .filter(|o| d.answer.as_deref().is_some_and(|a| a != o.as_str()))
+                    .cloned()
+                    .collect(),
+                idxs,
+                line_no: d.line_no,
+                session_ix: d.session_ix,
+                resolution,
+            }
         })
         .collect()
 }
@@ -179,7 +265,7 @@ mod tests {
     use super::*;
     use crate::ingest::ingest_str;
     use crate::merge::merge_work_unit;
-    use crate::model::Lane;
+    use crate::model::{Action, Decision, Lane};
 
     #[test]
     fn scope_quotes_human_turns_and_skips_harness_turns() {
@@ -296,20 +382,153 @@ mod tests {
         let d = decisions(&s);
         assert_eq!(d.len(), 1);
         assert_eq!(d[0].chosen.as_deref(), Some("JSONL"));
-        assert_eq!(d[0].rejected, vec!["SQLite".to_string(), "memory".to_string()]);
+        assert_eq!(
+            d[0].options_not_chosen,
+            vec!["SQLite".to_string(), "memory".to_string()]
+        );
     }
 
     #[test]
-    fn a_free_text_answer_rejects_every_offered_option() {
-        // The human answered "Other". Nothing on the menu was chosen, so
-        // every option was turned down, and the free text is the choice.
+    fn a_free_text_answer_not_matching_any_option_lists_every_option_as_not_chosen() {
+        // The human answered "Other" with text matching no option's label.
+        // Every option lands in `options_not_chosen`: none of them is the
+        // literal answer string. Framed as "not chosen", not "rejected",
+        // because the field makes no claim about intent (see DEFECT 2 test
+        // below for the case where that distinction actually matters).
         let call = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"tool_use","id":"q1","name":"AskUserQuestion","input":{"questions":[{"question":"Which store?","options":[{"label":"SQLite"},{"label":"JSONL"}]}]}}]}}"#;
         let result = r#"{"type":"user","timestamp":"2026-01-01T00:00:05Z","message":{"content":[{"type":"tool_result","tool_use_id":"q1"}]},"toolUseResult":{"answers":{"Which store?":"keep it in memory"}}}"#;
         let s = ingest_str(&format!("{call}\n{result}"), Lane::Main);
 
         let d = decisions(&s);
         assert_eq!(d[0].chosen.as_deref(), Some("keep it in memory"));
-        assert_eq!(d[0].rejected, vec!["SQLite".to_string(), "JSONL".to_string()]);
+        assert_eq!(
+            d[0].options_not_chosen,
+            vec!["SQLite".to_string(), "JSONL".to_string()]
+        );
+    }
+
+    // ---- DEFECT 2 regression: options_not_chosen is not a rejection claim ----
+
+    #[test]
+    fn a_free_text_answer_that_contains_an_options_label_still_lists_it_as_not_chosen_this_is_not_a_rejection_claim(
+    ) {
+        // The human answered free text that AFFIRMS and refines one of the
+        // offered options: "SQLite with WAL" picked SQLite, with detail.
+        // `options_not_chosen` still lists "SQLite", because the field is
+        // populated by exact string inequality against the answer, not by
+        // any judgement about intent. That arithmetic is correct and
+        // deliberately unchanged; what this test guards is the field's
+        // NAME and doc comment no longer claiming the human turned SQLite
+        // down; they did the opposite.
+        let call = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"tool_use","id":"q1","name":"AskUserQuestion","input":{"questions":[{"question":"Which store?","options":[{"label":"SQLite"},{"label":"JSONL"}]}]}}]}}"#;
+        let result = r#"{"type":"user","timestamp":"2026-01-01T00:00:05Z","message":{"content":[{"type":"tool_result","tool_use_id":"q1"}]},"toolUseResult":{"answers":{"Which store?":"SQLite with WAL"}}}"#;
+        let s = ingest_str(&format!("{call}\n{result}"), Lane::Main);
+
+        let d = decisions(&s);
+        assert_eq!(d[0].chosen.as_deref(), Some("SQLite with WAL"));
+        assert_eq!(
+            d[0].options_not_chosen,
+            vec!["SQLite".to_string(), "JSONL".to_string()],
+            "SQLite appears here only because it is not the literal answer \
+             string; the human chose and refined it, so this is NOT a claim \
+             that SQLite was rejected"
+        );
+    }
+
+    // ---- DEFECT 1 regressions: (session_ix, line_no) is not a unique
+    // action key, because one assistant JSONL record can carry several
+    // tool_use blocks, all sharing that record's line_no. ----
+
+    #[test]
+    fn an_askuserquestion_sharing_a_line_with_a_bash_call_cites_only_the_askuserquestion() {
+        // One assistant message, two tool_use blocks: AskUserQuestion and an
+        // unrelated Bash call. Both become Actions with the same line_no.
+        // Before this fix, the (session_ix, line_no) filter alone matched
+        // both, so a decision's idxs cited the Bash action too, as if it
+        // were part of answering the question.
+        let call = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"tool_use","id":"q1","name":"AskUserQuestion","input":{"questions":[{"question":"Which store?","options":[{"label":"SQLite"},{"label":"JSONL"}]}]}},{"type":"tool_use","id":"b1","name":"Bash","input":{"command":"ls"}}]}}"#;
+        let result = r#"{"type":"user","timestamp":"2026-01-01T00:00:05Z","message":{"content":[{"type":"tool_result","tool_use_id":"q1"}]},"toolUseResult":{"answers":{"Which store?":"JSONL"}}}"#;
+        let s = ingest_str(&format!("{call}\n{result}"), Lane::Main);
+
+        // Sanity check: both actions really do share one line_no.
+        assert_eq!(s.actions.len(), 2);
+        assert_eq!(s.actions[0].line_no, s.actions[1].line_no);
+        let askuserquestion_idx = s
+            .actions
+            .iter()
+            .find(|a| a.kind == ActionKind::Other("AskUserQuestion".to_string()))
+            .expect("the asking action was ingested")
+            .idx;
+
+        let d = decisions(&s);
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].resolution, Resolution::Resolved);
+        assert_eq!(
+            d[0].idxs,
+            vec![askuserquestion_idx],
+            "must cite only the AskUserQuestion action, never the Bash call \
+             that happened to share its line"
+        );
+    }
+
+    #[test]
+    fn a_decision_whose_asking_action_is_absent_reports_not_found_not_an_empty_vec() {
+        // Before this fix, zero matches and the (impossible before this fix)
+        // exactly-one-match case both produced idxs: vec![], indistinguishable
+        // to any caller checking is_empty(). Built by hand rather than via
+        // ingest_str, standing in for a decision whose asking call was
+        // deduped away as a replay: the decision is recorded, but no action
+        // at that (session_ix, line_no, kind) exists to resolve it to.
+        let d = Decision {
+            question: "Which store?".to_string(),
+            options: vec!["SQLite".to_string(), "JSONL".to_string()],
+            answer: Some("JSONL".to_string()),
+            line_no: 5,
+            session_ix: 0,
+        };
+        let s = Session {
+            decisions: vec![d],
+            actions: vec![Action {
+                // A real action exists, but at a different line_no, so it
+                // must not match.
+                line_no: 99,
+                kind: ActionKind::Other("AskUserQuestion".to_string()),
+                ..Action::default()
+            }],
+            ..Session::default()
+        };
+
+        let out = decisions(&s);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].resolution, Resolution::NotFound);
+        assert!(out[0].idxs.is_empty());
+    }
+
+    #[test]
+    fn two_askuserquestion_calls_in_one_message_report_ambiguous() {
+        // Two SEPARATE tool_use blocks, both named AskUserQuestion, on the
+        // very same assistant message. Both become Actions sharing the same
+        // line_no and the same Other("AskUserQuestion") kind, so kind-plus-
+        // (session_ix, line_no) still cannot tell them apart. Rather than
+        // guessing (e.g. citing the first one found), decisions() must say
+        // so explicitly.
+        let call = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"tool_use","id":"q1","name":"AskUserQuestion","input":{"questions":[{"question":"Which store?","options":[{"label":"SQLite"}]}]}},{"type":"tool_use","id":"q2","name":"AskUserQuestion","input":{"questions":[{"question":"Which cache?","options":[{"label":"LRU"}]}]}}]}}"#;
+        let result = r#"{"type":"user","timestamp":"2026-01-01T00:00:05Z","message":{"content":[{"type":"tool_result","tool_use_id":"q1"},{"type":"tool_result","tool_use_id":"q2"}]},"toolUseResult":{"answers":{"Which store?":"SQLite","Which cache?":"LRU"}}}"#;
+        let s = ingest_str(&format!("{call}\n{result}"), Lane::Main);
+
+        assert_eq!(s.decisions.len(), 2, "each AskUserQuestion block recorded its own decision");
+
+        let d = decisions(&s);
+        assert_eq!(d.len(), 2);
+        for out in &d {
+            assert_eq!(
+                out.resolution,
+                Resolution::Ambiguous,
+                "two AskUserQuestion actions on one line: neither decision can \
+                 be resolved to a single asking action"
+            );
+            assert!(out.idxs.is_empty());
+        }
     }
 
     #[test]
