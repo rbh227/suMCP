@@ -18,6 +18,36 @@ One line: *a deterministic local tool that reads Claude Code transcripts and
 gives a reviewing agent the recorded context it needs to stop reporting things
 that are not problems.*
 
+### The whole thing in four paragraphs
+
+**What we build.** A local binary that gives a reviewing agent five things
+about a commit, quoted verbatim with citations: what was asked, what was
+decided (including the options it beat), what was tried and failed, what was
+left unfinished, and what the agent claimed it did. Two MCP tools and a CLI
+command. No diff parsing, no scoring. Later, gated on the result: the same
+material accumulated into a per-file project memory, plus every review finding
+the human dismissed, read by the reviewer to avoid repeating itself and by the
+builder before it edits.
+
+**The design.** suMCP retrieves; the agent judges. It never says "this is
+fine" or "this is risky," only "here is what was recorded, at this index."
+That is why it needs no LLM, has nothing to calibrate, and can be wrong about
+nothing except whether it found the right passage.
+
+**Why it works.** A reviewer holding only the diff can check whether code is
+internally consistent, but not whether it does what was wanted, because it
+infers the intent from the code under review. Meta proved that fixing this
+works at production scale using exactly this data source. The measured pain is
+not missed bugs but false alarms: 56.3% of agentic review comments are
+rejected, mostly for being out of scope or misaligned with intent. Neither is
+a property of code; both are written down in the transcript. Meta must infer
+intent and is right 86% of the time. Quoting is right always.
+
+**What would kill it.** It is absorbable by whoever owns the transcript
+format, which is not this project. And it is unproven that this moves a real
+reviewer's precision, which is why the first build is an experiment on the
+author's own commits with kill criteria fixed before it runs, not a launch.
+
 ## Why this, and why now
 
 ### The workflow being served
@@ -144,36 +174,98 @@ This is what keeps the tool out of the judgment business. It is also what makes
 determinism a feature: there is nothing to calibrate, no threshold to tune, and
 no weighting to defend.
 
-## The project layer
+## The project memory layer (designed, deferred)
 
-Cross-session memory, aimed at precision rather than at hot-spot ranking:
+**Nothing in this section is in the first build.** It is designed here so the
+first build does not foreclose it, and gated on the precision result: durable
+storage for a signal that does not work is worse than no storage. Read this as
+direction, not scope.
 
-> Remember which review findings were rejected, and suppress their recurrence.
+### What it holds
 
-When a reviewer raises a finding and the human dismisses it, that dismissal is
-durable knowledge. It compounds with every review, it is uniquely available to
-a tool sitting in this position, and it attacks the 56% directly.
+A per-project index keyed by **file path**, holding four kinds of entry, all
+already extracted by the first build:
 
-Two things make this cheap:
+| entry | why it is worth remembering |
+|---|---|
+| `DECIDED` | a recorded human choice and the options it beat |
+| `REJECTED` | a review finding the human dismissed |
+| `TRIED` | an approach attempted and abandoned, with the recorded failure |
+| `HISTORY` | session and revert counts for the file |
 
-- **Backfill, not accumulation.** A project's entire history re-derives from
-  transcripts in about 1 second (measured: 35 transcripts / 44 MB in 0.99 s;
-  29 transcripts / 52 MB in 0.81 s). There is no cold start.
-- **No database.** Because re-derivation is that cheap, the transcripts are
-  the store. No schema, no migrations, no staleness policy, no retention
-  threat model. This is the architectural work the Rust choice actually does:
-  in an interpreted language, re-derivation would take tens of seconds, which
-  forces a persistent store and everything that comes with it.
+```
+crates/sumcp-core/src/score.rs
+  DECIDED    2026-07-26  weights removed in favour of a fixed rule
+             (rejected: keep weights, tune on holdout)   [session 3145f2f3]
+  REJECTED   2026-07-28  reviewer flagged "ranking rule is arbitrary";
+                         dismissed, see validation doc    [review r-014]
+  HISTORY    4 sessions, 2 reverts
+```
+
+`REJECTED` is the entry with no substitute anywhere else. A dismissal is
+durable knowledge, it compounds with every review, and it attacks the measured
+56% rejection rate directly.
+
+### It is an index, not a graph
+
+Every entry above is keyed by location, and every query is "what do I know
+about this file?" That is a dictionary. A graph earns its complexity only when
+a query needs multi-hop traversal, and no such query has been identified. If
+one appears later, edges can be added to an index; an unused graph cannot be
+simplified back down. Build the index.
+
+### Relevance is delegated, not computed
+
+The hard problem is not storage, it is knowing when a stored entry applies.
+"Is this the same objection the human rejected in July?" cannot be answered by
+exact string match, and answering it semantically would require embeddings,
+which would mean a model inside suMCP and the loss of its one advantage over
+ARCTIC.
+
+The invariant resolves it. suMCP retrieves by **exact key** (this file, later
+this region), returns the small complete set it holds for that location, and
+the consuming agent decides which entries bear on the finding in front of it.
+That judgement is trivial for a model already reading both the code and the
+finding, and impossible to make deterministically. No embeddings, no
+similarity search, no model, and the memory is still not dumb.
+
+### Consumers
+
+The same index serves both agents, which is the point:
+
+- **the reviewer**, to suppress objections already settled
+- **the builder**, queried before it edits a file, to avoid re-litigating
+  decisions and re-attempting known failures
+
+The builder-side consumer is the lower-friction product (it needs no workflow
+change and no second agent) and is also the only place in this design where
+the Rust choice is load-bearing: a `PreToolUse` hook fires synchronously on
+every edit, and 27 ms of interpreter startup would consume most of the latency
+budget before any work began (measured: 2.3 ms for the Rust binary, 26.5 ms for
+`python3 -c pass`, 27.6 ms for `node -e ''`).
+
+### Storage and growth
+
+Transcripts are **append-only and immutable once a session ends**, so each is
+processed once and never re-processed. Corpus growth (measured at roughly
+1 GB/year: 154 MB live plus 252 MB already archived across 2,141 files)
+therefore does not force a re-derivation cost, in any language.
 
 The one thing that must persist is the **raw transcripts**, which Claude Code
 deletes after 30 days. `scripts/archive_corpus.py` already does this.
 
-**Nothing in this section is in the first build.** Rejected-finding memory is
-the intended next step *after* the precision result comes back positive, and
-its capture mechanism is still unresolved (see "Open questions"). A per-region
-friction map is deferred further still. This section exists to record where the
-design is heading, so the first build does not foreclose it, not to widen the
-first build.
+File paths change, so the index must follow renames. `git log --follow` is the
+mechanism.
+
+### Open before this is built
+
+- **Capture of `REJECTED`.** Recording a dismissal requires the human to signal
+  it. Whether that is a CLI call, a hook, or parsing a review thread is
+  unresolved and must be settled first.
+- **Region-level keying.** File-level is the first version. Region-level is
+  strictly better and needs durable region identity, for which `git log -L`
+  (measured at 160 ms on this repository) is the mechanism rather than
+  something to invent.
 
 ## Validation
 
@@ -239,6 +331,43 @@ The session-to-commit mapping is imperfect by nature and its failure mode is
 disclosed in the payload rather than hidden, the same way `work_unit` grouping
 already discloses itself (see "Open questions").
 
+## Language choice, stated honestly
+
+An earlier draft of this spec claimed that Rust "buys the ability to have no
+database," because re-derivation would take tens of seconds in an interpreted
+language. **That claim was measured and is false.** A Python implementation of
+this spec's full extraction, over an entire project, runs in 0.34 s (35 files,
+44 MB) and 0.40 s (29 files, 52 MB). The relevant content is roughly 1% of a
+transcript, which is why extraction is cheap in any language.
+
+The claim is withdrawn rather than quietly softened, because the same
+overclaiming is what produced the earlier "8.9x lift" that a one-line rule
+matched.
+
+What actually justifies Rust here, in order:
+
+1. **Distribution.** A single static binary with no runtime, no virtualenv, and
+   no dependency resolution. This matters *more* in this design than any
+   previous one, because the consumer is an external agent: registering a
+   self-contained binary in another tool's MCP config is one line and cannot
+   break on an interpreter version.
+2. **The deferred builder-side hook.** Cold start of 2.3 ms against 26.5 ms
+   (`python3 -c pass`) and 27.6 ms (`node -e ''`) is decisive only for
+   something that fires synchronously on every edit. That is the memory
+   layer's builder consumer and nothing else in this spec.
+3. **The codebase already exists**, is well tested, and rewriting it would be
+   irrational.
+
+What does **not** justify Rust: throughput, corpus scale, or the no-database
+architecture. The one workload in this project that genuinely needed Rust's
+speed was content-matching edit fragments against a diff, and that workload was
+deliberately dropped (see "Rejected alternatives").
+
+Rust should therefore be treated as an implementation detail and a
+distribution property, not as a product claim. Every time it has been pitched
+as a performance advantage in this project's documentation, the benchmark has
+failed to support it.
+
 ## Testing
 
 Following the repo's existing TDD practice, with two additions:
@@ -272,6 +401,14 @@ Following the repo's existing TDD practice, with two additions:
   competitor's feature.
 - **Pushing full intent into the reviewer's context by default.** Rejected on
   the overcorrection finding above.
+- **A memory *graph*.** Every memory entry identified is keyed by location and
+  every query is "what do I know about this file," which is a dictionary. No
+  multi-hop traversal query has been identified to justify edges. An index can
+  gain edges later; an unused graph cannot be simplified back down.
+- **Semantic retrieval (embeddings) for memory relevance.** It would answer "is
+  this the same objection as before" well, and it would put a model inside
+  suMCP, forfeiting the only advantage this design holds over ARCTIC.
+  Relevance is delegated to the consuming agent instead.
 
 ## Open questions
 
@@ -285,9 +422,8 @@ Following the repo's existing TDD practice, with two additions:
   version reports all of them with a count and lets the reviewer choose. If
   that proves unusable, the selection rule becomes a real design problem
   rather than an afterthought.
-- **Rejected-finding capture.** Recording a dismissal requires the human to
-  signal it. Whether that is a CLI call, a hook, or parsing the review thread
-  is unresolved and should be settled before that part is built.
+Questions belonging to the deferred memory layer (rejected-finding capture,
+region-level keying) are recorded in that section rather than repeated here.
 
 ## Risks carried forward
 
