@@ -741,6 +741,7 @@ mod tests {
             interrupts: 0,
             auto_accept: false,
             spawns: vec![],
+            decisions: vec![],
             session_ids: vec![],
             subagent_files_missing: 0,
         };
@@ -815,6 +816,7 @@ mod tests {
             interrupts: 0,
             auto_accept: false,
             spawns: vec![],
+            decisions: vec![],
             session_ids: vec![],
             subagent_files_missing: 0,
         };

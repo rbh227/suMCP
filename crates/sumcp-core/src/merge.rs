@@ -24,6 +24,10 @@ pub fn merge_sessions(main: Session, subs: Vec<Session>, files_missing: u64) -> 
     let mut interrupts = main.interrupts;
     let auto_accept = main.auto_accept; // NOT OR'd — see spec §5
     let spawns = main.spawns;
+    // Main only: a subagent has no channel to ask the human anything, so a
+    // decision can only ever appear in the main transcript. Same reasoning
+    // that drops sub.user_texts.
+    let decisions = main.decisions;
 
     // Fold every subagent's actions and additive counters in.
     for sub in subs {
@@ -66,6 +70,7 @@ pub fn merge_sessions(main: Session, subs: Vec<Session>, files_missing: u64) -> 
         interrupts,
         auto_accept,
         spawns,
+        decisions,
         // This merge combines a main transcript with its own subagents into a
         // single work unit's worth of data, so it does not own the transcript id
         // table. The assembly step fills in session_ids when it merges multiple
@@ -107,6 +112,7 @@ pub fn merge_work_unit(parts: Vec<(String, Session)>) -> Session {
     let mut interrupts = 0u64;
     let mut auto_accept = false;
     let mut spawns = Vec::new();
+    let mut decisions = Vec::new();
     // Strictly the sum of the parts' own subagent-missing counts. A work-unit
     // MEMBER that failed to load is a different kind of gap (it is not a
     // subagent spawn) and is disclosed as `work_unit.members_unreadable`
@@ -135,6 +141,13 @@ pub fn merge_work_unit(parts: Vec<(String, Session)>) -> Session {
         for mut u in part.user_texts {
             u.session_ix = ix;
             user_texts.push(u);
+        }
+        // Stamped like user_texts: a decision must be attributable to the
+        // transcript it came from, or the payload cannot cite it correctly
+        // in a multi-transcript work unit.
+        for mut d in part.decisions {
+            d.session_ix = ix;
+            decisions.push(d);
         }
         // First non-None cwd wins; every transcript in a unit is in the same
         // project, so they agree, but a synthetic session can have None.
@@ -211,6 +224,7 @@ pub fn merge_work_unit(parts: Vec<(String, Session)>) -> Session {
         interrupts,
         auto_accept,
         spawns,
+        decisions,
         subagent_files_missing,
         session_ids,
     }
@@ -256,6 +270,7 @@ mod tests {
             interrupts: 0,
             auto_accept: false,
             spawns: vec![],
+            decisions: vec![],
             session_ids: vec![],
             subagent_files_missing: 0,
         }
@@ -401,6 +416,7 @@ mod tests {
             interrupts: 0,
             auto_accept: false,
             spawns: vec![],
+            decisions: vec![],
             session_ids: vec![],
             subagent_files_missing: 0,
         };

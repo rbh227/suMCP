@@ -13,7 +13,7 @@
 //! that is the more robust choice: a surprising shape in one field costs us
 //! that field, not the whole line's type/uuid/timestamp.
 
-use crate::model::{Action, ActionKind, Idx, Lane, Session, Spawn, Tokens, UserText};
+use crate::model::{Action, ActionKind, Decision, Idx, Lane, Session, Spawn, Tokens, UserText};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -49,6 +49,13 @@ pub fn ingest_str(raw: &str, default_lane: Lane) -> Session {
     let mut spawn_ids: Vec<String> = Vec::new();
     // tool_use id -> the result that came back for it (error text, patch hunks).
     let mut results: HashMap<String, ResultInfo> = HashMap::new();
+    // Decisions arrive in two halves on different lines: the AskUserQuestion
+    // call carries the question and options, the paired result carries the
+    // answer. We stash the half we have and join by tool_use id at the end,
+    // exactly the way spawns already resolve their agentId.
+    let mut pending_decisions: Vec<(String, Decision)> = Vec::new();
+    let mut decision_answers: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
 
     for (line_no, line) in raw.lines().enumerate() {
         if line.trim().is_empty() {
@@ -210,6 +217,47 @@ pub fn ingest_str(raw: &str, default_lane: Lane) -> Session {
                                 .and_then(Value::as_str),
                         );
 
+                        // A recorded human decision. One AskUserQuestion call
+                        // can carry several questions, and each becomes its
+                        // own Decision so the payload can cite them
+                        // separately.
+                        if name == "AskUserQuestion"
+                            && let Some(qs) = input
+                                .and_then(|i| i.get("questions"))
+                                .and_then(Value::as_array)
+                        {
+                            for q in qs {
+                                let Some(question) = q.get("question").and_then(Value::as_str)
+                                else {
+                                    continue; // malformed entry is data, not an error
+                                };
+                                let options = q
+                                    .get("options")
+                                    .and_then(Value::as_array)
+                                    .map(|os| {
+                                        os.iter()
+                                            .filter_map(|o| o.get("label").and_then(Value::as_str))
+                                            .map(str::to_string)
+                                            .collect()
+                                    })
+                                    .unwrap_or_default();
+                                pending_decisions.push((
+                                    question.to_string(),
+                                    Decision {
+                                        question: question.to_string(),
+                                        options,
+                                        answer: None, // filled by the join below
+                                        line_no,
+                                        // The asking action's Idx is assigned
+                                        // when `pending` is drained, so this
+                                        // is resolved in the join too.
+                                        idx: None,
+                                        session_ix: 0,
+                                    },
+                                ));
+                            }
+                        }
+
                         pending.push(PendingAction {
                             tool_use_id: tool_id.map(str::to_string),
                             effective_ts: effective_ts.clone(),
@@ -249,6 +297,20 @@ pub fn ingest_str(raw: &str, default_lane: Lane) -> Session {
                             // structuredPatch (edit line ranges) lives at the
                             // top level of the same line, paired with this result.
                             let hunks = read_hunks(v.get("toolUseResult"));
+                            // The answers map is keyed by the question text
+                            // itself, so it joins to the pending decisions
+                            // without needing the tool_use id.
+                            if let Some(answers) = v
+                                .get("toolUseResult")
+                                .and_then(|r| r.get("answers"))
+                                .and_then(Value::as_object)
+                            {
+                                for (q, a) in answers {
+                                    if let Some(text) = a.as_str() {
+                                        decision_answers.insert(q.clone(), text.to_string());
+                                    }
+                                }
+                            }
                             let user_modified = v
                                 .get("toolUseResult")
                                 .and_then(|r| r.get("userModified"))
@@ -356,6 +418,16 @@ pub fn ingest_str(raw: &str, default_lane: Lane) -> Session {
         tokens.cache_creation += u.cache_creation;
     }
 
+    // Join the two halves. An unanswered question keeps `answer: None`: the
+    // options it offered are still evidence of what was under consideration.
+    let decisions: Vec<Decision> = pending_decisions
+        .into_iter()
+        .map(|(q, mut d)| {
+            d.answer = decision_answers.get(&q).cloned();
+            d
+        })
+        .collect();
+
     Session {
         actions,
         user_texts,
@@ -367,6 +439,7 @@ pub fn ingest_str(raw: &str, default_lane: Lane) -> Session {
         interrupts,
         auto_accept,
         spawns,
+        decisions,
         // A single `ingest_str` call has no idea what its own transcript id
         // is (that lives outside the raw JSONL text it was handed), so it
         // cannot fill this in. It leaves the table empty; the merge/assembly
@@ -740,5 +813,50 @@ mod tests {
         let s = ingest_str(raw, Lane::Main);
         assert_eq!(s.user_texts.len(), 1);
         assert!(s.user_texts[0].is_human, "no origin field means human");
+    }
+
+    #[test]
+    fn ask_user_question_is_captured_with_its_answer() {
+        // A recorded decision is the highest-value item in the review payload:
+        // it is the human's explicit choice AND the options it beat. Both halves
+        // live on different lines (the call, then the result), joined by
+        // tool_use id, exactly like structuredPatch already is.
+        let call = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"tool_use","id":"q1","name":"AskUserQuestion","input":{"questions":[{"question":"Which store?","header":"Store","options":[{"label":"SQLite"},{"label":"JSONL"}]}]}}]}}"#;
+        let result = r#"{"type":"user","timestamp":"2026-01-01T00:00:05Z","message":{"content":[{"type":"tool_result","tool_use_id":"q1"}]},"toolUseResult":{"answers":{"Which store?":"JSONL"}}}"#;
+        let s = ingest_str(&format!("{call}\n{result}"), Lane::Main);
+
+        assert_eq!(s.decisions.len(), 1, "one recorded decision");
+        let d = &s.decisions[0];
+        assert_eq!(d.question, "Which store?");
+        assert_eq!(d.options, vec!["SQLite".to_string(), "JSONL".to_string()]);
+        assert_eq!(d.answer.as_deref(), Some("JSONL"));
+    }
+
+    #[test]
+    fn an_other_answer_is_kept_verbatim_not_matched_to_an_option() {
+        // The user can answer "Other" with free text that matches no option.
+        // Quoting is the whole point of this design, so the free text must
+        // survive intact rather than being dropped for failing to match.
+        let call = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"tool_use","id":"q1","name":"AskUserQuestion","input":{"questions":[{"question":"Which store?","options":[{"label":"SQLite"}]}]}}]}}"#;
+        let result = r#"{"type":"user","timestamp":"2026-01-01T00:00:05Z","message":{"content":[{"type":"tool_result","tool_use_id":"q1"}]},"toolUseResult":{"answers":{"Which store?":"neither, keep it in memory"}}}"#;
+        let s = ingest_str(&format!("{call}\n{result}"), Lane::Main);
+
+        assert_eq!(
+            s.decisions[0].answer.as_deref(),
+            Some("neither, keep it in memory")
+        );
+    }
+
+    #[test]
+    fn an_unanswered_question_is_still_recorded() {
+        // An interrupted session can leave a question with no result line. The
+        // question and its options are still evidence of what was under
+        // consideration, so the entry is kept with answer: None rather than
+        // dropped.
+        let call = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"tool_use","id":"q1","name":"AskUserQuestion","input":{"questions":[{"question":"Which store?","options":[{"label":"SQLite"}]}]}}]}}"#;
+        let s = ingest_str(call, Lane::Main);
+
+        assert_eq!(s.decisions.len(), 1);
+        assert_eq!(s.decisions[0].answer, None);
     }
 }
