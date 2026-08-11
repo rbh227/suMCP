@@ -172,7 +172,13 @@ pub fn validation_share(s: &Session) -> f64 {
     hits as f64 / bash.len() as f64
 }
 
-fn is_validation(cmd: &str) -> bool {
+/// Whether `cmd` looks like a test/lint/build/typecheck invocation.
+///
+/// `pub(crate)` (not private) because `context::incomplete()` reuses this
+/// exact classifier to decide which Bash actions count toward
+/// `failing_commands`: the design was deliberately never to invent a second
+/// definition of "validation command" that could drift from this one.
+pub(crate) fn is_validation(cmd: &str) -> bool {
     const NEEDLES: [&str; 8] = [
         "test",
         "lint",

@@ -6,6 +6,7 @@
 //! risky, because that judgement belongs to the agent consuming this.
 
 use crate::model::{ActionKind, Idx, Lane, Session, TurnOrigin};
+use crate::signals::failures::is_validation;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// One thing the human asked for, quoted exactly as written.
@@ -289,7 +290,8 @@ pub struct UnfinishedTask {
     pub line_no: usize,
 }
 
-/// A command whose LAST run in the session failed.
+/// A validation command (per `is_validation`: test/lint/build/typecheck)
+/// whose LAST recorded invocation explicitly failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FailingCommand {
     /// The command string, verbatim.
@@ -301,9 +303,19 @@ pub struct FailingCommand {
 /// Work that was planned or attempted and did not finish.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Incomplete {
-    /// Tasks that never reached `completed`.
+    /// Tasks that never reached a terminal status (`completed` or
+    /// `deleted`).
     pub unfinished_tasks: Vec<UnfinishedTask>,
-    /// Commands still failing when the session ended.
+    /// The last RECORDED outcome of each distinct validation command
+    /// string (spec §"incomplete": "Bash actions matching the existing
+    /// test/build regexes"), keyed by exact command text. This is NOT a
+    /// claim that "the test suite is still failing" as a whole: a command
+    /// with no paired result at all (its last invocation was retried and
+    /// then interrupted, say) is neither passing nor failing, so it is
+    /// simply absent from this list rather than guessed at either way. Two
+    /// invocations that differ by even one flag (`cargo test` vs
+    /// `cargo test --release`) are tracked as separate command strings,
+    /// deliberately: no fuzzy grouping is attempted here.
     pub failing_commands: Vec<FailingCommand>,
 }
 
@@ -327,13 +339,15 @@ pub fn incomplete(s: &Session) -> Incomplete {
     }
     let unfinished_tasks = final_state
         .into_iter()
-        // "completed" is the only terminal status a TaskUpdate result has
-        // ever been observed to confirm (see ingest.rs's task_events tests).
-        // There is no evidence for a "deleted" or "cancelled" status in this
-        // corpus, so nothing else is treated as finished; inventing a second
-        // terminal state without evidence would risk quietly hiding real
-        // unfinished work.
-        .filter(|(_, (_, status, _))| status != "completed")
+        // "completed" and "deleted" are the terminal statuses measured on
+        // real transcripts: `TaskUpdate` statuses observed across 15
+        // sessions are `completed` (71), `in_progress` (48), and `deleted`
+        // (1). A task the human explicitly deleted was cancelled, not left
+        // undone, so it must not be reported as work still pending.
+        // Nothing else is treated as finished; inventing a further terminal
+        // state without evidence would risk quietly hiding real unfinished
+        // work.
+        .filter(|(_, (_, status, _))| status != "completed" && status != "deleted")
         .map(
             |((session_ix, lane, id), (subject, last_status, line_no))| UnfinishedTask {
                 id,
@@ -346,23 +360,36 @@ pub fn incomplete(s: &Session) -> Incomplete {
         )
         .collect();
 
-    // Last run wins, per distinct command string. A test that failed and was
-    // then fixed is not unfinished work, so only the final state counts.
+    // Last run wins, per distinct VALIDATION command string (per
+    // `is_validation`: test/lint/build/typecheck). A non-validation command
+    // (e.g. `rg nomatch`, which exits non-zero on no match) is not work in
+    // progress at all, so it must never reach this replay.
+    //
+    // The state is tri-state, not boolean: `is_error` is `Some(true)`
+    // (failed), `Some(false)` (passed), or `None` (no confirmed result --
+    // the invocation was retried and then interrupted, say). Every
+    // invocation of a command is replayed in order, last-run-wins, so an
+    // unconfirmed retry SUPERSEDES an earlier confirmed failure instead of
+    // being skipped in its favor: a validation command that failed, was
+    // retried, and then interrupted has an unknown final outcome, not a
+    // failed one. `failing_commands` is populated only from a final state
+    // that is explicitly `Some(true)`; `None` emits nothing, since absence
+    // of a result is not evidence of failure any more than of success.
     // `incomplete()` runs on the already-merged session, so `Action::idx` is
     // the final global index and safe to cite directly, unlike a task event
     // (which carries none, for the reason `TaskEvent`'s doc gives).
-    let mut last_run: BTreeMap<String, (bool, Idx)> = BTreeMap::new();
+    let mut last_run: BTreeMap<String, (Option<bool>, Idx)> = BTreeMap::new();
     for a in &s.actions {
         if a.kind == ActionKind::Bash
             && let Some(cmd) = a.command.as_deref()
-            && let Some(err) = a.is_error
+            && is_validation(cmd)
         {
-            last_run.insert(cmd.to_string(), (err, a.idx));
+            last_run.insert(cmd.to_string(), (a.is_error, a.idx));
         }
     }
     let failing_commands = last_run
         .into_iter()
-        .filter(|(_, (err, _))| *err)
+        .filter(|(_, (err, _))| *err == Some(true))
         .map(|(command, (_, idx))| FailingCommand { command, idx })
         .collect();
 
@@ -522,8 +549,8 @@ mod tests {
     // ---- DEFECT 2 regression: options_not_chosen is not a rejection claim ----
 
     #[test]
-    fn a_free_text_answer_that_contains_an_options_label_still_lists_it_as_not_chosen_this_is_not_a_rejection_claim(
-    ) {
+    fn a_free_text_answer_that_contains_an_options_label_still_lists_it_as_not_chosen_this_is_not_a_rejection_claim()
+     {
         // The human answered free text that AFFIRMS and refines one of the
         // offered options: "SQLite with WAL" picked SQLite, with detail.
         // `options_not_chosen` still lists "SQLite", because the field is
@@ -628,7 +655,11 @@ mod tests {
         let result = r#"{"type":"user","timestamp":"2026-01-01T00:00:05Z","message":{"content":[{"type":"tool_result","tool_use_id":"q1"},{"type":"tool_result","tool_use_id":"q2"}]},"toolUseResult":{"answers":{"Which store?":"SQLite","Which cache?":"LRU"}}}"#;
         let s = ingest_str(&format!("{call}\n{result}"), Lane::Main);
 
-        assert_eq!(s.decisions.len(), 2, "each AskUserQuestion block recorded its own decision");
+        assert_eq!(
+            s.decisions.len(),
+            2,
+            "each AskUserQuestion block recorded its own decision"
+        );
 
         let d = decisions(&s);
         assert_eq!(d.len(), 2);
@@ -683,7 +714,10 @@ mod tests {
 
         let d = decisions(&merged);
         assert_eq!(d.len(), 1);
-        assert_eq!(d[0].session_ix, 1, "the decision came from the second transcript");
+        assert_eq!(
+            d[0].session_ix, 1,
+            "the decision came from the second transcript"
+        );
         assert_eq!(
             d[0].idxs,
             vec![Idx(1)],
@@ -708,7 +742,10 @@ mod tests {
 
         let inc = incomplete(&s);
         assert_eq!(inc.unfinished_tasks.len(), 1, "task 2 never completed");
-        assert_eq!(inc.unfinished_tasks[0].subject.as_deref(), Some("Add tests"));
+        assert_eq!(
+            inc.unfinished_tasks[0].subject.as_deref(),
+            Some("Add tests")
+        );
         assert_eq!(inc.unfinished_tasks[0].last_status, "pending");
     }
 
@@ -788,5 +825,89 @@ mod tests {
             Lane::Sub("agent-1".to_string())
         );
         assert_eq!(inc.unfinished_tasks[0].last_status, "pending");
+    }
+
+    // ---- DEFECT: failing_commands must only replay VALIDATION commands ----
+
+    #[test]
+    fn a_failing_non_validation_command_does_not_appear_in_failing_commands() {
+        // `rg nomatch` fails (exit 1 on no match) but is not a test, lint,
+        // build, or typecheck invocation. Reporting it to a reviewer as
+        // unfinished work would be exactly the false positive `is_validation`
+        // exists to prevent.
+        let call = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"tool_use","id":"b1","name":"Bash","input":{"command":"rg nomatch"}}]}}"#;
+        let result = r#"{"type":"user","timestamp":"2026-01-01T00:00:01Z","message":{"content":[{"type":"tool_result","tool_use_id":"b1","is_error":true}]}}"#;
+        let s = ingest_str(&format!("{call}\n{result}"), Lane::Main);
+
+        assert!(
+            incomplete(&s).failing_commands.is_empty(),
+            "a failing non-validation command must not be reported"
+        );
+    }
+
+    // ---- DEFECT: "deleted" is a terminal status, same as "completed" ----
+
+    #[test]
+    fn a_task_confirmed_deleted_is_not_reported_as_unfinished() {
+        let create = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"tool_use","id":"a","name":"TaskCreate","input":{"subject":"Scratch task"}}]}}"#;
+        let create_result = r#"{"type":"user","timestamp":"2026-01-01T00:00:01Z","message":{"content":[{"type":"tool_result","tool_use_id":"a"}]},"toolUseResult":{"task":{"id":"1","subject":"Scratch task"}}}"#;
+        let delete = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:02Z","message":{"content":[{"type":"tool_use","id":"b","name":"TaskUpdate","input":{"taskId":"1","status":"deleted"}}]}}"#;
+        let delete_result = r#"{"type":"user","timestamp":"2026-01-01T00:00:03Z","message":{"content":[{"type":"tool_result","tool_use_id":"b"}]},"toolUseResult":{"success":true,"taskId":"1","statusChange":"deleted"}}"#;
+        let s = ingest_str(
+            &format!("{create}\n{create_result}\n{delete}\n{delete_result}"),
+            Lane::Main,
+        );
+
+        assert!(
+            incomplete(&s).unfinished_tasks.is_empty(),
+            "a task the human explicitly deleted was cancelled, not left undone"
+        );
+    }
+
+    // ---- DEFECT: replay must be tri-state (passed/failed/unknown), last-run-wins ----
+
+    #[test]
+    fn a_validation_command_retried_with_no_paired_result_has_unknown_final_outcome_and_does_not_appear()
+     {
+        // First invocation of a validation command fails. It is retried, but
+        // the retry's tool_use has no matching tool_result at all (the
+        // transcript was interrupted mid-call). The final recorded outcome
+        // is therefore unknown, not failed: the old `let Some(err)` guard
+        // skipped the unconfirmed retry entirely and let the earlier failure
+        // stand as if it were the last word.
+        let fail = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"tool_use","id":"b1","name":"Bash","input":{"command":"cargo test"}}]}}"#;
+        let fail_r = r#"{"type":"user","timestamp":"2026-01-01T00:00:01Z","message":{"content":[{"type":"tool_result","tool_use_id":"b1","is_error":true}]}}"#;
+        // The retry: a tool_use with no corresponding tool_result line.
+        let retry = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:02Z","message":{"content":[{"type":"tool_use","id":"b2","name":"Bash","input":{"command":"cargo test"}}]}}"#;
+        let s = ingest_str(&format!("{fail}\n{fail_r}\n{retry}"), Lane::Main);
+
+        // Sanity check: the retry really is unconfirmed.
+        let retry_action = s
+            .actions
+            .iter()
+            .find(|a| a.command.as_deref() == Some("cargo test") && a.is_error.is_none());
+        assert!(
+            retry_action.is_some(),
+            "the retry must be an action with no confirmed result"
+        );
+
+        assert!(
+            incomplete(&s).failing_commands.is_empty(),
+            "the final invocation's outcome is unknown, not failed, so nothing is reported"
+        );
+    }
+
+    #[test]
+    fn a_validation_command_that_fails_then_passes_on_an_identical_retry_does_not_appear() {
+        let fail = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"tool_use","id":"b1","name":"Bash","input":{"command":"cargo test"}}]}}"#;
+        let fail_r = r#"{"type":"user","timestamp":"2026-01-01T00:00:01Z","message":{"content":[{"type":"tool_result","tool_use_id":"b1","is_error":true}]}}"#;
+        let pass = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:02Z","message":{"content":[{"type":"tool_use","id":"b2","name":"Bash","input":{"command":"cargo test"}}]}}"#;
+        let pass_r = r#"{"type":"user","timestamp":"2026-01-01T00:00:03Z","message":{"content":[{"type":"tool_result","tool_use_id":"b2","is_error":false}]}}"#;
+        let s = ingest_str(&format!("{fail}\n{fail_r}\n{pass}\n{pass_r}"), Lane::Main);
+
+        assert!(
+            incomplete(&s).failing_commands.is_empty(),
+            "the last recorded outcome of this command is a pass"
+        );
     }
 }

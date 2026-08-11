@@ -345,9 +345,8 @@ pub fn ingest_str(raw: &str, default_lane: Lane) -> Session {
                                 lane: default_lane.clone(),
                             });
                         } else if name == "TaskUpdate"
-                            && let Some(status) = input
-                                .and_then(|i| i.get("status"))
-                                .and_then(Value::as_str)
+                            && let Some(status) =
+                                input.and_then(|i| i.get("status")).and_then(Value::as_str)
                         {
                             pending_task_events.push(PendingTaskEvent::Update {
                                 tool_use_id: tool_id.map(str::to_string),
@@ -491,9 +490,7 @@ pub fn ingest_str(raw: &str, default_lane: Lane) -> Session {
                             );
                         }
                     }
-                    Some("text")
-                        if v.get("type").and_then(Value::as_str) == Some("assistant") =>
-                    {
+                    Some("text") if v.get("type").and_then(Value::as_str) == Some("assistant") => {
                         // Whitespace-only blocks carry nothing and would only
                         // pad the list Task 8 selects from. `str::trim` uses
                         // Unicode `White_Space`, not just ASCII, so a block of
@@ -674,10 +671,7 @@ pub fn ingest_str(raw: &str, default_lane: Lane) -> Session {
                 if r.task_update_success != Some(true) {
                     return None;
                 }
-                let status = r
-                    .task_status_change
-                    .clone()
-                    .unwrap_or(requested_status);
+                let status = r.task_status_change.clone().unwrap_or(requested_status);
                 Some(TaskEvent {
                     id: task_id,
                     subject,
@@ -1222,7 +1216,10 @@ mod tests {
 
         assert_eq!(s.task_events.len(), 2);
         assert_eq!(s.task_events[0].subject.as_deref(), Some("Wire the cache"));
-        assert_eq!(s.task_events[0].status, "pending", "a create starts pending");
+        assert_eq!(
+            s.task_events[0].status, "pending",
+            "a create starts pending"
+        );
         assert_eq!(s.task_events[0].id, "1", "id comes from the result");
         assert_eq!(s.task_events[1].id, "1");
         assert_eq!(s.task_events[1].status, "in_progress");
@@ -1321,7 +1318,11 @@ mod tests {
         );
         let s = ingest_str(&line, Lane::Main);
 
-        assert_eq!(s.agent_texts.len(), 2, "both blocks with text, not the blank");
+        assert_eq!(
+            s.agent_texts.len(),
+            2,
+            "both blocks with text, not the blank"
+        );
         assert_eq!(s.agent_texts[0].text.chars().count(), 100);
         assert_eq!(s.agent_texts[1].text, "ok");
     }
