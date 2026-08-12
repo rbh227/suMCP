@@ -1,4 +1,4 @@
-# suMCP — Specification (v0.1)
+# backstory-mcp — Specification (v0.1)
 
 Post-session forensics MCP server for Claude Code. Parses session transcripts
 (`~/.claude/projects/<url-encoded-path>/<session-id>.jsonl`) into a structured
@@ -6,7 +6,7 @@ session graph of deterministic behavioral signals, so a connected agent can give
 the developer honest, evidence-based answers about what it actually did — for a
 fraction of the tokens of re-reading the session.
 
-**The agent tells you what it built; suMCP tells you what it actually did.**
+**The agent tells you what it built; backstory-mcp tells you what it actually did.**
 
 The authoritative metrics catalog is `docs/metrics-spec.md`. This spec records
 the decisions layered on top of it (all grilled and locked 2026-07-14/15), the
@@ -19,7 +19,7 @@ engineering contract.
 
 - **Users:** developers running Claude Code who ship agent-written code they
   don't fully understand (comprehension debt), and the agent itself, which
-  queries suMCP mid-conversation for ground truth about its own behavior.
+  queries backstory-mcp mid-conversation for ground truth about its own behavior.
 - **Thesis:** the transcript is behavioral evidence — every edit, read, failure,
   and user pushback, ordered and timestamped. Parsing is deterministic and
   near-free. No LLM in the tool; the connected agent is the intelligence layer.
@@ -42,7 +42,7 @@ engineering contract.
 | 5 | v0.1 scope | Metrics-spec staging **L1 + L2**, plus **#15 approval latency** and **#16 large-write-then-instant-accept** pulled forward from L3 (they are the comprehension-debt thesis). Both are **explicitly heuristic [P]**: latency = delta from the assistant `tool_use` proposal to its `tool_result`, measured only for Edit/Write (near-zero execution time, so the delta ≈ human decision time); **suppressed entirely** when `permissionMode` grants auto-accept or no permission event can exist, and never reported as exact. Deferred: #4 context waste, #17 human-engagement (v0.2); L4 cross-session (v2, seam only). |
 | 6 | Ranking | **AMENDED 2026-07-26: a stated rule, not a weighted count.** Rank = four keys: edited files before never-edited, then file-class tier, then edit count descending, then path. Payload ships `ranking_rule` plus each file's `class`, `edits`, and per-category `breakdown`. Never a single opaque score; never session-length-based. ORIGINALLY: `Rank = Σ(config weight × evidence count)` per Tier-1 category, weights in config with documented defaults. Removed because the 2026-07-22 study found that ranking did not beat sorting by edit count, and fitting the weights to the outcomes gained at most 4 hits of 39. See `docs/validation/2026-07-26-file-class-measurement.md`. |
 | 7 | MCP tools | **Six** (five + `evidence`). See §2. |
-| 8 | Name | **suMCP.** Binary names `sumcp` (CLI) and `sumcp-mcp` (server). |
+| 8 | Name | **backstory-mcp.** Binary names `sumcp` (CLI) and `sumcp-mcp` (server). |
 
 ### Empirical amendments to docs/metrics-spec.md (validated on this machine's corpus)
 

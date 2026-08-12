@@ -1,28 +1,32 @@
 <p align="center">
-  <img src="docs/assets/wordmark.svg" alt="suMCP" width="420">
+  <img src="docs/assets/wordmark.svg" alt="backstory-mcp: the session, quoted verbatim, for the reviewing agent" width="480">
 </p>
 
-<p align="center"><b>One agent writes the code. Another reviews it. suMCP hands the reviewer the context only the session had.</b></p>
+<p align="center"><b>One agent writes the code. Another reviews it. backstory-mcp hands the reviewer the context only the session had.</b></p>
 
 <p align="center">
   <img alt="license: MIT OR Apache-2.0" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue">
   <img alt="Rust" src="https://img.shields.io/badge/Rust-edition%202024-orange">
   <img alt="deterministic, no LLM, no network" src="https://img.shields.io/badge/deterministic-no%20LLM%20%C2%B7%20no%20network-2ea44f">
-  <img alt="release: v0.2.0" src="https://img.shields.io/badge/release-v0.2.0-000080">
+  <img alt="release: v0.2.0" src="https://img.shields.io/badge/release-v0.2.0-b3372f">
   <img alt="platforms: macOS, Linux, Windows" src="https://img.shields.io/badge/platforms-macOS%20%C2%B7%20Linux%20%C2%B7%20Windows-555555">
 </p>
 
 > **v0.2.0 is released.** Prebuilt archives for macOS (Apple Silicon and Intel),
 > Linux (glibc and static musl), and Windows are on the
-> [releases page](https://github.com/rbh227/suMCP/releases/latest), each with a
+> [releases page](https://github.com/rbh227/backstory-mcp/releases/latest), each with a
 > SHA-256 checksum.
 >
 > **The v0.3 line (in this repository, not yet in a release archive) changes
-> who suMCP is for.** The consumer is no longer a human deciding what to read.
+> who backstory-mcp is for.** The consumer is no longer a human deciding what to read.
 > It is the *reviewing agent* you run after your coding agent commits, and the
 > goal is precision: fewer false findings, not more places to look. See
 > [What is and is not established](#what-is-and-is-not-established) before
 > trusting any claim on this page.
+>
+> **Renamed.** This project was published as **suMCP** through v0.2.0; old
+> links redirect. The binaries, the MCP server registration, and the release
+> archives keep the name `sumcp`.
 
 ---
 
@@ -43,7 +47,7 @@ not properties of code. They are properties of the conversation, and the
 conversation is sitting on disk in `~/.claude/projects/`, deleted after 30
 days, read by nobody.
 
-suMCP reads it. Deterministically, in Rust, no LLM, no network. It hands the
+backstory-mcp reads it. Deterministically, in Rust, no LLM, no network. It hands the
 reviewing agent, over MCP or the CLI, the recorded facts a diff cannot carry:
 
 - **what was asked**, the human's requests, quoted verbatim, never summarized
@@ -60,7 +64,7 @@ sample with an unconditional total, so "3 shown" is never readable as
 be attributed, subagent prose that was excluded), the payload says so in a
 top-level `coverage` block instead of implying completeness.
 
-**The invariant: suMCP retrieves, the agent judges.** It never says "this is
+**The invariant: backstory-mcp retrieves, the agent judges.** It never says "this is
 fine" or "this is risky", only "here is what was recorded, at this index".
 That is why it needs no LLM, has nothing to calibrate, and can be wrong about
 nothing except whether it found the right passage.
@@ -71,7 +75,7 @@ Meta's ARCTIC ([arXiv:2607.29516](https://arxiv.org/html/2607.29516v1))
 validated this thesis at production scale: intent derived from developer-agent
 conversation logs, over a million requests, 90.2% engineer approval. It is
 also Meta-internal and legally unreleasable, and it *infers* intent with an
-LLM at 0.86 F1, roughly one intent in seven wrong. suMCP is the local, open,
+LLM at 0.86 F1, roughly one intent in seven wrong. backstory-mcp is the local, open,
 transcript-native complement: it *quotes*. A quote is right always, which is
 the first time this project's no-LLM rule has been an advantage rather than
 a ceiling.
@@ -115,14 +119,14 @@ registration.
 ### From a release archive
 
 Download for your platform from the
-[latest release](https://github.com/rbh227/suMCP/releases/latest):
+[latest release](https://github.com/rbh227/backstory-mcp/releases/latest):
 
 ```bash
 # macOS, Apple Silicon. Swap the target for x86_64-apple-darwin (Intel Mac),
 # x86_64-unknown-linux-gnu (Linux), or x86_64-pc-windows-msvc (Windows).
 V=v0.2.0; T=aarch64-apple-darwin
-curl -LO https://github.com/rbh227/suMCP/releases/download/$V/sumcp-$V-$T.tar.gz
-curl -LO https://github.com/rbh227/suMCP/releases/download/$V/sumcp-$V-$T.tar.gz.sha256
+curl -LO https://github.com/rbh227/backstory-mcp/releases/download/$V/sumcp-$V-$T.tar.gz
+curl -LO https://github.com/rbh227/backstory-mcp/releases/download/$V/sumcp-$V-$T.tar.gz.sha256
 
 # Verify before running it. Expect "sumcp-...tar.gz: OK".
 shasum -a 256 -c sumcp-$V-$T.tar.gz.sha256   # Linux: sha256sum -c
@@ -171,7 +175,7 @@ compile. Building from source is also the path for `aarch64` Linux, which has
 no published archive.
 
 ```bash
-git clone https://github.com/rbh227/suMCP && cd suMCP
+git clone https://github.com/rbh227/backstory-mcp && cd backstory-mcp
 cargo build --release
 ./target/release/sumcp install          # dry-run: prints exactly what it will write
 ./target/release/sumcp install --apply  # register the MCP server, debrief skill, and Stop hook (Unix)
@@ -285,7 +289,7 @@ What `review_context` will not do, on purpose:
   <img src="docs/assets/diagram-pipeline.svg" alt="session.jsonl to a deterministic Rust parser to a session graph to MCP tools to your agent, cited. No LLM, no network, read-only." width="760">
 </p>
 
-`locate → ingest → model → signals/context → rank → payloads`. suMCP parses
+`locate → ingest → model → signals/context → rank → payloads`. backstory-mcp parses
 transcripts permissively (a bad line never fails a file), merges every
 transcript in the work unit plus their subagent transcripts into one
 totally-ordered timeline, then runs pure functions over it. The forensic layer
@@ -322,7 +326,7 @@ Honesty about which claims have evidence behind them, by layer.
 
 **The forensic layer (v0.2, released) is measured, and the measurement cuts
 both ways.** On the author's own corpus (43 sessions, 552 file-sessions, one
-project held out), files suMCP flagged for review were 8.9x more likely to
+project held out), files backstory-mcp flagged for review were 8.9x more likely to
 show renewed struggle in the next 3 sessions than unflagged edited files. The
 same study put the ranking against one-line baselines and it lost: sorting
 files by edit count and taking the top 3 did at least as well on relative
@@ -358,7 +362,7 @@ plumbing with disclosed semantics, not as a proven precision improvement.
   bottleneck is false findings, and where the transcript holds exactly the
   facts (scope, intent, decisions, incompleteness) whose absence produces
   them.
-- **suMCP retrieves; the agent judges.** The layer that survived every
+- **backstory-mcp retrieves; the agent judges.** The layer that survived every
   redesign is deterministic extraction with citations. Every attempt at a
   judgment layer (weighted scores, heuristic "abandoned approach" detection)
   has either lost to a trivial baseline or been cut before shipping for

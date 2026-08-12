@@ -9,7 +9,7 @@ labels: bug
 **What you expected**
 
 **Repro**
-- suMCP version / commit:
+- backstory-mcp version / commit:
 - OS:
 - Command or tool call:
 

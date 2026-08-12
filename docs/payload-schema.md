@@ -1,4 +1,4 @@
-# suMCP payload schema v2 (T0.1, frozen at Checkpoint A; bumped 2026-07-27)
+# backstory-mcp payload schema v2 (T0.1, frozen at Checkpoint A; bumped 2026-07-27)
 
 The contract for what the six MCP tools return. Canonical examples live in
 `fixtures/mock-payloads/` and are enforced by `scripts/check_payloads.py`
@@ -245,7 +245,7 @@ measurement study is forward-referenced at
 
 ## 2026-07-27 BREAKING: `v` goes 1 to 2, work-unit grouping disclosed (T7)
 
-suMCP can now merge several transcripts of one continuous stretch of work
+backstory-mcp can now merge several transcripts of one continuous stretch of work
 (same project, joined when a transcript overlaps the previous or starts
 within 30 minutes of its end) into a single report. This version makes that
 grouping visible instead of silently folding several transcripts' evidence

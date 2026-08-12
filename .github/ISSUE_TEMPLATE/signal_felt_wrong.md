@@ -4,7 +4,7 @@ about: The ranking accused the wrong file, or missed a real struggle
 labels: signal-accuracy
 ---
 
-suMCP is an honesty tool, so a wrong accusation matters more than a miss. Thank
+backstory-mcp is an honesty tool, so a wrong accusation matters more than a miss. Thank
 you for reporting it.
 
 **What the ranking said**

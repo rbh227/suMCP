@@ -1,6 +1,6 @@
 # Security
 
-suMCP is read-only and offline by design:
+backstory-mcp is read-only and offline by design:
 
 - It never makes network calls.
 - It never executes code from a transcript; it parses text.
@@ -10,6 +10,6 @@ suMCP is read-only and offline by design:
 
 ## Reporting
 
-If you find a way suMCP reads outside a session file, writes outside its
+If you find a way backstory-mcp reads outside a session file, writes outside its
 documented paths, or leaks transcript content, please open a private security
 advisory on the GitHub repository rather than a public issue.

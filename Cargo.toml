@@ -12,7 +12,7 @@ edition = "2024"
 # declaration cannot quietly drift.
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/rbh227/suMCP"
+repository = "https://github.com/rbh227/backstory-mcp"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }

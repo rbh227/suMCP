@@ -1,19 +1,19 @@
-# Contributing to suMCP
+# Contributing to backstory-mcp
 
-Thanks for looking. suMCP is a deterministic, read-only Rust MCP server; the
+Thanks for looking. backstory-mcp is a deterministic, read-only Rust MCP server; the
 bar for changes is that they stay honest, cheap, and reproducible.
 
 ## Dev setup
 
 ```bash
-git clone https://github.com/rbh227/suMCP && cd suMCP
+git clone https://github.com/rbh227/backstory-mcp && cd backstory-mcp
 cargo build
 cargo test --workspace
 ```
 
 ## Donating a fixture
 
-The most useful contribution is a real session that suMCP got wrong or right in
+The most useful contribution is a real session that backstory-mcp got wrong or right in
 an interesting way. Never commit a raw transcript: it contains your paths, code,
 and prompts. Sanitize it first:
 

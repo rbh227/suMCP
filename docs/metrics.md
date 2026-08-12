@@ -1,6 +1,6 @@
 # Metrics
 
-Every signal suMCP ships, what it means, and how far to trust it. This is the
+Every signal backstory-mcp ships, what it means, and how far to trust it. This is the
 reader-facing distillation of [docs/metrics-spec.md](metrics-spec.md); the spec
 is the authoritative catalog and the research citations live there.
 

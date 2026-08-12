@@ -118,5 +118,5 @@ CI before publishing.
   are not.
 - No external user has validated the ranking. That is the top post-v0.1 item.
 
-[0.2.0]: https://github.com/rbh227/suMCP/releases/tag/v0.2.0
-[0.1.0]: https://github.com/rbh227/suMCP/releases/tag/v0.1.0
+[0.2.0]: https://github.com/rbh227/backstory-mcp/releases/tag/v0.2.0
+[0.1.0]: https://github.com/rbh227/backstory-mcp/releases/tag/v0.1.0
