@@ -28,7 +28,7 @@ becomes length-approximate placeholders). Review the output, then open a PR.
 
 ## Adding a signal
 
-Detectors live in `crates/sumcp-core/src/signals/`. A new signal must carry a
+Detectors live in `crates/backstory-core/src/signals/`. A new signal must carry a
 **tier**, an **exact-vs-heuristic** flag, a **confidence**, and the action
 indices that prove it, and must add a fixture that makes it fire (and a
 zero-fire case). Ranking stays a transparent weighted count with a visible

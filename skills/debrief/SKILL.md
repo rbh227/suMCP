@@ -1,11 +1,11 @@
 ---
 name: debrief
-description: End-of-session debrief grounded in suMCP evidence. Use at the end of a working session (or when the Stop hook nudges) to report honestly where the agent struggled, flip-flopped, or left blind spots, from transcript evidence, never from memory or self-report.
+description: End-of-session debrief grounded in backstory-mcp evidence. Use at the end of a working session (or when the Stop hook nudges) to report honestly where the agent struggled, flip-flopped, or left blind spots, from transcript evidence, never from memory or self-report.
 ---
 
 # Session debrief
 
-Report what actually happened this stretch of work, grounded in suMCP's
+Report what actually happened this stretch of work, grounded in backstory-mcp's
 deterministic transcript evidence. Your own recollection is self-report; the
 tools are the record. Never answer from memory what the tools can answer from
 evidence.

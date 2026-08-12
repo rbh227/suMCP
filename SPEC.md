@@ -42,7 +42,7 @@ engineering contract.
 | 5 | v0.1 scope | Metrics-spec staging **L1 + L2**, plus **#15 approval latency** and **#16 large-write-then-instant-accept** pulled forward from L3 (they are the comprehension-debt thesis). Both are **explicitly heuristic [P]**: latency = delta from the assistant `tool_use` proposal to its `tool_result`, measured only for Edit/Write (near-zero execution time, so the delta ≈ human decision time); **suppressed entirely** when `permissionMode` grants auto-accept or no permission event can exist, and never reported as exact. Deferred: #4 context waste, #17 human-engagement (v0.2); L4 cross-session (v2, seam only). |
 | 6 | Ranking | **AMENDED 2026-07-26: a stated rule, not a weighted count.** Rank = four keys: edited files before never-edited, then file-class tier, then edit count descending, then path. Payload ships `ranking_rule` plus each file's `class`, `edits`, and per-category `breakdown`. Never a single opaque score; never session-length-based. ORIGINALLY: `Rank = Σ(config weight × evidence count)` per Tier-1 category, weights in config with documented defaults. Removed because the 2026-07-22 study found that ranking did not beat sorting by edit count, and fitting the weights to the outcomes gained at most 4 hits of 39. See `docs/validation/2026-07-26-file-class-measurement.md`. |
 | 7 | MCP tools | **Six** (five + `evidence`). See §2. |
-| 8 | Name | **backstory-mcp.** Binary names `sumcp` (CLI) and `sumcp-mcp` (server). |
+| 8 | Name | **backstory-mcp.** Binary names `backstory` (CLI) and `backstory-mcp` (server). |
 
 ### Empirical amendments to docs/metrics-spec.md (validated on this machine's corpus)
 
@@ -145,9 +145,9 @@ Deliverables besides the server: a **debrief skill** (the end-of-session ritual,
 <500-token output contract) and a **Stop hook** that nudges when the session had
 enough activity to warrant a debrief.
 
-Adoption packaging (added by the idea-refine pass, see `docs/ideas/sumcp.md`):
-`sumcp` run bare prints the latest session's debrief with zero config (the
-first-60-seconds experience), and `sumcp report --html` renders the same
+Adoption packaging (added by the idea-refine pass, see `docs/ideas/backstory.md`):
+`backstory` run bare prints the latest session's debrief with zero config (the
+first-60-seconds experience), and `backstory report --html` renders the same
 Report into one self-contained HTML file (the shareable screenshot). Both are
 views of the single `Report` type — no live dashboard, ever (viewers are the
 crowded non-moat category).
@@ -159,9 +159,9 @@ cargo build --workspace          # build everything
 cargo test --workspace           # unit + fixture snapshot tests
 cargo clippy --workspace -- -D warnings
 cargo fmt --all
-cargo run -p sumcp-cli -- overview [--session <id>] [--project <path>]  # human CLI
-cargo run -p sumcp-cli -- install    # register MCP server + skill + hook (prints every write first)
-cargo run -p sumcp-mcp           # MCP server over stdio
+cargo run -p backstory-cli -- overview [--session <id>] [--project <path>]  # human CLI
+cargo run -p backstory-cli -- install    # register MCP server + skill + hook (prints every write first)
+cargo run -p backstory-mcp           # MCP server over stdio
 python3 scripts/sanitize.py <transcript.jsonl> <out.jsonl>  # fixture sanitizer (dev only)
 ```
 
@@ -172,7 +172,7 @@ build task), latest edition.
 
 ```
 crates/
-  sumcp-core/        # library: locate → ingest → model → signals → score → Report
+  backstory-core/        # library: locate → ingest → model → signals → score → Report
     src/locate.rs    #   find transcript(s) for cwd/session, incl. subagent files
     src/ingest.rs    #   permissive streaming parse, dedup, unknown-type counters
     src/model.rs     #   Session, Action (monotonic Idx, agent_id), ordering first-class
@@ -180,13 +180,13 @@ crates/
     src/score.rs     #   the four-key ranking rule (RANKING_RULE)
     src/file_class.rs #  path to Code/Web/Notes/Docs/Config/Other, pure
     src/report.rs    #   Report + per-tool payload shaping/truncation
-  sumcp-cli/         # thin binary: human-readable output of the same Reports
-  sumcp-mcp/         # thin binary: MCP over stdio, 6 tools, read-only hints
+  backstory-cli/         # thin binary: human-readable output of the same Reports
+  backstory-mcp/         # thin binary: MCP over stdio, 6 tools, read-only hints
 fixtures/            # sanitized real transcripts, version-stamped (2.1.56, 2.1.183, …)
 scripts/sanitize.py  # dev-time fixture sanitizer (structure-preserving, reviewed by hand)
 docs/metrics-spec.md # authoritative metric catalog (amended per §1)
-skills/debrief/      # the end-of-session debrief skill (installed by `sumcp install`)
-hooks/               # Stop-hook nudge script (installed by `sumcp install`)
+skills/debrief/      # the end-of-session debrief skill (installed by `backstory install`)
+hooks/               # Stop-hook nudge script (installed by `backstory install`)
 ```
 
 Seams left open, not built: symbol mapping (tree-sitter), git join (git2),
@@ -198,7 +198,7 @@ param exists from day one, used later for real-time tailing).
 - Dependency budget: `serde`/`serde_json` (core), `clap` (CLI only), `rmcp`
   pinned with `features = ["server"]` (MCP binary only — tokio comes with it
   and stays confined there), `toml` + `dirs` (config). Justify anything beyond
-  this list. `sumcp-core` depends on serde/serde_json alone.
+  this list. `backstory-core` depends on serde/serde_json alone.
 - Parsing paths never panic: no `unwrap`/`expect` on transcript data; one bad
   line never fails a file; unknown fields/types increment counters, never error.
 - Signals are pure functions `&Session -> Vec<Finding>`; no I/O below `ingest`.
@@ -240,7 +240,7 @@ param exists from day one, used later for real-time tailing).
 
 **Ask first**
 - New dependencies beyond the budget in §5.
-- Any write path beyond `sumcp install` (the analysis pipeline — MCP server,
+- Any write path beyond `backstory install` (the analysis pipeline — MCP server,
   CLI analysis, HTML report generation — is read-only end to end; `install` is
   the sole sanctioned writer and is bound by the A8 write contract).
 - Publishing (crates.io, GitHub) or changing the six-tool MCP surface.
@@ -255,12 +255,12 @@ param exists from day one, used later for real-time tailing).
 
 | # | Decision | Why |
 |---|----------|-----|
-| A1 | **Rust**, despite no local toolchain yet and a permissive-parsing workload | Distribution: a single static binary with zero runtime deps is a real adoption edge for an MCP server. Secondary: learning Rust is an explicit goal — accept slower iteration; put the learning value in `sumcp-core`, not plumbing. |
-| A2 | **rmcp** (official SDK, pinned) over hand-rolled JSON-RPC | Protocol correctness outsourced; MCP is still evolving. Tokio confined to the `sumcp-mcp` binary; core stays sync/pure; SDK wrapped thinly so swapping it later is one crate. |
+| A1 | **Rust**, despite no local toolchain yet and a permissive-parsing workload | Distribution: a single static binary with zero runtime deps is a real adoption edge for an MCP server. Secondary: learning Rust is an explicit goal — accept slower iteration; put the learning value in `backstory-core`, not plumbing. |
+| A2 | **rmcp** (official SDK, pinned) over hand-rolled JSON-RPC | Protocol correctness outsourced; MCP is still evolving. Tokio confined to the `backstory-mcp` binary; core stays sync/pure; SDK wrapped thinly so swapping it later is one crate. |
 | A3 | **Memoized re-parse** for freshness | Transcript grows for hours under a long-lived server. Stat on each call; re-parse (~tens of ms for 6 MB) only if (mtime, size) changed. Always fresh, no mutable-model bugs. `byte_offset` param exists but is always 0 in v0.1 (real-time seam). |
 | A4 | **Self-identifying current session, fail-closed for MCP** | Scan recent files' tails for our forwarded tool_use id (short bounded retry). *Amended 2026-07-20 (Checkpoint D live + `/debug` log):* the original premise — "the calling session has already appended this tool_use" — is empirically false; Claude Code usually flushes that line only **after** the tool result returns (transcript mtime observed 8 s stale through a full retry window), so the scan is opportunistic verification (1-in-4 live hit rate), never reliable discovery, and no retry window fixes that ordering. The dependable path is explicit `session_id`; the Stop-hook debrief flow always passes it (hook input carries the id). If no verified match and no explicit `session_id`: MCP tools **fail closed**, returning an `ambiguous_session` error payload listing candidate sessions — never a recency guess (a plausible-but-wrong debrief is fatal for an honesty tool). Newest-mtime inference exists only in the CLI's explicit `latest` mode, with a provenance field. Explicit `session_id` param everywhere. |
 | A5 | **Compact JSON payloads** | Agents parse it reliably, snapshot tests diff it, token caps enforceable by construction (`truncated: true` markers). CLI renders the same `Report` for humans — one Report type, two views. |
-| A6 | **RETIRED 2026-07-26.** Was: compiled default Weights + optional TOML (`~/.config/sumcp/config.toml`). | Ranking no longer uses weights (decision 6, amended), so the config had nothing left to set and the loader was removed. A user with a stale config gets a one-line notice. Payloads echo `ranking_rule` instead of weights, which is a stronger transparency guarantee: the rule that produced the order, not six decimals that did not explain it. |
+| A6 | **RETIRED 2026-07-26.** Was: compiled default Weights + optional TOML (`~/.config/backstory/config.toml`). | Ranking no longer uses weights (decision 6, amended), so the config had nothing left to set and the loader was removed. A user with a stale config gets a one-line notice. Payloads echo `ranking_rule` instead of weights, which is a stronger transparency guarantee: the rule that produced the order, not six decimals that did not explain it. |
 | A7 | **Sanitizer script + hand review for fixtures** | Real transcripts contain private code/prompts/paths. Structure-preserving rewrite (ids, ordering, usage, error shapes kept; content synthesized) keeps the repo publishable without losing the weirdness that breaks parsers. |
-| A8 | **`sumcp install` subcommand with a strict write contract** | The sole write path in the product. Dry-run by default (`--apply` to execute); every write atomic via temp+rename with a timestamped backup of any pre-existing file; rollback of completed steps on partial failure; idempotent reinstall; `uninstall` restores backups and removes only what install created (manifest-tracked). Tested against pre-existing `.mcp.json`, skills, and hooks. Files `0600`/dirs `0700`; refuse to follow symlinks at write targets; assert the resolved target is under `$HOME`. Plugin packaging deferred to v0.2. |
+| A8 | **`backstory install` subcommand with a strict write contract** | The sole write path in the product. Dry-run by default (`--apply` to execute); every write atomic via temp+rename with a timestamped backup of any pre-existing file; rollback of completed steps on partial failure; idempotent reinstall; `uninstall` restores backups and removes only what install created (manifest-tracked). Tested against pre-existing `.mcp.json`, skills, and hooks. Files `0600`/dirs `0700`; refuse to follow symlinks at write targets; assert the resolved target is under `$HOME`. Plugin packaging deferred to v0.2. |
 | A9 | **Input is untrusted; the read boundary is allowlisted** (from /ship security audit) | Transcript content is attacker-influenceable (tool results, fetched web content, prompt injection all land in the JSONL), so ingestion is hardened at the `locate.rs`/`ingest.rs` boundary before any `open`: (1) `session_id` must match `^[0-9a-f-]{36}$`; `path`/`project` params are canonicalized and must resolve under `~/.claude/projects/` (reject `../` traversal and escaping symlinks — resolve *then* prefix-check). (2) External tool-output file references found inside transcript lines are followed **only** if they canonicalize under the analyzed session's project tree; anything else increments an unknown-reference counter, never a read (prevents `~/.ssh/id_rsa` disclosure via `evidence()`). (3) Resource caps: skip+count lines over 16 MB, bounded JSON recursion depth, a total-file ceiling. (4) `evidence()`/`report --html` run excerpts through a secret-redaction pass (common key/token/PEM patterns) — redacted by default in the shareable HTML. Each has a rejection fixture. |

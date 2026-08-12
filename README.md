@@ -25,8 +25,11 @@
 > trusting any claim on this page.
 >
 > **Renamed.** This project was published as **suMCP** through v0.2.0; old
-> links redirect. The binaries, the MCP server registration, and the release
-> archives keep the name `sumcp`.
+> links redirect. In the v0.3 line everything follows the new name: the
+> binaries are `backstory` and `backstory-mcp`, and the MCP server registers
+> as `backstory`. Only the v0.2.0 release archives keep the old `sumcp`
+> names, because they were published before the rename. If you installed as
+> suMCP, run `backstory install --apply` to re-register under the new name.
 
 ---
 
@@ -111,8 +114,8 @@ Two things differ on Windows, both stated rather than discovered:
 Running inside WSL is also fine, and is the better option if you want the hook:
 WSL is Linux, so use the Linux archive there.
 
-Every archive contains **both** binaries, `sumcp` and `sumcp-mcp`. `install`
-registers the MCP server by looking for `sumcp-mcp` as a sibling of `sumcp`, so
+Every archive contains **both** binaries, `backstory` and `backstory-mcp`. `install`
+registers the MCP server by looking for `backstory-mcp` as a sibling of `backstory`, so
 keep the two together. Installing one without the other leaves a broken
 registration.
 
@@ -120,6 +123,9 @@ registration.
 
 Download for your platform from the
 [latest release](https://github.com/rbh227/backstory-mcp/releases/latest):
+
+The v0.2.0 archives predate the rename, so their file names and binaries
+still say `sumcp`. Archives from v0.3.0 on use the `backstory` names.
 
 ```bash
 # macOS, Apple Silicon. Swap the target for x86_64-apple-darwin (Intel Mac),
@@ -146,16 +152,16 @@ download is not quarantined and will just work. A browser download is
 quarantined, and Gatekeeper will refuse it until you clear the attribute:
 
 ```bash
-xattr -dr com.apple.quarantine sumcp sumcp-mcp
+xattr -dr com.apple.quarantine backstory backstory-mcp
 ```
 
 Verify what you got, rather than taking the above on trust:
 
 ```bash
-codesign -dvv ./sumcp   # expect "Signature=adhoc" until a Developer ID is set up
+codesign -dvv ./backstory   # expect "Signature=adhoc" until a Developer ID is set up
 ```
 
-**Both platforms are exercised before publishing.** Every archive's `sumcp` is
+**Both platforms are exercised before publishing.** Every archive's `backstory` is
 executed in CI and made to analyze a real fixture, including the Intel macOS
 build, which is cross-compiled on an arm64 runner and run through Rosetta 2. A
 binary that links but cannot start, or starts but cannot parse a transcript,
@@ -177,15 +183,15 @@ no published archive.
 ```bash
 git clone https://github.com/rbh227/backstory-mcp && cd backstory-mcp
 cargo build --release
-./target/release/sumcp install          # dry-run: prints exactly what it will write
-./target/release/sumcp install --apply  # register the MCP server, debrief skill, and Stop hook (Unix)
+./target/release/backstory install          # dry-run: prints exactly what it will write
+./target/release/backstory install --apply  # register the MCP server, debrief skill, and Stop hook (Unix)
 ```
 
 `install` writes only under `$HOME` (everything self-contained in
-`~/.claude/sumcp/`), backs up any file it touches, and is fully reversible:
+`~/.claude/backstory/`), backs up any file it touches, and is fully reversible:
 
 ```bash
-sumcp uninstall --apply   # removes exactly what install added; restores backups
+backstory uninstall --apply   # removes exactly what install added; restores backups
 ```
 
 Restart Claude Code so it picks up the new user-scope server. See
@@ -197,16 +203,16 @@ Any MCP-capable reviewer can call the tools. For Codex, register the server in
 `~/.codex/config.toml` (or a project's `.codex/config.toml`):
 
 ```toml
-[mcp_servers.sumcp]
-command = "/path/to/sumcp-mcp"
+[mcp_servers.backstory]
+command = "/path/to/backstory-mcp"
 ```
 
 A reviewer with no MCP wiring at all uses the CLI instead and reads JSON:
 
 ```bash
-sumcp context                       # review context for the current session
-sumcp context --intent              # the full verbatim requests (large, on purpose)
-sumcp context --range HEAD~3..HEAD  # assert the session overlaps those commits
+backstory context                       # review context for the current session
+backstory context --intent              # the full verbatim requests (large, on purpose)
+backstory context --range HEAD~3..HEAD  # assert the session overlaps those commits
 ```
 
 `--range` is a scope guard, not a filter: if the analyzed session does not
@@ -227,7 +233,7 @@ payload discloses the grouping in a `work_unit` block so you can verify it.
 
 ```bash
 cd ~/code/your-project
-sumcp
+backstory
 ```
 
 It prints which session it picked to stderr, so `--json` and `--html` stay
@@ -235,11 +241,11 @@ pipeable. Add a flag to change the format, `--work-unit` to name the stretch
 by one of its transcripts, or `--file` to analyze exactly one transcript:
 
 ```bash
-sumcp --json                                  # the session_overview payload
-sumcp --html > report.html                    # a self-contained HTML report
+backstory --json                                  # the session_overview payload
+backstory --html > report.html                    # a self-contained HTML report
 
-sumcp --work-unit <path/to/session.jsonl>     # the whole stretch containing that transcript
-sumcp --file <path/to/session.jsonl>          # that single transcript only
+backstory --work-unit <path/to/session.jsonl>     # the whole stretch containing that transcript
+backstory --file <path/to/session.jsonl>          # that single transcript only
 ```
 
 `--file` stays single-transcript on purpose (an explicit path is an explicit
@@ -316,7 +322,7 @@ harness-notice markers, the validation-command needles, the origin mapping)
 are shared constants, re-typed rather than re-derived; agreement there checks
 only that both sides apply the same definition consistently, not that the
 definition itself is right. See the header of
-`crates/sumcp-core/tests/context_recount.rs` for the full breakdown.
+`crates/backstory-core/tests/context_recount.rs` for the full breakdown.
 
 ---
 

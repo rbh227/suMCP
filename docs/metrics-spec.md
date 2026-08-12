@@ -98,7 +98,7 @@ True git reverts/commits/PRs (need git); tests passing in CI; whether the human 
 **Superseded (2026-07-26).** The weighted score this section explains was
 removed. Ranking is now a fixed four-key rule (edited files first, then
 file-class tier, then edit count descending, then path; see
-`crates/sumcp-core/src/score.rs`), and payloads echo `ranking_rule` instead of
+`crates/backstory-core/src/score.rs`), and payloads echo `ranking_rule` instead of
 weights. The reasoning below is kept as a dated record of why the weights
 were ordered the way they were, not as a description of the current
 mechanism.

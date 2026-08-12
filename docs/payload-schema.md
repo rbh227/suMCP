@@ -337,7 +337,7 @@ this file".
 For a session with zero or one transcript, `work_unit` is never emitted and
 no finding ever gains a `session` key. The **only** difference from a v1
 payload is the `v` field itself, every other byte is identical. This is
-checked directly: `crates/sumcp-core/src/payloads.rs`'s
+checked directly: `crates/backstory-core/src/payloads.rs`'s
 `session_overview_omits_the_work_unit_block_for_one_transcript` and
 `struggle_areas_echoes_the_ranking_rule_and_breakdown` tests assert the
 absence of `work_unit` and `session` respectively on a single-transcript
@@ -347,7 +347,7 @@ session.
 
 Two new tools, `review_context(commit_range)` and
 `session_intent(commit_range, [max_tokens])`, plus the equivalent bare CLI
-paths (`sumcp context --file`/`--work-unit`). Both are `v: 3`. The six v2
+paths (`backstory context --file`/`--work-unit`). Both are `v: 3`. The six v2
 tools documented above are unchanged and stay at `v: 2`; `v` is per-payload,
 not a single crate-wide number, and only these two new payloads carry `v: 3`.
 
@@ -553,7 +553,7 @@ Every `line` in every payload, v0.1 through v3, is 0-based
 cross-checking `"line": 7` against an editor's line numbers is off by one. Not
 a bug: it is a deliberate, consistent convention applied identically by
 production extraction and by the independent recount gate
-(`crates/sumcp-core/tests/context_recount.rs`), so the two can never disagree
+(`crates/backstory-core/tests/context_recount.rs`), so the two can never disagree
 about it. Documented here rather than changed because changing it now would
 be a breaking shape change to every payload that carries a line number, for a
 cosmetic off-by-one a machine consumer never notices.

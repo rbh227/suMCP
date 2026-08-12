@@ -9,12 +9,12 @@
 # Requires: cargo, Google Chrome. Usage: scripts/render_demo_report.sh
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-HTML="$(mktemp -t sumcp-demo-XXXX).html"
+HTML="$(mktemp -t backstory-demo-XXXX).html"
 PNG="$ROOT/docs/assets/report-hero.png"
 CHROME="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 
 cargo build --release --manifest-path "$ROOT/Cargo.toml"
-"$ROOT/target/release/sumcp" --file "$ROOT/fixtures/demo/demo-session.jsonl" --html > "$HTML"
+"$ROOT/target/release/backstory" --file "$ROOT/fixtures/demo/demo-session.jsonl" --html > "$HTML"
 "$CHROME" --headless --disable-gpu --hide-scrollbars \
   --window-size=960,820 --screenshot="$PNG" "file://$HTML"
 echo "wrote $PNG"

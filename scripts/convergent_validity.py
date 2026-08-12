@@ -73,7 +73,7 @@ def main() -> int:
         multi = sum(v for k, v in counter.items() if k >= 2)
         return multi, total, (100 * multi / total if total else 0.0)
 
-    print("suMCP convergent-validity — distinct signal categories per struggle finding\n")
+    print("backstory-mcp convergent-validity — distinct signal categories per struggle finding\n")
 
     m, t, pct = share_multi(top1_sizes)
     print(f"Rank-1 files (one per session): {t} findings")

@@ -1,8 +1,8 @@
-# suMCP v0.1 — Build Plan
+# backstory-mcp v0.1 — Build Plan
 
 ## Context
 
-suMCP is a deterministic (no-LLM) Rust MCP server that parses Claude Code
+backstory-mcp is a deterministic (no-LLM) Rust MCP server that parses Claude Code
 session transcripts (`~/.claude/projects/**/*.jsonl`) into struggle,
 comprehension, and efficiency signals, so a connected agent can answer "what
 did you actually do?" from evidence instead of self-report. The full contract
@@ -11,10 +11,10 @@ was specced and grilled over the last two sessions:
 - `SPEC.md` — engineering contract: workspace layout, six read-only MCP tools,
   L1+L2 metrics + approval latency, ADRs A1–A8 (Rust; rmcp pinned; memoized
   re-parse; session self-identification; compact JSON; TOML-optional weights;
-  sanitized fixtures; `sumcp install`).
+  sanitized fixtures; `backstory install`).
 - `docs/metrics-spec.md` — authoritative metric catalog (with three empirical
   amendments recorded in SPEC §1).
-- `docs/ideas/sumcp.md` — product one-pager: success = strangers install it;
+- `docs/ideas/backstory.md` — product one-pager: success = strangers install it;
   v0.1 adds bare-CLI instant debrief + static HTML report; no live dashboard.
 
 The repo has no code yet, and **no Rust toolchain is installed**. This plan
@@ -40,7 +40,7 @@ rustup + workspace scaffold
         │
 sanitizer script ──► fixture corpus (3+ versions, subagents, streaming dups)
         │                    │
-        └──► locate + ingest + model  ──► session_overview ──► bare `sumcp` CLI
+        └──► locate + ingest + model  ──► session_overview ──► bare `backstory` CLI
                                 │
                      signal modules (churn/rework/thrash → failures → 
                      reverts/flips/opening-move → approval-latency)
@@ -49,7 +49,7 @@ sanitizer script ──► fixture corpus (3+ versions, subagents, streaming dup
                         │              │
                  MCP server (rmcp)   HTML report
                         │
-        debrief skill (real) + Stop hook + `sumcp install`
+        debrief skill (real) + Stop hook + `backstory install`
                         │
         external validation (other people's transcripts) + token-ratio → README
 ```
@@ -79,12 +79,12 @@ Do not start Rust until this passes.
 ## Phase 1 — Foundation (~1 day)
 
 **T1.1 Toolchain + workspace scaffold.**
-Install rustup (stable). Create the workspace per SPEC §4: `crates/sumcp-core`
-(deps: serde, serde_json only), `crates/sumcp-cli` (clap), `crates/sumcp-mcp`
+Install rustup (stable). Create the workspace per SPEC §4: `crates/backstory-core`
+(deps: serde, serde_json only), `crates/backstory-cli` (clap), `crates/backstory-mcp`
 (rmcp pinned, `features=["server"]`). Empty lib/bins that compile; `cargo fmt`,
 `clippy -D warnings`, `cargo test` all green. Commit hygiene starts here
 (git repo already initialized; first commit includes existing docs).
-- Accept: `cargo test --workspace` passes; `sumcp-core` has no async deps.
+- Accept: `cargo test --workspace` passes; `backstory-core` has no async deps.
 
 **T1.2 Sanitizer + fixture corpus.**
 Write `scripts/sanitize.py` (structure-preserving: keep ids, ordering, usage,
@@ -108,7 +108,7 @@ external tool-output file references followed), `model.rs` (`Session`, ordered
 ordering contract: sort key `(timestamp, agent lane [main first], line
 number)`, equal-timestamp cross-agent pairs marked order-uncertain and
 excluded from strict before/after findings), minimal `report.rs` for overview
-counts, and `sumcp` bare printing the overview table.
+counts, and `backstory` bare printing the overview table.
 - Accept (gate from metrics-spec staging): token totals match `ccusage` within
   a few % on a real local session; all three dedup layers unit-tested incl. a
   resumed-replay fixture (token totals AND action counts snapshotted); an
@@ -137,7 +137,7 @@ suppressed entirely when `permissionMode` grants auto-accept or no permission
 event can exist; never labeled exact. Large-write-then-instant-accept built on
 the same suppression rules; manual validation fixtures.
 **T3.5 Score + full Report:** `Weights` struct (compiled defaults + optional
-`~/.config/sumcp/config.toml`), transparent weighted ranking with per-category
+`~/.config/backstory/config.toml`), transparent weighted ranking with per-category
 breakdown, low-confidence ×0.5, all six tool payload builders with caps +
 `truncated:true` markers.
 - Accept per task: unit tests on hand-built minimal Sessions; zero-fire tests
@@ -149,7 +149,7 @@ echoed in payloads.
 
 ## Phase 4 — MCP server (~2 days)
 
-**T4.1 rmcp stdio server.** Six tools wired to `sumcp-core`, `readOnlyHint`
+**T4.1 rmcp stdio server.** Six tools wired to `backstory-core`, `readOnlyHint`
 annotations, memoized re-parse on (mtime,size), session self-identification
 FAIL-CLOSED per ADR A4: verified own-tool_use-id match (bounded retry for
 flush delay) or explicit `session_id`, else an `ambiguous_session` error
@@ -174,13 +174,13 @@ findings, two-layout discovery (2.1.x namespaced dir + legacy sibling), bounded
 0 on the synthetic fixture). Proven end-to-end through the stdio binary. Unblocks
 T5.3 (removes the Checkpoint D subagent blind spot volunteers would have hit).
 
-**T5.1 Static HTML report.** `sumcp report --html`: one self-contained file
+**T5.1 Static HTML report.** `backstory report --html`: one self-contained file
 (inline CSS/JS, no framework) rendering the same Report — struggle table,
 churn timeline, evidence appendix.
 - Accept: opens from `file://`, screenshot-worthy, zero network requests.
 
 **T5.2 Install story (the sole write path, ADR A8 contract).**
-`sumcp install`/`uninstall`: dry-run by default, `--apply` to execute; atomic
+`backstory install`/`uninstall`: dry-run by default, `--apply` to execute; atomic
 temp+rename writes with timestamped backups of pre-existing files; rollback of
 completed steps on partial failure; idempotent reinstall; manifest-tracked
 uninstall that restores backups and removes only what install created. Stop
@@ -191,13 +191,13 @@ hook nudges only when session had ≥N edits.
 
 **T5.3 Internal multi-project validation + README skeleton (v0.1 gate).**
 REFRAMED 2026-07-21: no external volunteers for v0.1. Validate by running
-suMCP across several of the author's OWN projects of different types (e.g.
-CSE262, CSE216, suMCP, …) — a real generalization + robustness check on
+backstory-mcp across several of the author's OWN projects of different types (e.g.
+CSE262, CSE216, backstory-mcp, …) — a real generalization + robustness check on
 transcripts the signals were not built on. Honesty is preserved by discipline,
 not by outside eyes:
   1. **Freeze weights** before starting the run.
   2. **Predict-then-check** — for each sampled session, write one line of what
-     you remember struggling with BEFORE running suMCP, then compare. This is
+     you remember struggling with BEFORE running backstory-mcp, then compare. This is
      the guardrail against confirmation bias and is non-negotiable.
   3. **Log true / partly / false AND misses** per top-3 finding, verbatim.
   4. **Robustness sweep** across projects: crashes, nonsense findings, zero-fire
@@ -207,7 +207,7 @@ on these real sessions. README leads with the measured number + HTML-report
 screenshot, labels validation HONESTLY as single-user / multi-project (never
 "external"), and lists external validation as the #1 post-v0.1 item. Metrics
 carry tier/heuristic labels.
-- Accept (v0.1 gate): suMCP runs clean (no crash/nonsense) across ≥3 distinct
+- Accept (v0.1 gate): backstory-mcp runs clean (no crash/nonsense) across ≥3 distinct
   project types; top-3 struggles match the predict-then-check ground truth on a
   majority of sampled sessions, with misses/false-positives documented; token
   ratio measured and in the README; weights frozen (or, if tuned after seeing
@@ -223,7 +223,7 @@ HTML-report screenshot, quickstart, tool reference table), `CONTRIBUTING.md`
 (dev setup, fixture-donation flow via sanitizer, how to add a signal),
 `CHANGELOG.md`, `docs/metrics.md` (every shipped metric: definition, tier,
 exact-vs-heuristic, known limits — distilled from metrics-spec), rustdoc on
-all public items (`#![warn(missing_docs)]` on sumcp-core), GitHub issue
+all public items (`#![warn(missing_docs)]` on backstory-core), GitHub issue
 templates incl. a "signal felt wrong" template that asks for a sanitized
 fixture, `cargo doc` builds clean.
 - Accept: a stranger can go from README to a working debrief without reading

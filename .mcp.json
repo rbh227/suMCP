@@ -1,8 +1,8 @@
 {
   "mcpServers": {
-    "sumcp": {
+    "backstory": {
       "command": "cargo",
-      "args": ["run", "--quiet", "-p", "sumcp-mcp"]
+      "args": ["run", "--quiet", "-p", "backstory-mcp"]
     }
   }
 }

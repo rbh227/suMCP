@@ -1,0 +1,27 @@
+[package]
+name = "backstory-core"
+description = "Deterministic session-forensics core: parse Claude Code transcripts into evidence-backed findings"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# ADR A2: backstory-core stays synchronous and pure — serde only, no async deps.
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+# Test-only: real on-disk temp dirs for discovery tests (already in the lockfile
+# via the mcp crate).
+tempfile = "3"
+
+# `validity_dump` carries the predictive-validity study's `last_edit_verified`
+# heuristic, whose contingency cells are small enough that a misclassified
+# action can move a reported conclusion. Cargo only *builds* examples by
+# default; `test = true` makes its `#[cfg(test)]` module run under
+# `cargo test` like any other target.
+[[example]]
+name = "validity_dump"
+test = true

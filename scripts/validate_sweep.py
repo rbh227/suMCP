@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """T5.3 internal validation sweep (read-only).
 
-Runs the release `sumcp` binary over a diverse sample of the author's OWN real
+Runs the release `backstory` binary over a diverse sample of the author's OWN real
 Claude Code transcripts (~/.claude/projects/**), one top-level session per row,
 and reports:
 
@@ -13,9 +13,9 @@ Token approximation matches scripts/check_payloads.py: chars / 3.5. The debrief
 numerator uses the COMPACT session_overview payload (what an agent actually
 consumes); the transcript denominator uses the main transcript file's bytes only
 (excludes merged subagent files) — a conservative choice that UNDERstates
-suMCP's advantage rather than inflating it.
+backstory-mcp's advantage rather than inflating it.
 
-Nothing is written. Subagent transcripts are discovered/merged by sumcp itself.
+Nothing is written. Subagent transcripts are discovered/merged by backstory itself.
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ from pathlib import Path
 
 CHARS_PER_TOKEN = 3.5  # keep in lockstep with check_payloads.py
 PROJECTS = Path.home() / ".claude" / "projects"
-SUMCP = Path(__file__).resolve().parent.parent / "target" / "release" / "sumcp"
+BACKSTORY = Path(__file__).resolve().parent.parent / "target" / "release" / "backstory"
 PER_PROJECT = 3   # newest N top-level sessions per project
 TOTAL_CAP = 15    # overall sample ceiling
 EDIT_HEAVY = 3    # a session with >= this many edits should usually fire a signal
@@ -64,12 +64,12 @@ def discover() -> list[tuple[str, Path]]:
 
 
 def analyze(path: Path) -> dict:
-    """Run sumcp --json on one session; return a compact result dict."""
+    """Run backstory --json on one session; return a compact result dict."""
     raw_bytes = path.stat().st_size
     transcript_tokens = raw_bytes / CHARS_PER_TOKEN
     try:
         proc = subprocess.run(
-            [str(SUMCP), "--file", str(path), "--json"],
+            [str(BACKSTORY), "--file", str(path), "--json"],
             capture_output=True,
             timeout=60,
         )
@@ -106,15 +106,15 @@ def analyze(path: Path) -> dict:
 
 
 def main() -> int:
-    if not SUMCP.exists():
-        print(f"release binary missing: {SUMCP}\nrun: cargo build --release", file=sys.stderr)
+    if not BACKSTORY.exists():
+        print(f"release binary missing: {BACKSTORY}\nrun: cargo build --release", file=sys.stderr)
         return 1
     sample = discover()
     if not sample:
         print("no transcripts found under ~/.claude/projects", file=sys.stderr)
         return 1
 
-    print(f"suMCP internal validation sweep — {len(sample)} sessions "
+    print(f"backstory-mcp internal validation sweep — {len(sample)} sessions "
           f"(chars/{CHARS_PER_TOKEN} tokens)\n")
     header = f"{'project':<14} {'session':<10} {'acts':>4} {'edits':>5} " \
              f"{'transcript':>11} {'debrief':>8} {'ratio':>7}  top-3 struggle files / error"

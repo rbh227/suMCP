@@ -5,7 +5,7 @@ backstory-mcp is read-only and offline by design:
 - It never makes network calls.
 - It never executes code from a transcript; it parses text.
 - The only files it writes are under `$HOME` (everything self-contained in
-  `~/.claude/sumcp/`), and `install` backs up anything it touches and is fully
+  `~/.claude/backstory/`), and `install` backs up anything it touches and is fully
   reversible with `uninstall`.
 
 ## Reporting

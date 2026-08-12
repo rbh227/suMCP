@@ -3,11 +3,11 @@
 
 NOTE (2026-07-26): the weighted score this script measures was removed the
 same day, in favour of the four-key ordering rule in
-`crates/sumcp-core/src/score.rs`. Everything below, and the report this
+`crates/backstory-core/src/score.rs`. Everything below, and the report this
 script generates, describes the product AS IT EXISTED on 2026-07-22; see
 `docs/validation/2026-07-22-predictive-validity.md` for the dated record.
 
-Question: did files suMCP flagged in session N predict rework in later
+Question: did files backstory-mcp flagged in session N predict rework in later
 sessions of the SAME project, on this machine's own corpus? Weights were
 frozen at `Weights::default()` everywhere; this was a no-tuning pass by
 design (any future tuning must predict-then-check on held-out projects,
@@ -15,7 +15,7 @@ never on the corpus that produced the tuning).
 
 Pipeline:
   1. Discover main transcripts under ~/.claude/projects/*/*.jsonl.
-  2. Dump each one via the Rust example (crates/sumcp-core/examples/
+  2. Dump each one via the Rust example (crates/backstory-core/examples/
      validity_dump.rs), which mirrors the CLI's real --file pipeline
      (assemble -> rank -> needs_review), caching results so re-runs are
      cheap.
@@ -1111,7 +1111,7 @@ def render_draft(
     lines.append("This report is a dated record of the product AS IT EXISTED on")
     lines.append("2026-07-22. The weighted score it measures was removed on 2026-07-26")
     lines.append("in favour of a stated four-key ordering rule (see")
-    lines.append("`crates/sumcp-core/src/score.rs`); read every present-tense claim")
+    lines.append("`crates/backstory-core/src/score.rs`); read every present-tense claim")
     lines.append("below as describing that snapshot, not the current product.")
     lines.append("")
     lines.append("Scope: every number in this report is computed on the TUNE SPLIT only.")
@@ -1240,7 +1240,7 @@ def main() -> int:
     if not DUMP_BIN.exists():
         print(
             f"missing {DUMP_BIN}\n"
-            "run: cargo build --release --example validity_dump -p sumcp-core",
+            "run: cargo build --release --example validity_dump -p backstory-core",
             file=sys.stderr,
         )
         return 1

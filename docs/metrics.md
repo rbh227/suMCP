@@ -9,7 +9,7 @@ Each finding carries a **tier**, an **exact-vs-heuristic** flag, a
 reliability label, not an importance ranking: T1 fields are stable across
 Claude Code versions, T2 need edge-case handling, T3 would be unstable
 (nothing shipped rests on T3 today). This table has one row per `FindingKind`
-that ships in `crates/sumcp-core/src/model.rs` today; nothing here is aspirational.
+that ships in `crates/backstory-core/src/model.rs` today; nothing here is aspirational.
 
 | Metric | Tier | Exact or heuristic | What it detects | Known limits |
 |--------|------|--------------------|-----------------|--------------|
@@ -17,7 +17,7 @@ that ships in `crates/sumcp-core/src/model.rs` today; nothing here is aspiration
 | Rework | T2 | Exact | A later edit whose patch hunk (from `toolUseResult.structuredPatch`) overlaps an earlier edit's hunk on the same file | Overlapping hunks can be a deliberate refinement of the same region, not confusion. Depends on the harness populating `structuredPatch`; an edit without hunk data can't be compared. |
 | Re-read thrash | T1 | Exact | A file `Read` 3+ times in the session | Fires on read count alone. It does **not** require an edit to be interleaved between the reads, so a file legitimately re-read many times (e.g. cross-referenced while writing elsewhere) still counts as thrash. |
 | Failure loops | T2 | Heuristic | 2+ failing Bash commands attributed to the same file via a four-step chain: file path in the command/error text, else the most recently edited file in the same lane within the last 5 actions, else unattributed (dropped) | Attribution confidence varies: a direct path match is High confidence, a proximity guess is Low (and counts at half weight in ranking). Only ever attributes to a file the session actually touched; never touches the real filesystem. |
-| Blind-write attempts | T1 | Exact | An Edit/Write whose tool result errored with "File has not been read yet" | Reframed from the original spec's "blind write" metric: the harness blocks true blind writes before they land, so this counts the *attempt*, not a write that actually happened blind. This is also the only detector behind the ranking category named `fumbles` (see `crates/sumcp-core/src/score.rs`); there is no separate, broader "tool fumble" detector for generic bad-argument or malformed-call errors. |
+| Blind-write attempts | T1 | Exact | An Edit/Write whose tool result errored with "File has not been read yet" | Reframed from the original spec's "blind write" metric: the harness blocks true blind writes before they land, so this counts the *attempt*, not a write that actually happened blind. This is also the only detector behind the ranking category named `fumbles` (see `crates/backstory-core/src/score.rs`); there is no separate, broader "tool fumble" detector for generic bad-argument or malformed-call errors. |
 | True revert | T2 | Exact | A later edit whose `new_string` exactly restores an earlier edit's `old_string`, same file, same lane | Rare in practice; high-signal when it fires. Computed by the detector but **not currently returned by any of the six MCP payloads** in v0 (`session_overview`, `struggle_areas`, `blind_spots`, `file_story`, `context_health`, `evidence`): it doesn't carry a ranking category, so `struggle_areas`/`rank()` drops it, and `blind_spots` only forwards blind-write, review-burden, and large-write-instant-accept findings. |
 | Flip | T2 | Exact | A true revert where the user pushed back (matched against 8 hardcoded phrases like "no", "wrong", "revert") between the two edits **and** the agent gathered no new evidence (no Read or Bash) in between | Rare in practice; high-signal when it fires. The revert equality check is exact, but the flip-vs-plain-revert classification rests on a short, hand-picked pushback-word list, so it can miss unworded pushback or misread borderline phrasing. Reversing after a failing test or a fresh read is treated as healthy revision, not sycophancy, and correctly stays a True revert. Same exposure gap as True revert: not surfaced by any of the six MCP payloads today. |
 | User corrected | T2 | Exact | An edit the harness marked `userModified: true` | Rare. Same exposure gap: computed, but not returned by any of the six MCP payloads today. |
@@ -42,7 +42,7 @@ be almost insensitive to the threshold across a 5-to-120-minute range). The
 a consumer can verify it by hand; the other payloads deliberately do not
 repeat the block (they are token-budgeted; see docs/payload-schema.md), and
 findings there carry a short `session` id resolving them to their
-originating transcript instead. Bare `sumcp` and `--work-unit` report the
+originating transcript instead. Bare `backstory` and `--work-unit` report the
 whole unit; `--file` stays single-transcript and prints a stderr note when
 the named transcript is part of a larger unit.
 
@@ -116,7 +116,7 @@ Three things follow, and no more than these:
 
 ## File class
 
-`class` is a pure function of the path (`sumcp_core::file_class`): `code`,
+`class` is a pure function of the path (`backstory_core::file_class`): `code`,
 `web`, `notes`, `docs`, `config`, or `other`, from a fixed table of extensions
 and path patterns, with no filesystem access.
 

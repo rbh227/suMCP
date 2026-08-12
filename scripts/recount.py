@@ -35,7 +35,7 @@ import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-SUMCP = REPO / "target" / "release" / "sumcp"
+BACKSTORY = REPO / "target" / "release" / "backstory"
 
 # Tool names that modify a file, and the totals key each contributes to.
 EDIT_TOOLS = {"Edit"}
@@ -145,12 +145,12 @@ def members_of(main: Path) -> list[Path]:
     return out
 
 
-def sumcp_payload(main: Path, work_unit: bool) -> dict | None:
-    """The full JSON payload suMCP reports for the given scope."""
+def backstory_payload(main: Path, work_unit: bool) -> dict | None:
+    """The full JSON payload backstory-mcp reports for the given scope."""
     flag = "--work-unit" if work_unit else "--file"
     try:
         r = subprocess.run(
-            [str(SUMCP), flag, str(main), "--json"],
+            [str(BACKSTORY), flag, str(main), "--json"],
             capture_output=True, text=True, timeout=120,
         )
     except (OSError, subprocess.SubprocessError) as e:
@@ -234,8 +234,8 @@ def main() -> int:
                     help="check only the committed fixtures (what CI runs)")
     args = ap.parse_args()
 
-    if not SUMCP.is_file():
-        sys.exit(f"build first: cargo build --release ({SUMCP} missing)")
+    if not BACKSTORY.is_file():
+        sys.exit(f"build first: cargo build --release ({BACKSTORY} missing)")
 
     if args.fixtures:
         mains = sorted((REPO / "fixtures" / "work-unit").glob("*.jsonl"))
@@ -254,7 +254,7 @@ def main() -> int:
 
     # Scope 1: each transcript alone, against `--file`.
     for m in mains:
-        payload = sumcp_payload(m, work_unit=False)
+        payload = backstory_payload(m, work_unit=False)
         if payload is None:
             failures.append(f"{m.name}: could not run")
             continue
@@ -268,7 +268,7 @@ def main() -> int:
     units_checked = 0
     seen_units: set[frozenset] = set()
     for m in mains:
-        payload = sumcp_payload(m, work_unit=True)
+        payload = backstory_payload(m, work_unit=True)
         if payload is None:
             failures.append(f"unit({m.name}): could not run")
             continue

@@ -33,13 +33,13 @@ jobs:
         run: cargo test --workspace
       - name: Payload contract checker
         run: python3 scripts/check_payloads.py
-      # --no-verify: sumcp-cli embeds the debrief skill from the repo-level
+      # --no-verify: backstory-cli embeds the debrief skill from the repo-level
       # skills/ dir via include_str!, which a from-package verify build can't
       # see. v0.1 distributes prebuilt archives, not crates.io publishes
       # (codex review P0); this gate only proves the manifests stay packageable.
       - name: Package (manifest sanity)
         if: matrix.os == 'ubuntu-latest'
-        run: cargo package -p sumcp-core -p sumcp-cli -p sumcp-mcp --no-verify --allow-dirty
+        run: cargo package -p backstory-core -p backstory-cli -p backstory-mcp --no-verify --allow-dirty
 
   # The differential recount gate: a second, deliberately naive count of every
   # countable quantity that must agree with the analyzer exactly. CI runs it
@@ -52,7 +52,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build release binary
-        run: cargo build --release -p sumcp-cli
+        run: cargo build --release -p backstory-cli
       - name: Differential recount against fixtures
         run: python3 scripts/recount.py --fixtures
 
@@ -78,8 +78,8 @@ jobs:
       - name: The CLI runs and analyzes a fixture
         run: |
           set -euo pipefail
-          cargo build --release -p sumcp-cli
-          bin="./target/release/sumcp.exe"
+          cargo build --release -p backstory-cli
+          bin="./target/release/backstory.exe"
           "$bin" --version
           "$bin" --file fixtures/demo/demo-session.jsonl --json > out.json
           python3 -c 'import json; d=json.load(open("out.json")); assert d["v"]==2, d["v"]; assert d["top_struggles"], "no ranked files"; print("Windows binary analyzed the fixture:", d["top_struggles"][0]["file"])'
@@ -90,15 +90,15 @@ jobs:
           # so the runner's real profile is untouched. This is the part most
           # likely to be wrong: it resolves the home directory, copies a sibling
           # .exe, and edits Claude Code's JSON config.
-          cargo build --release -p sumcp-cli -p sumcp-mcp
+          cargo build --release -p backstory-cli -p backstory-mcp
           export HOME="$(pwd)/fake-home"
           mkdir -p "$HOME"
-          ./target/release/sumcp.exe install --apply
-          test -f "$HOME/.claude/sumcp/bin/sumcp.exe"
-          test -f "$HOME/.claude/sumcp/bin/sumcp-mcp.exe"
-          grep -q '"sumcp"' "$HOME/.claude.json"
-          ./target/release/sumcp.exe uninstall --apply
-          test ! -f "$HOME/.claude/sumcp/bin/sumcp.exe"
+          ./target/release/backstory.exe install --apply
+          test -f "$HOME/.claude/backstory/bin/backstory.exe"
+          test -f "$HOME/.claude/backstory/bin/backstory-mcp.exe"
+          grep -q '"backstory"' "$HOME/.claude.json"
+          ./target/release/backstory.exe uninstall --apply
+          test ! -f "$HOME/.claude/backstory/bin/backstory.exe"
           echo "install and uninstall round trip clean on Windows"
 
   # The Intel macOS archive is cross-compiled from an arm64 runner, so nothing
@@ -133,11 +133,11 @@ jobs:
             echo "Rosetta 2 is available"
           fi
       - name: Build both binaries for x86_64-apple-darwin
-        run: cargo build --locked --release --target x86_64-apple-darwin -p sumcp-cli -p sumcp-mcp
+        run: cargo build --locked --release --target x86_64-apple-darwin -p backstory-cli -p backstory-mcp
       - name: Execute the Intel binary
         run: |
           set -euo pipefail
-          bin="./target/x86_64-apple-darwin/release/sumcp"
+          bin="./target/x86_64-apple-darwin/release/backstory"
           file "$bin"
           # Prove the artifact really is x86-64 rather than a silently native build.
           file "$bin" | grep -q "x86_64" || {
@@ -154,7 +154,7 @@ jobs:
           run_bin() { if [ "$(uname -m)" = "arm64" ]; then arch -x86_64 "$@"; else "$@"; fi; }
           run_bin "$bin" --file fixtures/demo/demo-session.jsonl --json > out.json
           python3 -c 'import json; d=json.load(open("out.json")); assert d["v"]==2, d["v"]; assert d["top_struggles"], "no ranked files"; print("Intel binary analyzed the fixture:", d["top_struggles"][0]["file"])'
-          test -x "./target/x86_64-apple-darwin/release/sumcp-mcp"
+          test -x "./target/x86_64-apple-darwin/release/backstory-mcp"
 
   # The release workflow's `publish` job depends on ALL build targets, so a
   # musl build that only breaks at tag time would block the whole release
@@ -175,11 +175,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y musl-tools
       - name: Build both binaries for musl
-        run: cargo build --locked --release --target x86_64-unknown-linux-musl -p sumcp-cli -p sumcp-mcp
+        run: cargo build --locked --release --target x86_64-unknown-linux-musl -p backstory-cli -p backstory-mcp
       - name: Assert the binaries are statically linked
         run: |
           set -euo pipefail
-          for b in sumcp sumcp-mcp; do
+          for b in backstory backstory-mcp; do
             path="./target/x86_64-unknown-linux-musl/release/${b}"
             file "$path"
             # Rust's musl target emits a static-pie (static position

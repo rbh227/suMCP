@@ -1,9 +1,9 @@
 # Release: build prebuilt archives for a pushed `v*` tag and attach them to a
 # GitHub Release.
 #
-# Why archives and not crates.io: `sumcp install` copies a SIBLING `sumcp-mcp`
-# binary from the directory of the running `sumcp` executable. A crates.io
-# install of `sumcp-cli` alone would leave that sibling missing and the install
+# Why archives and not crates.io: `backstory install` copies a SIBLING `backstory-mcp`
+# binary from the directory of the running `backstory` executable. A crates.io
+# install of `backstory-cli` alone would leave that sibling missing and the install
 # broken, so the unit of distribution is an archive that carries BOTH binaries
 # next to each other.
 #
@@ -32,7 +32,7 @@ concurrency:
 
 jobs:
   # Cheap gate: a tag that disagrees with the workspace version would ship
-  # binaries whose `sumcp --version` contradicts the release name. Fail before
+  # binaries whose `backstory --version` contradicts the release name. Fail before
   # spending three build jobs on it.
   verify-version:
     runs-on: ubuntu-latest
@@ -135,7 +135,7 @@ jobs:
       # --locked honours the committed Cargo.lock, so the published binaries
       # are built from exactly the dependency versions CI tested.
       - name: Build both binaries
-        run: cargo build --locked --release --target "${{ matrix.target }}" -p sumcp-cli -p sumcp-mcp
+        run: cargo build --locked --release --target "${{ matrix.target }}" -p backstory-cli -p backstory-mcp
 
       - name: Smoke test the CLI
         if: matrix.native
@@ -143,7 +143,7 @@ jobs:
           set -euo pipefail
           exe=""
           case "${{ matrix.target }}" in *windows*) exe=".exe";; esac
-          bin="./target/${{ matrix.target }}/release/sumcp${exe}"
+          bin="./target/${{ matrix.target }}/release/backstory${exe}"
           # An x86-64 binary built on an arm64 runner has to go through Rosetta.
           # Every other combination here is genuinely native.
           run_bin() {
@@ -160,9 +160,9 @@ jobs:
           # binary that starts but cannot parse a transcript fails here.
           run_bin "$bin" --file fixtures/demo/demo-session.jsonl --json > smoke.json
           python3 -c 'import json; d=json.load(open("smoke.json")); assert d["v"]==2, d["v"]; assert d["top_struggles"], "no ranked files"; print("analyzed the fixture:", d["top_struggles"][0]["file"])'
-          # sumcp-mcp is a stdio server with no --version flag, so running it
+          # backstory-mcp is a stdio server with no --version flag, so running it
           # would block on stdin. Prove it exists and is a real executable.
-          test -x "./target/${{ matrix.target }}/release/sumcp-mcp${exe}"
+          test -x "./target/${{ matrix.target }}/release/backstory-mcp${exe}"
 
       # WHAT A USER GETS, recorded rather than assumed. Rust ad-hoc signs macOS
       # binaries at link time, which is enough for them to RUN, but an ad-hoc
@@ -182,28 +182,28 @@ jobs:
         if: contains(matrix.target, 'apple-darwin')
         run: |
           set -euo pipefail
-          for b in sumcp sumcp-mcp; do
+          for b in backstory backstory-mcp; do
             path="./target/${{ matrix.target }}/release/${b}"
             echo "== ${b}"
             codesign -dvv "$path" 2>&1 | sed 's/^/   /' || echo "   no signature at all"
           done
 
       # Layout inside the tarball:
-      #   sumcp-<tag>-<target>/{sumcp,sumcp-mcp,README.md,LICENSE-MIT,LICENSE-APACHE}
+      #   backstory-<tag>-<target>/{backstory,backstory-mcp,README.md,LICENSE-MIT,LICENSE-APACHE}
       # The single top-level directory keeps the extract from spraying files
       # into the user's cwd, and keeps the two binaries siblings, which is the
-      # exact shape `sumcp install` requires.
+      # exact shape `backstory install` requires.
       - name: Stage the archive
         run: |
           set -euo pipefail
-          stage="sumcp-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          stage="backstory-${GITHUB_REF_NAME}-${{ matrix.target }}"
           mkdir -p "dist/${stage}"
           exe=""
           case "${{ matrix.target }}" in *windows*) exe=".exe";; esac
-          cp "target/${{ matrix.target }}/release/sumcp${exe}" "dist/${stage}/sumcp${exe}"
-          cp "target/${{ matrix.target }}/release/sumcp-mcp${exe}" "dist/${stage}/sumcp-mcp${exe}"
+          cp "target/${{ matrix.target }}/release/backstory${exe}" "dist/${stage}/backstory${exe}"
+          cp "target/${{ matrix.target }}/release/backstory-mcp${exe}" "dist/${stage}/backstory-mcp${exe}"
           cp README.md LICENSE-MIT LICENSE-APACHE "dist/${stage}/"
-          chmod +x "dist/${stage}/sumcp${exe}" "dist/${stage}/sumcp-mcp${exe}"
+          chmod +x "dist/${stage}/backstory${exe}" "dist/${stage}/backstory-mcp${exe}"
           tar -czf "dist/${stage}.tar.gz" -C dist "${stage}"
           rm -rf "dist/${stage}"
           ls -l dist
@@ -216,7 +216,7 @@ jobs:
         working-directory: dist
         run: |
           set -euo pipefail
-          archive="sumcp-${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz"
+          archive="backstory-${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz"
           if command -v sha256sum >/dev/null 2>&1; then
             sha256sum "${archive}" > "${archive}.sha256"
           else
@@ -262,20 +262,20 @@ jobs:
           tag="${GITHUB_REF_NAME}"
           cat > notes.md <<EOF
           Prebuilt archives for macOS (Apple Silicon and Intel) and x86_64 Linux.
-          Every archive contains both binaries, \`sumcp\` and \`sumcp-mcp\`.
-          \`sumcp install\` needs them side by side, so keep them in the same
+          Every archive contains both binaries, \`backstory\` and \`backstory-mcp\`.
+          \`backstory install\` needs them side by side, so keep them in the same
           directory.
 
           ### Install (macOS, Apple Silicon)
 
           \`\`\`bash
-          curl -LO https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}/sumcp-${tag}-aarch64-apple-darwin.tar.gz
-          curl -LO https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}/sumcp-${tag}-aarch64-apple-darwin.tar.gz.sha256
-          shasum -a 256 -c sumcp-${tag}-aarch64-apple-darwin.tar.gz.sha256
-          tar -xzf sumcp-${tag}-aarch64-apple-darwin.tar.gz
-          cd sumcp-${tag}-aarch64-apple-darwin
-          ./sumcp install          # dry-run: prints exactly what it will write
-          ./sumcp install --apply  # register the MCP server, debrief skill, and Stop hook
+          curl -LO https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}/backstory-${tag}-aarch64-apple-darwin.tar.gz
+          curl -LO https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}/backstory-${tag}-aarch64-apple-darwin.tar.gz.sha256
+          shasum -a 256 -c backstory-${tag}-aarch64-apple-darwin.tar.gz.sha256
+          tar -xzf backstory-${tag}-aarch64-apple-darwin.tar.gz
+          cd backstory-${tag}-aarch64-apple-darwin
+          ./backstory install          # dry-run: prints exactly what it will write
+          ./backstory install --apply  # register the MCP server, debrief skill, and Stop hook
           \`\`\`
 
           Swap \`aarch64-apple-darwin\` for \`x86_64-apple-darwin\` (Intel Mac) or
@@ -284,7 +284,7 @@ jobs:
 
           The binaries are not notarized. If macOS Gatekeeper blocks them after a
           browser download, clear the quarantine flag:
-          \`xattr -dr com.apple.quarantine sumcp sumcp-mcp\`.
+          \`xattr -dr com.apple.quarantine backstory backstory-mcp\`.
           EOF
           cat notes.md
 
@@ -305,7 +305,7 @@ jobs:
           esac
           gh release create "${tag}" \
             --repo "${GITHUB_REPOSITORY}" \
-            --title "suMCP ${tag}" \
+            --title "backstory-mcp ${tag}" \
             --notes-file notes.md \
             --generate-notes \
             --verify-tag \

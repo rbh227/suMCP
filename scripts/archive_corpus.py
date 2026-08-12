@@ -8,7 +8,7 @@ therefore a rolling window. `tasks/todo.md` records the consequence already:
 one frozen held-out project aged out, and the exact population of the
 2026-07-22 predictive-validity study can no longer be rebuilt from disk.
 
-Every measurement claim suMCP makes is only as durable as the transcripts
+Every measurement claim backstory-mcp makes is only as durable as the transcripts
 behind it. This script copies the evidence somewhere the cleanup does not
 reach, incrementally, so it can be run as often as you like.
 
@@ -24,7 +24,7 @@ PRIVACY
 -------
 These files contain unredacted secrets and real work. The default destination
 is deliberately OUTSIDE this repository (`~/claude-corpus-archive`), because
-suMCP is a public repo and a transcript archive must never become committable.
+backstory-mcp is a public repo and a transcript archive must never become committable.
 The script refuses to write anywhere inside the repo, and refuses a
 destination that is inside a git work tree at all.
 
@@ -140,7 +140,7 @@ def assert_safe_dest(dest: Path) -> None:
     # exactly what a safety check on a to-be-created destination needs.
     resolved = dest.resolve()
     if resolved == repo or repo in resolved.parents:
-        sys.exit(f"refusing: {resolved} is inside the suMCP repo. Transcripts "
+        sys.exit(f"refusing: {resolved} is inside the backstory-mcp repo. Transcripts "
                  f"carry unredacted secrets and must not be committable.")
     # Probe the NEAREST EXISTING ancestor, not merely the immediate parent.
     # A nested nonexistent destination (<worktree>/new/nested/archive) used
