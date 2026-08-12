@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/wordmark.svg" alt="backstory-mcp: the session, quoted verbatim, for the reviewing agent" width="480">
+  <img src="docs/assets/wordmark.svg" alt="backstory-mcp" width="480">
 </p>
 
 <p align="center"><b>One agent writes the code. Another reviews it. backstory-mcp hands the reviewer the context only the session had.</b></p>

@@ -15,11 +15,11 @@ use std::sync::Mutex;
 // `Arc` = atomically reference-counted pointer. Handing out `Arc<LoadedUnit>`
 // lets every caller share one parsed unit without cloning the whole thing;
 // the unit is dropped when the last holder lets go.
-use std::sync::Arc;
 use backstory_core::assemble::{MAX_TRANSCRIPT_BYTES as CORE_MAX_BYTES, load_work_unit};
 use backstory_core::model::Session;
 use backstory_core::payloads::{UnitMeta, unit_meta_from};
 use backstory_core::work_unit::discover_work_unit;
+use std::sync::Arc;
 
 /// Cap on cached parsed units (T4.2). A long-lived server that outlives many
 /// sessions would otherwise hold every unit it ever parsed; parsed units run

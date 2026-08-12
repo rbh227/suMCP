@@ -959,7 +959,10 @@ fn run_install(paths: &Paths, exe_dir: &Path, apply: bool) -> io::Result<Vec<Str
         let src_backstory = exe_dir.join(format!("backstory{}", std::env::consts::EXE_SUFFIX));
         let src_mcp = exe_dir.join(format!("backstory-mcp{}", std::env::consts::EXE_SUFFIX));
         let backstory_bytes = fs::read(&src_backstory).map_err(|e| {
-            io::Error::new(e.kind(), format!("reading {}: {e}", src_backstory.display()))
+            io::Error::new(
+                e.kind(),
+                format!("reading {}: {e}", src_backstory.display()),
+            )
         })?;
         let mcp_bytes = fs::read(&src_mcp)
             .map_err(|e| io::Error::new(e.kind(), format!("reading {}: {e}", src_mcp.display())))?;
@@ -986,8 +989,10 @@ fn run_install(paths: &Paths, exe_dir: &Path, apply: bool) -> io::Result<Vec<Str
         //    than write a script nothing will ever execute; `cmd_install`
         //    prints a one-line notice explaining the gap.
         if cfg!(unix) {
-            let script =
-                HOOK_TEMPLATE.replace("__BACKSTORY_BIN__", &paths.installed_backstory().to_string_lossy());
+            let script = HOOK_TEMPLATE.replace(
+                "__BACKSTORY_BIN__",
+                &paths.installed_backstory().to_string_lossy(),
+            );
             j.place_file(&paths.hook_script(), script.as_bytes(), 0o700)?;
         }
 
@@ -1410,8 +1415,16 @@ mod tests {
     fn fake_exe_dir() -> (TempDir, PathBuf) {
         let d = tempdir().unwrap();
         let exe = std::env::consts::EXE_SUFFIX;
-        fs::write(d.path().join(format!("backstory{exe}")), b"#!fake backstory\n").unwrap();
-        fs::write(d.path().join(format!("backstory-mcp{exe}")), b"#!fake mcp\n").unwrap();
+        fs::write(
+            d.path().join(format!("backstory{exe}")),
+            b"#!fake backstory\n",
+        )
+        .unwrap();
+        fs::write(
+            d.path().join(format!("backstory-mcp{exe}")),
+            b"#!fake mcp\n",
+        )
+        .unwrap();
         let p = d.path().to_path_buf();
         (d, p)
     }
@@ -1544,7 +1557,10 @@ mod tests {
         );
         let cj = read_json(&cjp);
         assert!(cj["mcpServers"]["other"].is_object(), "user server lost");
-        assert!(cj["mcpServers"]["backstory"].is_object(), "our server missing");
+        assert!(
+            cj["mcpServers"]["backstory"].is_object(),
+            "our server missing"
+        );
 
         // Backups of both pre-existing files exist.
         let has_backup = |dir: &Path| {
@@ -1605,7 +1621,10 @@ mod tests {
 
         run_uninstall(&paths, true).unwrap();
 
-        assert!(!paths.backstory().exists(), "uninstall left the backstory tree");
+        assert!(
+            !paths.backstory().exists(),
+            "uninstall left the backstory tree"
+        );
         assert!(!paths.skill_dest().exists(), "uninstall left the skill");
         let cj2 = read_json(&cjp);
         assert!(
@@ -1730,7 +1749,10 @@ mod tests {
         );
 
         // Everything we started is rolled back; the user's config is intact.
-        assert!(!paths.backstory().exists(), "rollback left the backstory tree");
+        assert!(
+            !paths.backstory().exists(),
+            "rollback left the backstory tree"
+        );
         assert!(!paths.skill_dest().exists(), "rollback left the skill");
         let cj = read_json(&cjp);
         assert!(
@@ -1788,7 +1810,10 @@ mod tests {
 
         run_uninstall(&paths, true).unwrap();
 
-        assert!(!paths.backstory().exists(), "uninstall left the backstory tree");
+        assert!(
+            !paths.backstory().exists(),
+            "uninstall left the backstory tree"
+        );
         assert_eq!(
             fs::read(&notes).unwrap(),
             b"precious",
@@ -2080,7 +2105,10 @@ mod tests {
             !paths.manifest().exists(),
             "manifest left after clean retry"
         );
-        assert!(!paths.backstory().exists(), "backstory tree left after clean retry");
+        assert!(
+            !paths.backstory().exists(),
+            "backstory tree left after clean retry"
+        );
     }
 
     #[test]

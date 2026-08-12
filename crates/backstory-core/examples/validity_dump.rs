@@ -10,13 +10,13 @@
 //! anomalies, and a zero-action session prints a valid object with an empty
 //! `files` array.
 
-use serde_json::json;
-use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
 use backstory_core::assemble::{MAX_TRANSCRIPT_BYTES, load_session};
 use backstory_core::model::{Action, ActionKind, Idx};
 use backstory_core::review::needs_review;
 use backstory_core::score::{all_findings, rank};
+use serde_json::json;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 
 fn main() -> std::process::ExitCode {
     let mut args = std::env::args_os().skip(1);

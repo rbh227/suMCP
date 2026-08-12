@@ -12,13 +12,13 @@
 
 mod install;
 
-use clap::{Parser, Subcommand};
-use std::path::{Path, PathBuf};
-use std::process::ExitCode;
 use backstory_core::payloads::{
     SessionMeta, review_context, session_intent, session_overview, unit_meta_from,
 };
 use backstory_core::score::rank;
+use clap::{Parser, Subcommand};
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 
 /// Post-session forensics for Claude Code sessions.
 #[derive(Parser)]
@@ -233,7 +233,9 @@ fn main() -> ExitCode {
         Err(why) => {
             match why {
                 NoTarget::NowhereToLook => {
-                    eprintln!("backstory: cannot tell which project this is (no HOME, or the current");
+                    eprintln!(
+                        "backstory: cannot tell which project this is (no HOME, or the current"
+                    );
                     eprintln!("       directory is unreadable).");
                 }
                 NoTarget::NoSessions(searched) => {
@@ -242,7 +244,9 @@ fn main() -> ExitCode {
                     let cwd = cwd.expect("cwd was resolved to reach NoSessions");
                     eprintln!("  cwd:      {}", cwd.display());
                     eprintln!("  searched: {}", searched.display());
-                    eprintln!("Claude Code stores transcripts per project directory, so run backstory");
+                    eprintln!(
+                        "Claude Code stores transcripts per project directory, so run backstory"
+                    );
                     eprintln!("from the directory you launched Claude Code in.");
                 }
             }
@@ -440,7 +444,9 @@ fn cmd_context(
         Err(why) => {
             match why {
                 NoTarget::NowhereToLook => {
-                    eprintln!("backstory: cannot tell which project this is (no HOME, or the current");
+                    eprintln!(
+                        "backstory: cannot tell which project this is (no HOME, or the current"
+                    );
                     eprintln!("       directory is unreadable).");
                 }
                 NoTarget::NoSessions(searched) => {
@@ -449,7 +455,9 @@ fn cmd_context(
                         eprintln!("  cwd:      {}", cwd.display());
                     }
                     eprintln!("  searched: {}", searched.display());
-                    eprintln!("Claude Code stores transcripts per project directory, so run backstory");
+                    eprintln!(
+                        "Claude Code stores transcripts per project directory, so run backstory"
+                    );
                     eprintln!("from the directory you launched Claude Code in.");
                 }
             }
@@ -550,7 +558,8 @@ fn cmd_context(
         let (w_start, w_end) =
             window.expect("Some(range) implies window was resolved above, or we already returned");
         let session_id = stem_id(&target.path);
-        let Some((s_start, s_end)) = backstory_core::work_unit::session_epoch_span(&session.actions)
+        let Some((s_start, s_end)) =
+            backstory_core::work_unit::session_epoch_span(&session.actions)
         else {
             eprintln!(
                 "backstory: session {session_id} has no timestamped actions, so whether it overlaps \

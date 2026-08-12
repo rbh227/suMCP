@@ -4,9 +4,9 @@
 //! the parse gate for Checkpoint B. Integration tests live in `tests/` and see
 //! the crate as an external user would (only its public API).
 
-use std::path::PathBuf;
 use backstory_core::ingest::ingest_str;
 use backstory_core::model::Lane;
+use std::path::PathBuf;
 
 fn fixture(name: &str) -> String {
     // CARGO_MANIFEST_DIR is this crate's dir; the fixtures live at repo root.
@@ -67,8 +67,11 @@ fn donor_reports_all_subagents_missing() {
     ]
     .iter()
     .collect();
-    let a = backstory_core::assemble::load_session(&path, backstory_core::assemble::MAX_TRANSCRIPT_BYTES)
-        .unwrap();
+    let a = backstory_core::assemble::load_session(
+        &path,
+        backstory_core::assemble::MAX_TRANSCRIPT_BYTES,
+    )
+    .unwrap();
     assert_eq!(
         a.session.subagent_files_missing, 12,
         "12 spawns, no child files on disk"
@@ -95,8 +98,11 @@ fn synthetic_2_1_x_merges_subagent_actions() {
     ]
     .iter()
     .collect();
-    let a = backstory_core::assemble::load_session(&path, backstory_core::assemble::MAX_TRANSCRIPT_BYTES)
-        .unwrap();
+    let a = backstory_core::assemble::load_session(
+        &path,
+        backstory_core::assemble::MAX_TRANSCRIPT_BYTES,
+    )
+    .unwrap();
     // Count actions whose lane is `Sub(_)` — i.e. came from a subagent file.
     // `matches!` is a compact "does this value fit that pattern?" test.
     let sub = a

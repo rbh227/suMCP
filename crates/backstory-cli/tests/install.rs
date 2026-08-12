@@ -51,7 +51,9 @@ fn dry_run_writes_nothing_then_apply_and_uninstall_roundtrip() {
         "backstory binary missing"
     );
     assert!(
-        backstory_dir.join(format!("bin/backstory-mcp{exe}")).exists(),
+        backstory_dir
+            .join(format!("bin/backstory-mcp{exe}"))
+            .exists(),
         "mcp binary missing"
     );
     // The hook is a /bin/sh script, installed on Unix and deliberately skipped
@@ -67,7 +69,10 @@ fn dry_run_writes_nothing_then_apply_and_uninstall_roundtrip() {
         !backstory_dir.join("hooks/stop-nudge.sh").exists(),
         "there is no /bin/sh here, so the hook must not be written"
     );
-    assert!(backstory_dir.join("manifest.json").exists(), "manifest missing");
+    assert!(
+        backstory_dir.join("manifest.json").exists(),
+        "manifest missing"
+    );
     assert!(
         home.path().join(".claude/skills/debrief/SKILL.md").exists(),
         "skill missing"

@@ -5,6 +5,9 @@
 //! logic lives in `identify.rs`; caching lives in `store.rs`. Swapping the
 //! SDK later should mean rewriting only this file and `main.rs`.
 
+use backstory_core::model::Idx;
+use backstory_core::payloads::{self, SessionMeta};
+use backstory_core::score::rank;
 use rmcp::model::{
     CallToolRequestParams, CallToolResult, ContentBlock, Implementation, ListToolsResult,
     PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool, ToolAnnotations,
@@ -14,9 +17,6 @@ use rmcp::{ErrorData, ServerHandler};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use backstory_core::model::Idx;
-use backstory_core::payloads::{self, SessionMeta};
-use backstory_core::score::rank;
 
 use crate::identify::{self, IdentifyError, Resolved};
 use crate::store::SessionStore;

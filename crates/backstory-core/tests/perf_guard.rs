@@ -36,8 +36,11 @@ fn a_sixteen_member_work_unit_analyzes_well_under_the_ceiling() {
     let last = td.path().join("00000015-1111-2222-3333-444455556666.jsonl");
 
     let t0 = Instant::now();
-    let a = backstory_core::assemble::load_work_unit(&last, backstory_core::assemble::MAX_TRANSCRIPT_BYTES)
-        .expect("assembles");
+    let a = backstory_core::assemble::load_work_unit(
+        &last,
+        backstory_core::assemble::MAX_TRANSCRIPT_BYTES,
+    )
+    .expect("assembles");
     let dt = t0.elapsed();
 
     assert_eq!(
