@@ -7,7 +7,9 @@
 //! and every finding carries the action indices proving it.
 
 pub mod assemble;
+pub mod context;
 pub mod file_class;
+pub mod git;
 pub mod html;
 pub mod ingest;
 pub mod locate;

@@ -350,20 +350,157 @@ pub struct UserText {
     /// together, the same way it does for `Action::session_ix`.
     #[serde(default)]
     pub session_ix: u16,
-    /// Whether this turn came from the human, per the `origin.kind` field.
-    /// A harness-injected turn (e.g. a task notification) is recorded but is
-    /// not a human turn, so it must not reset the review-burden window.
-    /// Absent `origin` means human: the field is newer than the transcripts
-    /// we must keep reading, and defaulting an unknown turn to human keeps
-    /// the pre-existing (wider) windowing on old data. The serde default is
-    /// `true` for the same reason.
-    #[serde(default = "default_true")]
-    pub is_human: bool,
+    /// Where this turn came from, per the transcript's `origin.kind` field.
+    /// See [`TurnOrigin`] for the three states, and [`UserText::is_human`]
+    /// for why the review-burden consumer and the quoting consumer read
+    /// this field differently.
+    #[serde(default)]
+    pub origin: TurnOrigin,
 }
 
-/// Serde default helper: see [`UserText::is_human`].
-fn default_true() -> bool {
-    true
+impl UserText {
+    /// "Was this turn produced by the human, or at least not KNOWN to be
+    /// something else": the review-burden / segment-boundary sense of
+    /// "human turn" (`signals/dynamics.rs::segments`). This treats
+    /// `TurnOrigin::Unknown` as human on purpose: an origin-less turn is
+    /// old transcript data (the `origin` field is newer than transcripts we
+    /// must keep reading), not evidence the turn wasn't human, and counting
+    /// it as a boundary here keeps the pre-existing (wider) review window
+    /// that consumer has always used. This is the ONLY reason the default
+    /// exists; do not reuse this method anywhere that needs to know the
+    /// turn was ACTUALLY said by the human.
+    ///
+    /// `context::scope()` is that other case: it quotes turns to a
+    /// reviewing agent as the human's stated intent, so it must NOT call
+    /// this method. It matches `TurnOrigin::Human` directly instead,
+    /// because quoting an `Unknown` turn risks quoting an interrupt marker
+    /// or a slash-command echo as if the human had asked for it (measured
+    /// on 12 real transcripts: 13.3% of textual user turns carry no
+    /// `origin` at all, and they are not old-format human requests).
+    pub fn is_human(&self) -> bool {
+        matches!(self.origin, TurnOrigin::Human | TurnOrigin::Unknown)
+    }
+}
+
+/// The three things a transcript line's `origin.kind` can tell us about a
+/// user turn.
+///
+/// A plain bool cannot represent this: "definitely not human" (a task
+/// notification) and "we have no idea" (an old transcript with no `origin`
+/// field at all) are different facts, and two different consumers in this
+/// crate need to treat them differently. Review-burden windowing folds
+/// `Unknown` into "human" (the conservative direction for a window that
+/// must not silently narrow on old data); `context::scope()`, which quotes
+/// a turn to a reviewer as the human's stated intent, must NOT. See
+/// [`UserText::is_human`] for the full reasoning.
+///
+/// `Default` (via `#[default]` on `Unknown`) is what lets `#[serde(default)]`
+/// on `UserText::origin` fall back to something when deserializing a disk
+/// cache written before this field existed. `Unknown` is the right
+/// fallback: those old cache entries carry no origin information at all,
+/// which is exactly what `Unknown` means.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TurnOrigin {
+    /// `origin.kind == "human"`, explicitly.
+    Human,
+    /// `origin` was present with some other `kind` (e.g.
+    /// `"task-notification"`): known, on direct evidence, not to be human.
+    NonHuman,
+    /// No `origin` field at all on the transcript line.
+    #[default]
+    Unknown,
+}
+
+/// One question the agent put to the human, the options it offered, and what
+/// the human picked.
+///
+/// WHY THIS IS ITS OWN VEC AND NOT A FIELD ON `Action`: a session has tens of
+/// thousands of actions and a handful of decisions. Hanging the question and
+/// option text off every action would cost memory on every one of them to
+/// serve a few. This follows the same shape as `Session::spawns`, which is
+/// also a small paired-with-its-result list.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Decision {
+    /// The question text, verbatim.
+    pub question: String,
+    /// The option labels offered, in the order presented.
+    pub options: Vec<String>,
+    /// What the human chose. `None` when the session ended before answering.
+    /// This is NOT constrained to be one of `options`: the "Other" escape
+    /// hatch lets the human answer in free text, and that text is the most
+    /// informative answer of all, so it is kept exactly as written.
+    pub answer: Option<String>,
+    /// Source line of the asking call (total-order tiebreak, same key as
+    /// actions and user texts).
+    pub line_no: usize,
+    /// Which transcript of the work unit this came from. See
+    /// [`Action::session_ix`] for why this is an index and not a `String`.
+    #[serde(default)]
+    pub session_ix: u16,
+    // Deliberately no `Idx` field here. Both `merge_sessions` and
+    // `merge_work_unit` renumber every action's `Idx` globally, so an index
+    // assigned at ingest time would go stale the moment a merge ran, and a
+    // stale citation is worse than an absent one. `line_no` + `session_ix`
+    // above are stable across merges; a later task resolves the real,
+    // current `Idx` from the MERGED session by matching on that pair. Do
+    // not re-add `idx` here without solving the staleness problem first.
+}
+
+/// One transition in a task's lifecycle: its creation, or a status change.
+///
+/// Kept as an event LIST rather than a final-state map because the payload
+/// needs to cite the action that left a task unfinished, and a map would
+/// have thrown that index away.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TaskEvent {
+    /// The task id, exactly as the harness reported it: `toolUseResult.task.id`
+    /// on a create, `taskId` on an update. Each transcript's harness numbers
+    /// ids from 1 independently, so this id is only unique WITHIN one
+    /// (session_ix, lane) pair, never across a merged work unit; see `lane`
+    /// below.
+    pub id: String,
+    /// The subject, present on creates and on renames, absent on plain
+    /// status updates.
+    pub subject: Option<String>,
+    /// `"pending"` for a create, otherwise the confirmed status an update's
+    /// result reported.
+    pub status: String,
+    /// Source line (total-order tiebreak).
+    pub line_no: usize,
+    /// Which transcript of the work unit this came from.
+    #[serde(default)]
+    pub session_ix: u16,
+    /// Main or subagent lane, stamped from the ingest call's `default_lane`
+    /// exactly like `Action::lane`. `merge_sessions` concatenates a
+    /// subagent's task events into the main lane's without renumbering
+    /// anything, and each transcript's harness numbers its own task ids from
+    /// 1, so a subagent's task "1" and the main lane's task "1" would
+    /// otherwise share an identity. Task identity is therefore
+    /// `(session_ix, lane, id)`, not `id` alone.
+    pub lane: Lane,
+    // Deliberately no `Idx` field here, same reasoning as `Decision` above:
+    // both merge functions renumber every action's `Idx` globally, so an
+    // index captured at ingest time would go stale the moment a merge ran.
+    // `line_no` + `session_ix` are stable across merges; a later task
+    // resolves the real, current `Idx` from the MERGED session by matching
+    // on that pair.
+}
+
+/// One block of agent prose: what it said it did.
+///
+/// The review payload hands these to the reviewer as CLAIMS to verify against
+/// the diff. suMCP never checks them itself, because checking a natural
+/// language assertion against code requires understanding both, which is the
+/// consuming agent's job and not this tool's.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AgentText {
+    /// The prose, capped at `AGENT_TEXT_CAP` characters.
+    pub text: String,
+    /// Source line (total-order tiebreak).
+    pub line_no: usize,
+    /// Which transcript of the work unit this came from.
+    #[serde(default)]
+    pub session_ix: u16,
 }
 
 /// A fully parsed session: ordered actions plus parse-health counters.
@@ -402,6 +539,35 @@ pub struct Session {
     /// MAIN transcript), post-dedup. Used by assembly to find and merge the
     /// child transcripts; carried through the merge as provenance.
     pub spawns: Vec<Spawn>,
+    /// Questions the agent put to the human, with the options offered and the
+    /// answer given. The review-context payload's highest-value block: it is
+    /// the only place a deliberate human choice is recorded, so a reviewer
+    /// can stop flagging it as a mistake.
+    ///
+    /// `#[serde(default)]` so transcript caches written before this field
+    /// existed still deserialize.
+    #[serde(default)]
+    pub decisions: Vec<Decision>,
+    /// Task lifecycle transitions, in source order. Replayed by the context
+    /// module into a final state per task, so the payload can report work
+    /// that was planned and never finished.
+    #[serde(default)]
+    pub task_events: Vec<TaskEvent>,
+    /// Agent prose blocks, in source order: what the agent said it did. The
+    /// payload presents these as claims for the reviewer to check against
+    /// the diff.
+    #[serde(default)]
+    pub agent_texts: Vec<AgentText>,
+    /// How many non-empty prose blocks were seen on a NON-main lane and, for
+    /// that reason, never made it into `agent_texts` (`merge_sessions` keeps
+    /// only main's prose, see that function's comment for why). The string
+    /// itself is not worth retaining, but its existence is: without this
+    /// counter a payload could report a claim count with no sign that a
+    /// subagent's own account of its work went unrecorded. Honest scope
+    /// disclosure, same precedent as `subagent_files_missing`; a payload can
+    /// say "N subagent prose blocks were not captured".
+    #[serde(default)]
+    pub agent_texts_excluded: u64,
     /// The transcript ids making up this session, oldest first. An action's
     /// `session_ix` indexes into this. A single-transcript analysis has
     /// exactly one entry, so `session_ids[0]` is always the id being reported.

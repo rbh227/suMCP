@@ -144,7 +144,7 @@ pub(crate) fn segments(s: &Session) -> Vec<Segment<'_>> {
     // notification) is recorded in `user_texts` but is not the human coming
     // back to review, so it must not close a task segment. Counting it as a
     // boundary truncated the review-burden window and understated the metric.
-    for u in s.user_texts.iter().filter(|u| u.is_human) {
+    for u in s.user_texts.iter().filter(|u| u.is_human()) {
         match by_session.iter_mut().find(|(ix, _)| *ix == u.session_ix) {
             Some((_, msgs)) => msgs.push(u),
             None => by_session.push((u.session_ix, vec![u])),
@@ -741,6 +741,10 @@ mod tests {
             interrupts: 0,
             auto_accept: false,
             spawns: vec![],
+            decisions: vec![],
+            task_events: vec![],
+            agent_texts: vec![],
+            agent_texts_excluded: 0,
             session_ids: vec![],
             subagent_files_missing: 0,
         };
@@ -765,7 +769,7 @@ mod tests {
         // "capitulation flip." The Flip upgrade must be gated to the main lane.
         // The self-revert itself is real, so it must STILL emit as TrueRevert —
         // only the Flip label is suppressed for sub lanes.
-        use crate::model::{Action, ActionKind, Idx, UserText};
+        use crate::model::{Action, ActionKind, Idx, TurnOrigin, UserText};
         let sub_edit = |idx, line, old: &str, new: &str, ts: &str| Action {
             idx: Idx(idx),
             effective_ts: ts.into(),
@@ -805,7 +809,7 @@ mod tests {
                 text: "no revert that please".into(),
                 effective_ts: "2026-01-01T00:00:02Z".into(),
                 session_ix: 0,
-                is_human: true,
+                origin: TurnOrigin::Human,
             }],
             cwd: None,
             tokens: Default::default(),
@@ -815,6 +819,10 @@ mod tests {
             interrupts: 0,
             auto_accept: false,
             spawns: vec![],
+            decisions: vec![],
+            task_events: vec![],
+            agent_texts: vec![],
+            agent_texts_excluded: 0,
             session_ids: vec![],
             subagent_files_missing: 0,
         };
@@ -1013,7 +1021,7 @@ mod tests {
         // doc), so a message from session 1 must never be read as pushback
         // between two session-0 edits -- doing so would invent a struggle
         // that never happened (the two transcripts are unrelated).
-        use crate::model::UserText;
+        use crate::model::{TurnOrigin, UserText};
         let mut first = Action::default();
         first.idx = Idx(0);
         first.effective_ts = "2026-01-01T00:00:01Z".into();
@@ -1043,7 +1051,7 @@ mod tests {
             line_no: 2, // between 1 and 3 -- but in a DIFFERENT transcript
             text: "no, revert that".into(),
             session_ix: 1,
-            is_human: true,
+            origin: TurnOrigin::Human,
         }];
         s.session_ids = vec!["sess-0".into(), "sess-1".into()];
 
@@ -1066,7 +1074,7 @@ mod tests {
         // scoping fix does not simply disable flip detection outright,
         // which is the obvious way to make the test above pass for the
         // wrong reason.
-        use crate::model::UserText;
+        use crate::model::{TurnOrigin, UserText};
         let mut first = Action::default();
         first.idx = Idx(0);
         first.effective_ts = "2026-01-01T00:00:01Z".into();
@@ -1096,7 +1104,7 @@ mod tests {
             line_no: 2,
             text: "no, revert that".into(),
             session_ix: 0, // same transcript as the edits
-            is_human: true,
+            origin: TurnOrigin::Human,
         }];
         s.session_ids = vec!["sess-0".into()];
 
@@ -1122,7 +1130,7 @@ mod tests {
         // shape as `pushback_in_the_same_transcript_still_creates_a_flip`
         // above, moved entirely to session 1, to pin down that the scoping
         // compares against the actual session_ix rather than a hardcoded 0.
-        use crate::model::UserText;
+        use crate::model::{TurnOrigin, UserText};
         let mut first = Action::default();
         first.idx = Idx(0);
         first.effective_ts = "2026-01-01T00:00:01Z".into();
@@ -1152,7 +1160,7 @@ mod tests {
             line_no: 2,
             text: "no, revert that".into(),
             session_ix: 1, // same transcript as the edits, but not 0
-            is_human: true,
+            origin: TurnOrigin::Human,
         }];
         s.session_ids = vec!["sess-0".into(), "sess-1".into()];
 
@@ -1177,7 +1185,7 @@ mod tests {
         // at a line number that numerically falls in range. Without the
         // gate this foreign Read would count as "evidence gathered" and
         // wrongly downgrade the Flip to a TrueRevert.
-        use crate::model::UserText;
+        use crate::model::{TurnOrigin, UserText};
         let mut first = Action::default();
         first.idx = Idx(0);
         first.effective_ts = "2026-01-01T00:00:01Z".into();
@@ -1219,7 +1227,7 @@ mod tests {
             line_no: 2,
             text: "no, revert that".into(),
             session_ix: 0,
-            is_human: true,
+            origin: TurnOrigin::Human,
         }];
         s.session_ids = vec!["sess-0".into(), "sess-1".into()];
 
@@ -1240,7 +1248,7 @@ mod tests {
         // belongs to a DIFFERENT transcript, so it must not split the
         // segment: `line_no` only means "position in this transcript's own
         // file", never a global counter comparable across transcripts.
-        use crate::model::UserText;
+        use crate::model::{TurnOrigin, UserText};
         let mk = |idx, line_no| Action {
             idx: Idx(idx),
             effective_ts: format!("2026-01-01T00:00:{line_no:02}Z"),
@@ -1271,7 +1279,7 @@ mod tests {
                 line_no: 5,
                 text: "an unrelated transcript's message".into(),
                 session_ix: 1,
-                is_human: true,
+                origin: TurnOrigin::Human,
             }],
             session_ids: vec!["sess-0".into(), "sess-1".into()],
             ..Session::default()

@@ -13,7 +13,10 @@
 //! that is the more robust choice: a surprising shape in one field costs us
 //! that field, not the whole line's type/uuid/timestamp.
 
-use crate::model::{Action, ActionKind, Idx, Lane, Session, Spawn, Tokens, UserText};
+use crate::model::{
+    Action, ActionKind, AgentText, Decision, Idx, Lane, Session, Spawn, TaskEvent, Tokens,
+    TurnOrigin, UserText,
+};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -21,7 +24,20 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 /// paste from bloating the model while still allowing equality comparison.
 const EDIT_CAP: usize = 2000;
 /// Prefix Claude Code writes when the user interrupts a turn.
-const INTERRUPT_PREFIX: &str = "[Request interrupted by user";
+///
+/// `pub(crate)` so `context::claims()` can reuse this exact rule to tag a
+/// claim whose closing turn was an interrupt, instead of writing a second,
+/// possibly-drifting definition of "what counts as an interrupt".
+pub(crate) const INTERRUPT_PREFIX: &str = "[Request interrupted by user";
+/// Longest prose block stored. Unlike `EDIT_CAP`, truncating here cannot skew
+/// any metric: nothing counts these characters, they are only quoted.
+///
+/// There is deliberately no MINIMUM. A length floor was measured as a proxy
+/// for "is this a verifiable claim" and rejected: across 8 real sessions the
+/// 80-159 character band is mostly narration ("Now the rules engine and
+/// TikTok driver:"), not assertion. Selection happens in `context::claims`
+/// using the spec's rule instead.
+pub(crate) const AGENT_TEXT_CAP: usize = 4000;
 
 /// Parse raw transcript text (one JSON object per line) into a [`Session`].
 ///
@@ -49,6 +65,50 @@ pub fn ingest_str(raw: &str, default_lane: Lane) -> Session {
     let mut spawn_ids: Vec<String> = Vec::new();
     // tool_use id -> the result that came back for it (error text, patch hunks).
     let mut results: HashMap<String, ResultInfo> = HashMap::new();
+    // Decisions arrive in two halves on different lines: the AskUserQuestion
+    // call carries the question and options, the paired result carries the
+    // answer. We stash the half we have and join by tool_use id at the end,
+    // exactly the way spawns already resolve their agentId.
+    //
+    // The join MUST be scoped by tool_use_id, not by question text alone.
+    // If a session asks the same question text in two different calls, a
+    // text-only key would let the second call's answer overwrite the
+    // first's in a shared map, so BOTH decisions would report the later
+    // answer, a fabricated result for the earlier one. Each pending
+    // decision therefore carries the tool_use_id of the call that asked it
+    // (`None` only if the call's `id` was itself missing, which the "cannot
+    // disambiguate" fallback below also covers), and `decision_answers` is
+    // keyed by tool_use_id first, question text second, matching the shape
+    // of the transcript's own per-call `answers` object.
+    let mut pending_decisions: Vec<(Option<String>, bool, Decision)> = Vec::new();
+    let mut decision_answers: std::collections::BTreeMap<
+        String,
+        std::collections::BTreeMap<String, String>,
+    > = std::collections::BTreeMap::new();
+    // Task creates and updates, like decisions, arrive in two halves on
+    // different lines: the call, then its paired result. A create's real id
+    // is only reported in the result (`toolUseResult.task.id`), and an
+    // update can fail, in which case reporting the requested status as
+    // though it happened would hide genuinely unfinished work. Both are
+    // therefore staged here in the order they're seen and resolved by
+    // tool_use_id after the full pass, exactly like `pending_decisions`.
+    // `Session::task_events` documents itself as "in source order", so this
+    // stays a single ordered `Vec` rather than separate create/update lists
+    // that would need re-interleaving afterward.
+    let mut pending_task_events: Vec<PendingTaskEvent> = Vec::new();
+    // Every non-empty prose block the agent wrote ON THE MAIN LANE, in source
+    // order. Ingest makes no judgment about which blocks are worth keeping
+    // (see AGENT_TEXT_CAP's doc comment): that selection is Task 8's job.
+    // Subagent prose is never pushed here at all: `merge_sessions` discards
+    // it unconditionally (subagent prose is internal reasoning the human
+    // never saw), so capturing it would only allocate strings that are
+    // guaranteed to be thrown away.
+    let mut agent_texts: Vec<AgentText> = Vec::new();
+    // How many non-empty prose blocks were seen on a non-main lane and
+    // therefore never pushed above. The count survives even though the
+    // string does not, so a payload can disclose that a subagent's account
+    // of its own work went unrecorded (see `Session::agent_texts_excluded`).
+    let mut agent_texts_excluded = 0u64;
 
     for (line_no, line) in raw.lines().enumerate() {
         if line.trim().is_empty() {
@@ -108,6 +168,30 @@ pub fn ingest_str(raw: &str, default_lane: Lane) -> Session {
 
         let message = v.get("message");
 
+        // Positive agent-authorship check for the `text` blocks handled
+        // below. Claude Code injects harness notices (a dropped connection,
+        // a monthly spend limit, a 529 overload, an unrequested-response
+        // stub) as `type: "assistant"` records carrying a plain `text`
+        // block, the exact shape genuine agent prose uses. Left unchecked, a
+        // notice becomes a false claim, and because `context::claims()`
+        // keeps only the LAST prose block in a window, it can also displace
+        // the agent's real summary right before a human turn.
+        //
+        // Checked against every `message.model == "<synthetic>"` record in
+        // the live `~/.claude/projects` corpus (42 records, 4 wordings): all
+        // 42 were harness notices, none were genuine prose, so `model` alone
+        // is a sufficient marker. `isApiErrorMessage` and the top-level
+        // `error` field agreed on every record that set them, but neither
+        // covers the "No response requested." notice (it sets `model` only,
+        // with `isApiErrorMessage: false` and no `error` field), so `model`
+        // is the one marker that must be checked, not merely one of a set.
+        // All three are still checked so a future notice shape that omits
+        // `model` is still caught by one of the others.
+        let is_harness_notice = message.and_then(|m| m.get("model")).and_then(Value::as_str)
+            == Some("<synthetic>")
+            || v.get("isApiErrorMessage").and_then(Value::as_bool) == Some(true)
+            || v.get("error").is_some();
+
         // Capture real user text (prompts, interrupts) — not tool_result echoes
         // or meta lines. Placed in time so signals can ask "did the user push
         // back between edit A and edit B?".
@@ -128,17 +212,22 @@ pub fn ingest_str(raw: &str, default_lane: Lane) -> Session {
                 // stamps the real value later (see `UserText::session_ix`).
                 session_ix: 0,
                 // `origin.kind` distinguishes a real human turn from a
-                // harness-injected one. Absent means human: the field is
-                // newer than the transcripts we must keep reading, and
-                // defaulting an unknown turn to human keeps the review-burden
-                // window at its pre-existing (wider) behaviour rather than
-                // silently narrowing it on old data.
-                is_human: v
+                // harness-injected one, or from a line where the field is
+                // simply absent (a transcript older than the field, or an
+                // interrupt/slash-command echo that never carries one).
+                // Exactly "human" maps to Human; any other present value is
+                // known non-human evidence; an absent `origin` is Unknown,
+                // not assumed human. See `TurnOrigin` for why the two
+                // consumers of this need different defaults for "unknown".
+                origin: match v
                     .get("origin")
                     .and_then(|o| o.get("kind"))
                     .and_then(Value::as_str)
-                    .map(|k| k == "human")
-                    .unwrap_or(true),
+                {
+                    Some("human") => TurnOrigin::Human,
+                    Some(_) => TurnOrigin::NonHuman,
+                    None => TurnOrigin::Unknown,
+                },
             });
         }
 
@@ -210,6 +299,100 @@ pub fn ingest_str(raw: &str, default_lane: Lane) -> Session {
                                 .and_then(Value::as_str),
                         );
 
+                        // A recorded human decision. One AskUserQuestion call
+                        // can carry several questions, and each becomes its
+                        // own Decision so the payload can cite them
+                        // separately.
+                        if name == "AskUserQuestion"
+                            && let Some(qs) = input
+                                .and_then(|i| i.get("questions"))
+                                .and_then(Value::as_array)
+                        {
+                            // The transcript's own answers map (read from the
+                            // paired result line) is keyed by question text
+                            // WITHIN one call. If this call asks the same
+                            // text twice, that map has room for only one
+                            // entry, so there is no way to tell which
+                            // decision the recorded answer belongs to.
+                            // Detect that collision here, at the source, so
+                            // the join below can refuse to guess instead of
+                            // handing both decisions the same answer.
+                            let mut text_counts: HashMap<&str, usize> = HashMap::new();
+                            for q in qs {
+                                if let Some(text) = q.get("question").and_then(Value::as_str) {
+                                    *text_counts.entry(text).or_insert(0) += 1;
+                                }
+                            }
+                            for q in qs {
+                                let Some(question) = q.get("question").and_then(Value::as_str)
+                                else {
+                                    continue; // malformed entry is data, not an error
+                                };
+                                let options = q
+                                    .get("options")
+                                    .and_then(Value::as_array)
+                                    .map(|os| {
+                                        os.iter()
+                                            .filter_map(|o| o.get("label").and_then(Value::as_str))
+                                            .map(str::to_string)
+                                            .collect()
+                                    })
+                                    .unwrap_or_default();
+                                let ambiguous_in_call =
+                                    text_counts.get(question).copied().unwrap_or(0) > 1;
+                                pending_decisions.push((
+                                    tool_id.map(str::to_string),
+                                    ambiguous_in_call,
+                                    Decision {
+                                        question: question.to_string(),
+                                        options,
+                                        answer: None, // filled by the join below
+                                        line_no,
+                                        session_ix: 0,
+                                    },
+                                ));
+                            }
+                        }
+
+                        // Task lifecycle. TaskCreate always starts a task at
+                        // pending; TaskUpdate is a lifecycle event only when
+                        // it carries a status (it is also used for renames
+                        // and dependency edits, which are not evidence of
+                        // anything unfinished). Neither becomes a `TaskEvent`
+                        // yet: a create needs its result for the real id, and
+                        // an update needs its result to confirm the status
+                        // actually took. Both are staged for the join below.
+                        if name == "TaskCreate" {
+                            pending_task_events.push(PendingTaskEvent::Create {
+                                tool_use_id: tool_id.map(str::to_string),
+                                subject: input
+                                    .and_then(|i| i.get("subject"))
+                                    .and_then(Value::as_str)
+                                    .map(str::to_string),
+                                line_no,
+                                lane: default_lane.clone(),
+                            });
+                        } else if name == "TaskUpdate"
+                            && let Some(status) =
+                                input.and_then(|i| i.get("status")).and_then(Value::as_str)
+                        {
+                            pending_task_events.push(PendingTaskEvent::Update {
+                                tool_use_id: tool_id.map(str::to_string),
+                                task_id: input
+                                    .and_then(|i| i.get("taskId"))
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("?")
+                                    .to_string(),
+                                requested_status: status.to_string(),
+                                subject: input
+                                    .and_then(|i| i.get("subject"))
+                                    .and_then(Value::as_str)
+                                    .map(str::to_string),
+                                line_no,
+                                lane: default_lane.clone(),
+                            });
+                        }
+
                         pending.push(PendingAction {
                             tool_use_id: tool_id.map(str::to_string),
                             effective_ts: effective_ts.clone(),
@@ -249,6 +432,26 @@ pub fn ingest_str(raw: &str, default_lane: Lane) -> Session {
                             // structuredPatch (edit line ranges) lives at the
                             // top level of the same line, paired with this result.
                             let hunks = read_hunks(v.get("toolUseResult"));
+                            // The answers map is keyed by question text
+                            // WITHIN this one call, so it is stored under
+                            // this result's tool_use_id (`id`, bound above)
+                            // and joined to the pending decisions by that id
+                            // plus question text below. Keying by question
+                            // text alone (the old behaviour) let a second
+                            // call asking the same text overwrite the
+                            // first's answer in a session-wide map.
+                            if let Some(answers) = v
+                                .get("toolUseResult")
+                                .and_then(|r| r.get("answers"))
+                                .and_then(Value::as_object)
+                            {
+                                let per_call = decision_answers.entry(id.to_string()).or_default();
+                                for (q, a) in answers {
+                                    if let Some(text) = a.as_str() {
+                                        per_call.insert(q.clone(), text.to_string());
+                                    }
+                                }
+                            }
                             let user_modified = v
                                 .get("toolUseResult")
                                 .and_then(|r| r.get("userModified"))
@@ -271,6 +474,33 @@ pub fn ingest_str(raw: &str, default_lane: Lane) -> Session {
                                 .and_then(|r| r.get("agentId"))
                                 .and_then(Value::as_str)
                                 .map(str::to_string);
+                            // A TaskCreate result's real, harness-assigned id
+                            // (measured present in 78/78 real cases): the
+                            // only source of truth for `TaskEvent::id`, since
+                            // the id is otherwise reported only as free text.
+                            let task_id = v
+                                .get("toolUseResult")
+                                .and_then(|r| r.get("task"))
+                                .and_then(|t| t.get("id"))
+                                .and_then(Value::as_str)
+                                .map(str::to_string);
+                            // A TaskUpdate result's confirmation. `success`
+                            // gates whether the update happened at all;
+                            // `statusChange` is present in 120/121 measured
+                            // cases and, when present, is the confirmed
+                            // resulting status (preferred over the requested
+                            // one). The one older case without it still
+                            // carries `success`, which the join below falls
+                            // back on.
+                            let task_update_success = v
+                                .get("toolUseResult")
+                                .and_then(|r| r.get("success"))
+                                .and_then(Value::as_bool);
+                            let task_status_change = v
+                                .get("toolUseResult")
+                                .and_then(|r| r.get("statusChange"))
+                                .and_then(Value::as_str)
+                                .map(str::to_string);
                             results.insert(
                                 id.to_string(),
                                 ResultInfo {
@@ -281,8 +511,63 @@ pub fn ingest_str(raw: &str, default_lane: Lane) -> Session {
                                     result_ts: effective_ts.clone(),
                                     read_total_lines,
                                     agent_id,
+                                    task_id,
+                                    task_update_success,
+                                    task_status_change,
                                 },
                             );
+                        }
+                    }
+                    Some("text") if v.get("type").and_then(Value::as_str) == Some("assistant") => {
+                        // Whitespace-only blocks carry nothing and would only
+                        // pad the list Task 8 selects from. `str::trim` uses
+                        // Unicode `White_Space`, not just ASCII, so a block of
+                        // e.g. U+3000 (ideographic space) is caught here too.
+                        //
+                        // Trim BEFORE capping, not after: a block can carry
+                        // more than AGENT_TEXT_CAP leading whitespace
+                        // characters followed by real text. Capping the raw
+                        // string first would keep only whitespace (the real
+                        // text sits past the cut), passing this check on the
+                        // full string while storing a blank block, exactly
+                        // the kind of blank that could later stand in as the
+                        // "last block before a human turn" and displace a
+                        // real claim. Trimming first means what gets stored
+                        // is what was validated as non-empty.
+                        if let Some(t) = block.get("text").and_then(Value::as_str) {
+                            let trimmed = t.trim();
+                            // A harness notice is not agent-authored prose at
+                            // all: it is dropped here, before an `AgentText`
+                            // ever exists, rather than filtered later at
+                            // claim-selection time. It is not counted toward
+                            // `agent_texts_excluded` either -- that counter's
+                            // contract is specifically "subagent-lane prose
+                            // that existed but was not kept" (see its own
+                            // declaration below), and a harness notice is
+                            // neither agent prose nor evidence of anything a
+                            // reviewer needs disclosed as missing.
+                            if !trimmed.is_empty() && !is_harness_notice {
+                                // Subagent prose (non-main lane) is never kept:
+                                // `merge_sessions` drops every subagent
+                                // AgentText unconditionally, so pushing it here
+                                // would allocate a string that is always
+                                // thrown away. Its existence is still counted
+                                // (see `agent_texts_excluded`'s declaration)
+                                // so the exclusion is disclosed, not hidden.
+                                if default_lane == Lane::Main {
+                                    agent_texts.push(AgentText {
+                                        // `chars().take()` not `[..n]`: slicing
+                                        // a String by byte index panics if it
+                                        // lands mid-character, and prose is
+                                        // full of multi-byte characters.
+                                        text: trimmed.chars().take(AGENT_TEXT_CAP).collect(),
+                                        line_no,
+                                        session_ix: 0,
+                                    });
+                                } else {
+                                    agent_texts_excluded += 1;
+                                }
+                            }
                         }
                     }
                     _ => {}
@@ -356,6 +641,87 @@ pub fn ingest_str(raw: &str, default_lane: Lane) -> Session {
         tokens.cache_creation += u.cache_creation;
     }
 
+    // Join the two halves, scoped by the asking call's tool_use_id. An
+    // unanswered question keeps `answer: None`: the options it offered are
+    // still evidence of what was under consideration. A question that
+    // shares its exact text with another question in the SAME call also
+    // keeps `answer: None`: the call's own answers map cannot tell the two
+    // apart, so reporting a specific answer there would be a guess dressed
+    // up as quoted ground truth, exactly the fabrication this join exists
+    // to prevent.
+    let decisions: Vec<Decision> = pending_decisions
+        .into_iter()
+        .map(|(tool_use_id, ambiguous_in_call, mut d)| {
+            if !ambiguous_in_call {
+                d.answer = tool_use_id
+                    .as_ref()
+                    .and_then(|id| decision_answers.get(id))
+                    .and_then(|per_call| per_call.get(&d.question))
+                    .cloned();
+            }
+            d
+        })
+        .collect();
+
+    // Resolve task creates and updates against their paired results, in the
+    // order they were seen (see `pending_task_events`'s declaration for why
+    // order is preserved through this join). `filter_map` drops an entry
+    // rather than inventing one: an interrupted session can leave a create
+    // or update with no result line at all, and that is exactly the case
+    // where fabricating a status would be worst.
+    let task_events: Vec<TaskEvent> = pending_task_events
+        .into_iter()
+        .filter_map(|p| match p {
+            PendingTaskEvent::Create {
+                tool_use_id,
+                subject,
+                line_no,
+                lane,
+            } => {
+                // No paired result, or a result that never reports the
+                // harness-assigned id: nothing to trust as this task's
+                // identity, so no event (FIX1's "interrupted session" case).
+                let id = tool_use_id
+                    .as_deref()
+                    .and_then(|id| results.get(id))
+                    .and_then(|r| r.task_id.clone())?;
+                Some(TaskEvent {
+                    id,
+                    subject,
+                    status: "pending".to_string(),
+                    line_no,
+                    session_ix: 0,
+                    lane,
+                })
+            }
+            PendingTaskEvent::Update {
+                tool_use_id,
+                task_id,
+                requested_status,
+                subject,
+                line_no,
+                lane,
+            } => {
+                let r = tool_use_id.as_deref().and_then(|id| results.get(id))?;
+                // Anything other than an explicit `success: true` is treated
+                // as unconfirmed: a failure, or a result that omits the key
+                // entirely, is not evidence the transition happened.
+                if r.task_update_success != Some(true) {
+                    return None;
+                }
+                let status = r.task_status_change.clone().unwrap_or(requested_status);
+                Some(TaskEvent {
+                    id: task_id,
+                    subject,
+                    status,
+                    line_no,
+                    session_ix: 0,
+                    lane,
+                })
+            }
+        })
+        .collect();
+
     Session {
         actions,
         user_texts,
@@ -367,6 +733,10 @@ pub fn ingest_str(raw: &str, default_lane: Lane) -> Session {
         interrupts,
         auto_accept,
         spawns,
+        decisions,
+        task_events,
+        agent_texts,
+        agent_texts_excluded,
         // A single `ingest_str` call has no idea what its own transcript id
         // is (that lives outside the raw JSONL text it was handed), so it
         // cannot fill this in. It leaves the table empty; the merge/assembly
@@ -456,6 +826,40 @@ struct ResultInfo {
     read_total_lines: Option<usize>,
     /// The child agent's id from a subagent spawn's `toolUseResult.agentId`.
     agent_id: Option<String>,
+    /// A TaskCreate result's harness-assigned id (`toolUseResult.task.id`).
+    task_id: Option<String>,
+    /// A TaskUpdate result's `success` flag.
+    task_update_success: Option<bool>,
+    /// A TaskUpdate result's confirmed status (`toolUseResult.statusChange`),
+    /// when the result shape carries one.
+    task_status_change: Option<String>,
+}
+
+/// A `TaskCreate` or `TaskUpdate` call, staged until its paired result comes
+/// back. Kept as one enum (not two separate `Vec`s) so the join below can
+/// walk both in the single order they were seen in the transcript, matching
+/// `Session::task_events`'s "in source order" contract.
+enum PendingTaskEvent {
+    /// The call that starts a task. Its real id is not known yet: the
+    /// harness reports it only in the paired result's `task.id`.
+    Create {
+        tool_use_id: Option<String>,
+        subject: Option<String>,
+        line_no: usize,
+        lane: Lane,
+    },
+    /// A status-carrying call. `task_id` comes straight from the call's own
+    /// `taskId` input (that part was never in question); `requested_status`
+    /// is what it asked for, which the join below only trusts once the
+    /// paired result confirms it.
+    Update {
+        tool_use_id: Option<String>,
+        task_id: String,
+        requested_status: String,
+        subject: Option<String>,
+        line_no: usize,
+        lane: Lane,
+    },
 }
 
 /// Hash (tool name + raw input JSON) for the loop detector: byte-identical
@@ -726,19 +1130,421 @@ mod tests {
         );
         let s = ingest_str(raw, Lane::Main);
         assert_eq!(s.user_texts.len(), 2, "both are recorded");
-        assert!(s.user_texts[0].is_human);
-        assert!(!s.user_texts[1].is_human);
+        // `.is_human()` is the "Human or Unknown" method (review-burden's
+        // sense); a task notification is the one case that fails it because
+        // it is KNOWN non-human, not merely unattributed.
+        assert!(s.user_texts[0].is_human());
+        assert!(!s.user_texts[1].is_human());
+        assert_eq!(s.user_texts[1].origin, crate::model::TurnOrigin::NonHuman);
     }
 
     #[test]
     fn an_absent_origin_defaults_to_human() {
         // Transcripts written before the `origin` field existed must keep the
-        // old, WIDER review window: defaulting unknown to human means those
-        // turns still draw segment boundaries exactly as they always did.
+        // old, WIDER review window: defaulting unknown to human (via
+        // `.is_human()`) means those turns still draw segment boundaries
+        // exactly as they always did.
         let raw =
             r#"{"type":"user","timestamp":"2026-01-01T00:00:01Z","message":{"content":"hi"}}"#;
         let s = ingest_str(raw, Lane::Main);
         assert_eq!(s.user_texts.len(), 1);
-        assert!(s.user_texts[0].is_human, "no origin field means human");
+        assert!(s.user_texts[0].is_human(), "no origin field means human");
+    }
+
+    #[test]
+    fn an_absent_origin_is_unknown_not_explicitly_human() {
+        // DEFECT 1 regression: `.is_human()` folds Unknown into "human" for
+        // the review-burden consumer (see the test above), but the raw
+        // `origin` must stay Unknown, not Human. `context::scope()` reads
+        // this field directly, and it must be able to tell "the human said
+        // this" apart from "we don't know who said this" so it never quotes
+        // the latter as intent.
+        let raw =
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:01Z","message":{"content":"hi"}}"#;
+        let s = ingest_str(raw, Lane::Main);
+        assert_eq!(s.user_texts[0].origin, crate::model::TurnOrigin::Unknown);
+    }
+
+    #[test]
+    fn ask_user_question_is_captured_with_its_answer() {
+        // A recorded decision is the highest-value item in the review payload:
+        // it is the human's explicit choice AND the options it beat. Both halves
+        // live on different lines (the call, then the result), joined by
+        // tool_use id, exactly like structuredPatch already is.
+        let call = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"tool_use","id":"q1","name":"AskUserQuestion","input":{"questions":[{"question":"Which store?","header":"Store","options":[{"label":"SQLite"},{"label":"JSONL"}]}]}}]}}"#;
+        let result = r#"{"type":"user","timestamp":"2026-01-01T00:00:05Z","message":{"content":[{"type":"tool_result","tool_use_id":"q1"}]},"toolUseResult":{"answers":{"Which store?":"JSONL"}}}"#;
+        let s = ingest_str(&format!("{call}\n{result}"), Lane::Main);
+
+        assert_eq!(s.decisions.len(), 1, "one recorded decision");
+        let d = &s.decisions[0];
+        assert_eq!(d.question, "Which store?");
+        assert_eq!(d.options, vec!["SQLite".to_string(), "JSONL".to_string()]);
+        assert_eq!(d.answer.as_deref(), Some("JSONL"));
+    }
+
+    #[test]
+    fn an_other_answer_is_kept_verbatim_not_matched_to_an_option() {
+        // The user can answer "Other" with free text that matches no option.
+        // Quoting is the whole point of this design, so the free text must
+        // survive intact rather than being dropped for failing to match.
+        let call = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"tool_use","id":"q1","name":"AskUserQuestion","input":{"questions":[{"question":"Which store?","options":[{"label":"SQLite"}]}]}}]}}"#;
+        let result = r#"{"type":"user","timestamp":"2026-01-01T00:00:05Z","message":{"content":[{"type":"tool_result","tool_use_id":"q1"}]},"toolUseResult":{"answers":{"Which store?":"neither, keep it in memory"}}}"#;
+        let s = ingest_str(&format!("{call}\n{result}"), Lane::Main);
+
+        assert_eq!(
+            s.decisions[0].answer.as_deref(),
+            Some("neither, keep it in memory")
+        );
+    }
+
+    #[test]
+    fn an_unanswered_question_is_still_recorded() {
+        // An interrupted session can leave a question with no result line. The
+        // question and its options are still evidence of what was under
+        // consideration, so the entry is kept with answer: None rather than
+        // dropped.
+        let call = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"tool_use","id":"q1","name":"AskUserQuestion","input":{"questions":[{"question":"Which store?","options":[{"label":"SQLite"}]}]}}]}}"#;
+        let s = ingest_str(call, Lane::Main);
+
+        assert_eq!(s.decisions.len(), 1);
+        assert_eq!(s.decisions[0].answer, None);
+    }
+
+    #[test]
+    fn same_question_text_twice_in_one_session_gets_its_own_answer_each_time() {
+        // Regression for a fabrication bug: decision_answers used to be keyed
+        // by question text ALONE across the whole session, so a second call
+        // asking the identically-worded question overwrote the first call's
+        // answer in the shared map, and BOTH decisions reported the later
+        // answer. The join must be scoped by the asking call's tool_use_id
+        // so each call's answer stays its own.
+        let call1 = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"tool_use","id":"q1","name":"AskUserQuestion","input":{"questions":[{"question":"Which store?","options":[{"label":"SQLite"},{"label":"JSONL"}]}]}}]}}"#;
+        let result1 = r#"{"type":"user","timestamp":"2026-01-01T00:00:05Z","message":{"content":[{"type":"tool_result","tool_use_id":"q1"}]},"toolUseResult":{"answers":{"Which store?":"JSONL"}}}"#;
+        let call2 = r#"{"type":"assistant","timestamp":"2026-01-01T00:10:00Z","message":{"content":[{"type":"tool_use","id":"q2","name":"AskUserQuestion","input":{"questions":[{"question":"Which store?","options":[{"label":"SQLite"},{"label":"JSONL"}]}]}}]}}"#;
+        let result2 = r#"{"type":"user","timestamp":"2026-01-01T00:10:05Z","message":{"content":[{"type":"tool_result","tool_use_id":"q2"}]},"toolUseResult":{"answers":{"Which store?":"SQLite"}}}"#;
+        let raw = format!("{call1}\n{result1}\n{call2}\n{result2}");
+        let s = ingest_str(&raw, Lane::Main);
+
+        assert_eq!(s.decisions.len(), 2, "both decisions recorded");
+        assert_eq!(
+            s.decisions[0].answer.as_deref(),
+            Some("JSONL"),
+            "first call's own answer, not the second call's"
+        );
+        assert_eq!(
+            s.decisions[1].answer.as_deref(),
+            Some("SQLite"),
+            "second call's own answer, not the first call's"
+        );
+    }
+
+    #[test]
+    fn task_events_record_creation_and_final_status() {
+        // Unfinished work is invisible in a diff: a task created and never
+        // completed means the commit is partial, and no reviewer can tell that
+        // from the code.
+        let create = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"tool_use","id":"t1","name":"TaskCreate","input":{"subject":"Wire the cache"}}]}}"#;
+        let create_result = r#"{"type":"user","timestamp":"2026-01-01T00:00:01Z","message":{"content":[{"type":"tool_result","tool_use_id":"t1"}]},"toolUseResult":{"task":{"id":"1","subject":"Wire the cache"}}}"#;
+        let update = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:10Z","message":{"content":[{"type":"tool_use","id":"t2","name":"TaskUpdate","input":{"taskId":"1","status":"in_progress"}}]}}"#;
+        let update_result = r#"{"type":"user","timestamp":"2026-01-01T00:00:11Z","message":{"content":[{"type":"tool_result","tool_use_id":"t2"}]},"toolUseResult":{"success":true,"taskId":"1","statusChange":"in_progress"}}"#;
+        let s = ingest_str(
+            &format!("{create}\n{create_result}\n{update}\n{update_result}"),
+            Lane::Main,
+        );
+
+        assert_eq!(s.task_events.len(), 2);
+        assert_eq!(s.task_events[0].subject.as_deref(), Some("Wire the cache"));
+        assert_eq!(
+            s.task_events[0].status, "pending",
+            "a create starts pending"
+        );
+        assert_eq!(s.task_events[0].id, "1", "id comes from the result");
+        assert_eq!(s.task_events[1].id, "1");
+        assert_eq!(s.task_events[1].status, "in_progress");
+    }
+
+    #[test]
+    fn a_task_update_without_a_status_is_ignored() {
+        // TaskUpdate also renames and reassigns. Only status transitions are
+        // lifecycle events; a rename is not evidence of anything unfinished.
+        let update = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:10Z","message":{"content":[{"type":"tool_use","id":"t2","name":"TaskUpdate","input":{"taskId":"1","subject":"Renamed"}}]}}"#;
+        let s = ingest_str(update, Lane::Main);
+
+        assert!(s.task_events.is_empty());
+    }
+
+    #[test]
+    fn a_task_create_takes_its_id_from_the_result_not_appearance_order() {
+        // The old code numbered creates 1..N in the order they appeared,
+        // assuming the harness numbers them identically. Real transcripts
+        // don't guarantee that (a task from an earlier, since-cleared list
+        // can leave the counter ahead), so the first create appearing here
+        // deliberately reports an id that is NOT "1".
+        let create = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"tool_use","id":"t1","name":"TaskCreate","input":{"subject":"Commit untracked VGGT scripts"}}]}}"#;
+        let create_result = r#"{"type":"user","timestamp":"2026-01-01T00:00:01Z","message":{"content":[{"type":"tool_result","tool_use_id":"t1"}]},"toolUseResult":{"task":{"id":"7","subject":"Commit untracked VGGT scripts"}}}"#;
+        let s = ingest_str(&format!("{create}\n{create_result}"), Lane::Main);
+
+        assert_eq!(s.task_events.len(), 1);
+        assert_eq!(
+            s.task_events[0].id, "7",
+            "the reported id, not the 1st-appearance position"
+        );
+    }
+
+    #[test]
+    fn a_task_create_with_no_paired_result_produces_no_event() {
+        // An interrupted session can leave a TaskCreate with no result line.
+        // With no result there is no real id to report, and inventing one
+        // (the old synthetic counter's behaviour) would be a fabrication.
+        let create = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"tool_use","id":"t1","name":"TaskCreate","input":{"subject":"Wire the cache"}}]}}"#;
+        let s = ingest_str(create, Lane::Main);
+
+        assert!(s.task_events.is_empty());
+    }
+
+    #[test]
+    fn a_task_update_whose_result_reports_failure_produces_no_event() {
+        // A failed update that requested "completed" must not be recorded as
+        // completed: that would hide genuinely unfinished work in exactly
+        // the block whose value is reporting it honestly.
+        let update = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:10Z","message":{"content":[{"type":"tool_use","id":"t2","name":"TaskUpdate","input":{"taskId":"1","status":"completed"}}]}}"#;
+        let update_result = r#"{"type":"user","timestamp":"2026-01-01T00:00:11Z","message":{"content":[{"type":"tool_result","tool_use_id":"t2"}]},"toolUseResult":{"success":false,"taskId":"1"}}"#;
+        let s = ingest_str(&format!("{update}\n{update_result}"), Lane::Main);
+
+        assert!(s.task_events.is_empty());
+    }
+
+    #[test]
+    fn a_task_update_result_with_status_change_uses_the_confirmed_status() {
+        // The result's `statusChange` is authoritative over the requested
+        // status: here the update asks for "completed" but the result
+        // confirms only "blocked" (e.g. an unmet dependency), and the
+        // recorded event must reflect what actually happened.
+        let update = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:10Z","message":{"content":[{"type":"tool_use","id":"t2","name":"TaskUpdate","input":{"taskId":"1","status":"completed"}}]}}"#;
+        let update_result = r#"{"type":"user","timestamp":"2026-01-01T00:00:11Z","message":{"content":[{"type":"tool_result","tool_use_id":"t2"}]},"toolUseResult":{"success":true,"taskId":"1","statusChange":"blocked"}}"#;
+        let s = ingest_str(&format!("{update}\n{update_result}"), Lane::Main);
+
+        assert_eq!(s.task_events.len(), 1);
+        assert_eq!(
+            s.task_events[0].status, "blocked",
+            "the confirmed status, not the requested one"
+        );
+    }
+
+    #[test]
+    fn a_task_update_result_without_status_change_falls_back_to_requested_status() {
+        // One measured real case carried `success` but no `statusChange`
+        // (an older result shape). `success: true` with nothing to override
+        // it is still a confirmation, so the requested status stands.
+        let update = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:10Z","message":{"content":[{"type":"tool_use","id":"t2","name":"TaskUpdate","input":{"taskId":"1","status":"in_progress"}}]}}"#;
+        let update_result = r#"{"type":"user","timestamp":"2026-01-01T00:00:11Z","message":{"content":[{"type":"tool_result","tool_use_id":"t2"}]},"toolUseResult":{"success":true,"taskId":"1"}}"#;
+        let s = ingest_str(&format!("{update}\n{update_result}"), Lane::Main);
+
+        assert_eq!(s.task_events.len(), 1);
+        assert_eq!(s.task_events[0].status, "in_progress");
+    }
+
+    #[test]
+    fn every_non_empty_agent_prose_block_is_captured() {
+        // No length filter here on purpose: selecting which prose is a claim is
+        // Task 8's job, using the spec's rule (last block before a human turn).
+        // Measurement showed length is a bad proxy, so ingest makes no judgment
+        // and keeps everything with text in it.
+        let long = "x".repeat(100);
+        let line = format!(
+            r#"{{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{{"content":[{{"type":"text","text":"{long}"}},{{"type":"text","text":"ok"}},{{"type":"text","text":"   "}}]}}}}"#
+        );
+        let s = ingest_str(&line, Lane::Main);
+
+        assert_eq!(
+            s.agent_texts.len(),
+            2,
+            "both blocks with text, not the blank"
+        );
+        assert_eq!(s.agent_texts[0].text.chars().count(), 100);
+        assert_eq!(s.agent_texts[1].text, "ok");
+    }
+
+    #[test]
+    fn a_runaway_prose_block_is_capped() {
+        use crate::ingest::AGENT_TEXT_CAP;
+        // One block must not be able to dominate memory. The cap is on the
+        // stored copy only; nothing downstream counts characters for a metric,
+        // so truncation here cannot skew a number the way EDIT_CAP would have.
+        let huge = "y".repeat(AGENT_TEXT_CAP + 500);
+        let line = format!(
+            r#"{{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{{"content":[{{"type":"text","text":"{huge}"}}]}}}}"#
+        );
+        let s = ingest_str(&line, Lane::Main);
+
+        assert_eq!(s.agent_texts[0].text.chars().count(), AGENT_TEXT_CAP);
+    }
+
+    #[test]
+    fn a_subagent_lanes_prose_is_not_retained_but_is_counted_as_excluded() {
+        // merge_sessions drops every subagent AgentText unconditionally, so
+        // keeping it here at ingest time would only allocate a string that is
+        // always thrown away. Its existence must still be disclosed: the
+        // count survives even though the text does not.
+        let line = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"text","text":"I refactored the parser to handle the new shape."}]}}"#;
+        let s = ingest_str(line, Lane::Sub("x".into()));
+
+        assert!(
+            s.agent_texts.is_empty(),
+            "subagent prose must not be retained"
+        );
+        assert_eq!(
+            s.agent_texts_excluded, 1,
+            "but its existence must be counted"
+        );
+    }
+
+    #[test]
+    fn leading_whitespace_past_the_cap_still_stores_the_real_text() {
+        // A block can carry more leading whitespace than AGENT_TEXT_CAP,
+        // followed by real prose. Capping the raw string BEFORE trimming
+        // would keep only whitespace (the real text sits past the cut),
+        // which would pass the old "is this blank" check on the full string
+        // while storing a blank block. Trimming first means what's stored is
+        // what was validated as non-empty.
+        let padding = " ".repeat(AGENT_TEXT_CAP + 500);
+        let text = format!("{padding}real claim here");
+        let line = format!(
+            r#"{{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{{"content":[{{"type":"text","text":"{text}"}}]}}}}"#
+        );
+        let s = ingest_str(&line, Lane::Main);
+
+        assert_eq!(s.agent_texts.len(), 1);
+        assert_eq!(
+            s.agent_texts[0].text, "real claim here",
+            "the trimmed real text must be stored, not a capped run of blanks"
+        );
+    }
+
+    #[test]
+    fn unicode_whitespace_only_block_is_still_skipped() {
+        // U+3000 (ideographic space) is Unicode whitespace, not ASCII, so an
+        // ASCII-only blank check would wrongly keep this block. `str::trim`
+        // uses Unicode `White_Space`, which does cover it.
+        let line = "{\"type\":\"assistant\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"\u{3000}\u{3000}\u{3000}\"}]}}";
+        let s = ingest_str(line, Lane::Main);
+
+        assert!(
+            s.agent_texts.is_empty(),
+            "Unicode-whitespace-only block must be skipped, not stored"
+        );
+        assert_eq!(
+            s.agent_texts_excluded, 0,
+            "skipped on the main lane, not excluded (exclusion is a non-main-lane count)"
+        );
+    }
+
+    /// Builds two consecutive assistant lines: a genuine prose block, then a
+    /// harness notice with the given fields (any absent marker is passed as
+    /// `None`/`false`, matching the "No response requested." shape which
+    /// carries none of `isApiErrorMessage`/`error`).
+    fn genuine_then_notice(
+        notice_text: &str,
+        model: &str,
+        is_api_error_message: Option<bool>,
+        error: Option<&str>,
+    ) -> String {
+        let genuine = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"model":"claude-fable-5","content":[{"type":"text","text":"Ran the migration and the tests pass."}]}}"#.to_string();
+        let is_api_error_message_field = match is_api_error_message {
+            Some(b) => format!(r#","isApiErrorMessage":{b}"#),
+            None => String::new(),
+        };
+        let error_field = match error {
+            Some(e) => format!(r#","error":"{e}""#),
+            None => String::new(),
+        };
+        let notice = format!(
+            r#"{{"type":"assistant","timestamp":"2026-01-01T00:00:01Z","message":{{"model":"{model}","content":[{{"type":"text","text":"{notice_text}"}}]}}{is_api_error_message_field}{error_field}}}"#
+        );
+        format!("{genuine}\n{notice}")
+    }
+
+    /// Asserts a harness notice built by `genuine_then_notice` neither
+    /// becomes a claim itself (it never even becomes an `AgentText`) NOR
+    /// displaces the genuine block that came before it.
+    fn assert_notice_excluded_and_genuine_survives(raw: &str) {
+        let s = ingest_str(raw, Lane::Main);
+        assert_eq!(
+            s.agent_texts.len(),
+            1,
+            "the notice must not become an AgentText at all"
+        );
+        assert_eq!(
+            s.agent_texts[0].text, "Ran the migration and the tests pass.",
+            "the genuine block must survive as the last (and only) prose block"
+        );
+    }
+
+    #[test]
+    fn a_connection_closed_notice_is_not_agent_prose() {
+        // DEFECT 1 regression (the case reproduced live): the FIRST claim a
+        // real run returned was this exact notice text.
+        let raw = genuine_then_notice(
+            "API Error: Connection closed mid-response. The response above may be incomplete.",
+            "<synthetic>",
+            Some(true),
+            Some("server_error"),
+        );
+        assert_notice_excluded_and_genuine_survives(&raw);
+    }
+
+    #[test]
+    fn a_529_overload_notice_is_not_agent_prose() {
+        let raw = genuine_then_notice(
+            "API Error: 529 Overloaded. This is a server-side issue, usually temporary, try again in a moment.",
+            "<synthetic>",
+            Some(true),
+            Some("server_error"),
+        );
+        assert_notice_excluded_and_genuine_survives(&raw);
+    }
+
+    #[test]
+    fn a_spend_limit_notice_is_not_agent_prose() {
+        let raw = genuine_then_notice(
+            "You've hit your monthly spend limit. Run /usage-credits to manage your limit.",
+            "<synthetic>",
+            Some(true),
+            Some("rate_limit"),
+        );
+        assert_notice_excluded_and_genuine_survives(&raw);
+    }
+
+    #[test]
+    fn a_no_response_requested_notice_is_not_agent_prose() {
+        // The one case with neither `isApiErrorMessage: true` nor an `error`
+        // field: `message.model == "<synthetic>"` is the only marker that
+        // catches it, which is why `model` must be checked, not just offered
+        // as one option among the three.
+        let raw = genuine_then_notice("No response requested.", "<synthetic>", Some(false), None);
+        assert_notice_excluded_and_genuine_survives(&raw);
+    }
+
+    #[test]
+    fn two_identical_questions_in_one_call_both_resolve_to_none() {
+        // One AskUserQuestion call can carry several questions. If two of
+        // them share identical text, the transcript's own `answers` map
+        // (keyed by question text) has room for only one entry, so there is
+        // no way to tell which decision it belongs to. Guessing would hand
+        // both decisions the same fabricated answer, exactly the failure
+        // mode this fix exists to prevent, so both must stay `None`.
+        let call = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"tool_use","id":"q1","name":"AskUserQuestion","input":{"questions":[{"question":"Which store?","options":[{"label":"SQLite"}]},{"question":"Which store?","options":[{"label":"JSONL"}]}]}}]}}"#;
+        let result = r#"{"type":"user","timestamp":"2026-01-01T00:00:05Z","message":{"content":[{"type":"tool_result","tool_use_id":"q1"}]},"toolUseResult":{"answers":{"Which store?":"JSONL"}}}"#;
+        let s = ingest_str(&format!("{call}\n{result}"), Lane::Main);
+
+        assert_eq!(s.decisions.len(), 2, "both questions still recorded");
+        assert_eq!(
+            s.decisions[0].answer, None,
+            "ambiguous within the call: no guessing"
+        );
+        assert_eq!(
+            s.decisions[1].answer, None,
+            "ambiguous within the call: no guessing"
+        );
     }
 }

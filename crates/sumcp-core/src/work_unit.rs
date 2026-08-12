@@ -2,6 +2,7 @@
 //! work. See `docs/superpowers/specs/2026-07-28-v02-measurement-fidelity-design.md`.
 
 use crate::locate::{TranscriptSpan, is_agent_jsonl, transcript_span};
+use crate::model::Action;
 use std::path::{Path, PathBuf};
 
 /// The idle gap that separates two stretches of work, in seconds.
@@ -119,7 +120,7 @@ fn secs_between(a: &str, b: &str) -> Option<i64> {
 /// into whole eras plus a remainder ("year of era", `yoe`, 0..=399) lets the
 /// leap-year corrections (`/4`, `/100`) be done once per era with plain
 /// integer division, instead of needing a lookup table or a loop.
-fn to_epoch_secs(ts: &str) -> Option<i64> {
+pub(crate) fn to_epoch_secs(ts: &str) -> Option<i64> {
     let b = ts.as_bytes();
     if b.len() < 19 || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' {
         return None;
@@ -153,6 +154,36 @@ fn to_epoch_secs(ts: &str) -> Option<i64> {
     // Unix epoch.
     let days = era * 146_097 + doe - 719_468;
     Some(days * 86_400 + hh * 3_600 + mm * 60 + ss)
+}
+
+/// A session's own time span, as Unix epoch seconds: the earliest and latest
+/// `effective_ts` across `actions`.
+///
+/// `None` if `actions` is empty, or if every `effective_ts` in it fails to
+/// parse (can't-happen for a session ingest actually produced, since
+/// `effective_ts` is always written from a value that parsed cleanly, but
+/// this function does not assume that and does not panic either way).
+///
+/// This is a small public helper rather than promoting `to_epoch_secs` itself
+/// to `pub`: the one thing a caller outside this crate genuinely needs is
+/// "what epoch span did this session cover", and handing back just that
+/// keeps the crate's public surface to one function instead of also
+/// exporting the raw RFC 3339 parser, which carries its own documented sharp
+/// edge (string comparison of two differently-formatted timestamps is not a
+/// time comparison) that a caller doing its own arithmetic on the bare
+/// converter could reintroduce.
+pub fn session_epoch_span(actions: &[Action]) -> Option<(i64, i64)> {
+    let mut span: Option<(i64, i64)> = None;
+    for t in actions
+        .iter()
+        .filter_map(|a| to_epoch_secs(&a.effective_ts))
+    {
+        span = Some(match span {
+            Some((lo, hi)) => (lo.min(t), hi.max(t)),
+            None => (t, t),
+        });
+    }
+    span
 }
 
 /// Group transcripts into work units.
@@ -378,6 +409,42 @@ pub fn discover_work_unit(main_path: &Path) -> WorkUnit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn action_at(ts: &str) -> Action {
+        Action {
+            effective_ts: ts.to_string(),
+            ..Action::default()
+        }
+    }
+
+    #[test]
+    fn session_epoch_span_is_none_for_no_actions() {
+        assert_eq!(session_epoch_span(&[]), None);
+    }
+
+    #[test]
+    fn session_epoch_span_is_min_and_max_of_effective_ts() {
+        let actions = vec![
+            action_at("2026-01-02T00:00:00Z"),
+            action_at("2026-01-01T00:00:00Z"),
+            action_at("2026-01-03T00:00:00Z"),
+        ];
+        let first = to_epoch_secs("2026-01-01T00:00:00Z").unwrap();
+        let last = to_epoch_secs("2026-01-03T00:00:00Z").unwrap();
+        assert_eq!(session_epoch_span(&actions), Some((first, last)));
+    }
+
+    #[test]
+    fn session_epoch_span_skips_unparseable_timestamps_rather_than_failing() {
+        // A single malformed `effective_ts` must not blank out the whole
+        // span; the good timestamps around it still say something real.
+        let actions = vec![
+            action_at("not-a-timestamp"),
+            action_at("2026-01-01T00:00:00Z"),
+        ];
+        let only = to_epoch_secs("2026-01-01T00:00:00Z").unwrap();
+        assert_eq!(session_epoch_span(&actions), Some((only, only)));
+    }
 
     /// Build a Member with a synthetic path and a span of two timestamps.
     fn m(name: &str, first: &str, last: &str) -> Member {

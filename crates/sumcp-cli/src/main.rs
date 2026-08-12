@@ -15,7 +15,9 @@ mod install;
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use sumcp_core::payloads::{SessionMeta, session_overview, unit_meta_from};
+use sumcp_core::payloads::{
+    SessionMeta, review_context, session_intent, session_overview, unit_meta_from,
+};
 use sumcp_core::score::rank;
 
 /// Post-session forensics for Claude Code sessions.
@@ -58,6 +60,37 @@ enum Command {
         /// Actually perform the removals (default is a dry-run preview).
         #[arg(long)]
         apply: bool,
+    },
+    /// Print the recorded-session-context payload for a reviewing agent:
+    /// the same data the MCP `review_context` / `session_intent` tools
+    /// serve, for a reviewer with no MCP wiring. This is the one entry
+    /// point that can genuinely resolve a commit range into a time window,
+    /// because it is the one that knows the working directory to run git
+    /// in; the MCP server has no repo path and deliberately has no range
+    /// parameter at all.
+    Context {
+        /// Path to a transcript `.jsonl` to analyze. Defaults to the most
+        /// recent session of the current directory's project, exactly like
+        /// bare `sumcp` (both go through the same target resolution, so
+        /// they never disagree about what "this session" means).
+        #[arg(long)]
+        file: Option<PathBuf>,
+        /// A git revision range (e.g. `HEAD~3..HEAD`), resolved with `git`
+        /// run in the current directory, and used as a scope GUARD on the
+        /// session picked above: if the session's own time span does not
+        /// overlap the range's commit window, this is a hard error and
+        /// nothing is printed to stdout. An unresolvable range is likewise a
+        /// hard error. This does not filter the session's contents down to
+        /// the overlapping part; the payload always covers the whole
+        /// session. Answering about the wrong session is the exact failure
+        /// this feature exists to prevent.
+        #[arg(long)]
+        range: Option<String>,
+        /// Emit the `session_intent` payload (what the human asked for)
+        /// instead of the default `review_context` payload (what actually
+        /// happened).
+        #[arg(long)]
+        intent: bool,
     },
 }
 
@@ -152,7 +185,15 @@ fn claude_home_from(override_dir: Option<PathBuf>, home: Option<PathBuf>) -> Opt
 fn main() -> ExitCode {
     let args = Args::parse();
 
-    // Subcommands (the write path) short-circuit the analysis flow.
+    // These two lookups can fail (an environment with no `$HOME`, a deleted
+    // cwd); `resolve_target` decides whether that actually mattered, since
+    // `--file` and `--work-unit` both need neither. Computed up front (not
+    // just below the subcommand dispatch) because `Context` needs them too.
+    let home = claude_home();
+    let cwd = std::env::current_dir().ok();
+
+    // Subcommands (the write path, plus `Context`) short-circuit the
+    // analysis flow.
     match args.command {
         Some(Command::Install { apply }) => {
             return match install::cmd_install(apply) {
@@ -172,14 +213,16 @@ fn main() -> ExitCode {
                 }
             };
         }
+        Some(Command::Context {
+            file,
+            range,
+            intent,
+        }) => {
+            return cmd_context(file, range, intent, home.as_deref(), cwd.as_deref());
+        }
         None => {}
     }
 
-    // These two lookups can fail (an environment with no `$HOME`, a deleted
-    // cwd); `resolve_target` decides whether that actually mattered, since
-    // `--file` and `--work-unit` both need neither.
-    let home = claude_home();
-    let cwd = std::env::current_dir().ok();
     // `--file` and `--work-unit` conflict (clap enforces it, see `Args`), so
     // at most one of these is `Some`. `resolve_target` only decides the
     // PATH; which of the two scopes below reads that path is decided just
@@ -334,6 +377,221 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// `sumcp context`: print the recorded-session-context payload (the same
+/// `review_context` / `session_intent` data the MCP tools serve) for a
+/// reviewer with no MCP wiring. Target resolution goes through
+/// [`resolve_target`], the exact function bare `sumcp` uses, so the two
+/// paths never disagree about what "this session" means.
+///
+/// A `--range` is resolved into a Unix-epoch time window (`git::range_window`)
+/// and used as a SCOPE GUARD, not a filter: once the session is loaded, its
+/// own epoch span (earliest/latest `effective_ts`, via
+/// `work_unit::session_epoch_span`) is checked for overlap against the
+/// window, and a session that does not overlap is a hard error with nothing
+/// on stdout. This is deliberately not action-level filtering of the
+/// session's contents down to the overlapping part; the commit-to-session
+/// mapping semantics that would require are an open design question (see
+/// `docs/superpowers/specs/2026-08-10-review-context-design.md`), not
+/// something to invent inside a bug fix. When the session does overlap, the
+/// payload printed still covers the WHOLE session, and stderr says so
+/// explicitly so a reader cannot mistake "overlaps" for "filtered to".
+///
+/// Both bounds this compares are epoch seconds, never formatted timestamp
+/// strings: git emits local time with a UTC offset and transcripts emit UTC
+/// with milliseconds, so lexical string comparison across the two is not a
+/// time comparison at all (see `git::range_window`'s doc comment).
+///
+/// An unresolvable range is still a hard error, never a silent fall back to
+/// reporting the whole session: reporting context from the wrong session is
+/// the precise failure this feature exists to prevent, and `range_window`
+/// already errors rather than guessing, so this function must not undo that
+/// by papering over the failure.
+/// Whether a session's own epoch span (`[start, end]`, both ends included:
+/// the session was genuinely running at either instant) overlaps a
+/// `--range` window (`(start, end]`, half-open per `git::range_window`'s
+/// doc comment: it opens the instant the PREVIOUS commit landed and closes
+/// the instant the range's own last commit landed).
+///
+/// Two conditions, both required: the session must still have been going
+/// strictly AFTER the window opened (`s_end > w_start`; touching the open
+/// start instant exactly does not count), and must have started at or
+/// before the window closed (`s_start <= w_end`; touching the closed end
+/// instant exactly does count).
+fn window_overlaps_session(window: (i64, i64), session: (i64, i64)) -> bool {
+    let (w_start, w_end) = window;
+    let (s_start, s_end) = session;
+    s_end > w_start && s_start <= w_end
+}
+
+fn cmd_context(
+    file: Option<PathBuf>,
+    range: Option<String>,
+    intent: bool,
+    home: Option<&Path>,
+    cwd: Option<&Path>,
+) -> ExitCode {
+    // Captured before `file` moves into `resolve_target`: it decides below
+    // whether the named transcript stays single-transcript (explicit path,
+    // explicit scope) or is read as its whole work unit (no path named, so
+    // "this session" means the same stretch of work bare `sumcp` reports).
+    let explicit_file = file.is_some();
+    let target = match resolve_target(file, home, cwd) {
+        Ok(t) => t,
+        Err(why) => {
+            match why {
+                NoTarget::NowhereToLook => {
+                    eprintln!("sumcp: cannot tell which project this is (no HOME, or the current");
+                    eprintln!("       directory is unreadable).");
+                }
+                NoTarget::NoSessions(searched) => {
+                    eprintln!("sumcp: no Claude Code sessions found for this project.");
+                    if let Some(cwd) = cwd {
+                        eprintln!("  cwd:      {}", cwd.display());
+                    }
+                    eprintln!("  searched: {}", searched.display());
+                    eprintln!("Claude Code stores transcripts per project directory, so run sumcp");
+                    eprintln!("from the directory you launched Claude Code in.");
+                }
+            }
+            eprintln!("To analyze a specific transcript instead:");
+            eprintln!("  sumcp context --file <transcript.jsonl> [--intent]");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // A bad range is a hard error rather than a silent full-session answer
+    // (see this function's doc comment). Resolved here, before the session
+    // even loads, so a bad range fails fast with nothing on stdout. The
+    // window itself is held onto rather than acted on yet: whether it is a
+    // GUARD that passes or fails can only be known once the session below
+    // has loaded and its own epoch span is known.
+    let window: Option<(i64, i64)> = match range.as_deref() {
+        Some(r) => {
+            let Some(dir) = cwd else {
+                eprintln!(
+                    "sumcp: --range needs a readable current directory to run git in, and none was found"
+                );
+                return ExitCode::FAILURE;
+            };
+            match sumcp_core::git::range_window(dir, r) {
+                Ok(w) => Some(w),
+                Err(e) => {
+                    eprintln!("sumcp: could not resolve range '{r}': {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        None => None,
+    };
+
+    // The user never named this file, so say which session we picked. Goes
+    // to stderr on purpose: stdout must stay pipeable JSON.
+    if target.identified_by == "cli_latest" {
+        eprintln!(
+            "sumcp: analyzing most recent session {} ({})",
+            stem_id(&target.path),
+            target.path.display()
+        );
+    }
+
+    // Mirrors the default path's own explicit-vs-whole-unit split (see
+    // `main`, above): an explicit `--file` stays single-transcript, and
+    // everything else reads the whole work unit.
+    let (session, unit_meta) = if explicit_file {
+        let assembled = match sumcp_core::assemble::load_session(
+            &target.path,
+            sumcp_core::assemble::MAX_TRANSCRIPT_BYTES,
+        ) {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("sumcp: could not read {}: {e}", target.path.display());
+                return ExitCode::FAILURE;
+            }
+        };
+        let unit = sumcp_core::work_unit::discover_work_unit(&target.path);
+        if unit.members.len() > 1 {
+            let at = unit
+                .members
+                .iter()
+                .position(|m| m.path == target.path)
+                .map(|i| i + 1)
+                .unwrap_or(1);
+            eprintln!(
+                "note: this transcript is {at} of {} in a work unit; sumcp context stays \
+                 single-transcript for an explicit --file",
+                unit.members.len()
+            );
+        }
+        (assembled.session, None)
+    } else {
+        let assembled = match sumcp_core::assemble::load_work_unit(
+            &target.path,
+            sumcp_core::assemble::MAX_TRANSCRIPT_BYTES,
+        ) {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("sumcp: could not read {}: {e}", target.path.display());
+                return ExitCode::FAILURE;
+            }
+        };
+        let meta = unit_meta_from(&assembled);
+        (assembled.session, meta)
+    };
+
+    // The range guard: only reachable when `--range` was given, in which
+    // case `window` is always `Some` (an unresolvable range already
+    // returned above). A session that does not overlap the window, or whose
+    // span cannot even be determined, is a hard error with nothing on
+    // stdout: the same "wrong session" failure an unresolvable range
+    // guards against, just discovered one step later. A session that does
+    // overlap proceeds, but the note on stderr says plainly that overlap is
+    // all that was checked: the payload still covers the whole session.
+    if let Some(r) = range.as_deref() {
+        let (w_start, w_end) =
+            window.expect("Some(range) implies window was resolved above, or we already returned");
+        let session_id = stem_id(&target.path);
+        let Some((s_start, s_end)) = sumcp_core::work_unit::session_epoch_span(&session.actions)
+        else {
+            eprintln!(
+                "sumcp: session {session_id} has no timestamped actions, so whether it overlaps \
+                 range {r} cannot be verified. Nothing printed: an unverifiable scope is treated \
+                 the same as a wrong one."
+            );
+            return ExitCode::FAILURE;
+        };
+        if !window_overlaps_session((w_start, w_end), (s_start, s_end)) {
+            eprintln!(
+                "sumcp: session {session_id} spans epoch [{s_start}, {s_end}], which does not \
+                 overlap range {r}'s window (strictly after epoch {w_start}, up to and including \
+                 epoch {w_end}). Nothing printed: reporting context from a session outside the \
+                 requested range is the exact failure this feature exists to prevent."
+            );
+            return ExitCode::FAILURE;
+        }
+        eprintln!(
+            "sumcp: session {session_id} (epoch [{s_start}, {s_end}]) overlaps range {r}'s window \
+             (epoch ({w_start}, {w_end}]). This confirms only that overlap: the payload below \
+             still covers the WHOLE session, not filtered down to the overlapping part."
+        );
+    }
+
+    let meta = SessionMeta {
+        id: stem_id(&target.path),
+        identified_by: target.identified_by.into(),
+        unit: unit_meta,
+    };
+    let payload = if intent {
+        session_intent(&session, &meta, None)
+    } else {
+        review_context(&session, &meta)
+    };
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&payload).unwrap_or_default()
+    );
+    ExitCode::SUCCESS
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -422,5 +680,39 @@ mod tests {
             Some(PathBuf::from("/Users/dev/.claude"))
         );
         assert_eq!(claude_home_from(None, None), None);
+    }
+
+    #[test]
+    fn a_session_entirely_before_the_window_does_not_overlap() {
+        assert!(!window_overlaps_session((100, 200), (0, 50)));
+    }
+
+    #[test]
+    fn a_session_entirely_after_the_window_does_not_overlap() {
+        assert!(!window_overlaps_session((100, 200), (250, 300)));
+    }
+
+    #[test]
+    fn a_session_spanning_the_whole_window_overlaps() {
+        assert!(window_overlaps_session((100, 200), (0, 300)));
+    }
+
+    #[test]
+    fn touching_only_the_windows_open_start_instant_does_not_overlap() {
+        // The window is (start, end]: open at the start. A session whose
+        // entire span is that one instant was not itself happening AFTER
+        // the window opened, so this must not count as overlap. This is
+        // the boundary the whole half-open/closed distinction exists for;
+        // flipping `>` to `>=` in `window_overlaps_session` would make this
+        // test fail.
+        assert!(!window_overlaps_session((100, 200), (100, 100)));
+    }
+
+    #[test]
+    fn touching_only_the_windows_closed_end_instant_does_overlap() {
+        // The window is (start, end]: closed at the end. A session whose
+        // entire span is that one instant DOES count as overlap. Flipping
+        // `<=` to `<` in `window_overlaps_session` would make this fail.
+        assert!(window_overlaps_session((100, 200), (200, 200)));
     }
 }

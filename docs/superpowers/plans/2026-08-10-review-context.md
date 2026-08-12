@@ -17,7 +17,7 @@
 - **No I/O below `ingest`** (ADR A2). The `context` module is pure: `&Session -> struct`. The `git` module is the one exception and lives in the CLI/MCP boundary layer, never called from a signal.
 - **Every payload is token-capped** via the existing `shrink_to_fit(cap, start, build)` helper in `payloads.rs`, and every capped payload sets `"truncated": true` when it dropped anything.
 - **Every extracted item carries `idxs`** (action indices) or `line_no` so `evidence()` can dereference it. An item with no citation path is a plan violation.
-- **`exact: false` requires a `note`.** The repo's `Finding` invariant. The `constraints` block is the only heuristic extraction and must be labelled.
+- **`exact: false` requires a `note`.** The repo's `Finding` invariant. No block in this build is heuristic (the one that was, `constraints`, was cut on 2026-08-11), so this constraint binds anything added later rather than anything written now.
 - **No em dashes** in any prose, comment, doc, or commit message written by this plan.
 - **Comment density matches the surrounding code.** This codebase explains *why* in prose comments aimed at a reader learning Rust. Match it; do not strip it down.
 - **Payload version is `"v": 3`** for the two new payloads. The existing six stay at `2`.
@@ -628,29 +628,35 @@ unfinished is exactly as unfinished as one the main lane abandoned."
 - Consumes: nothing.
 - Produces: `sumcp_core::model::AgentText { text: String, line_no: usize, session_ix: u16 }` and `Session::agent_texts: Vec<AgentText>`. Task 8 reads this.
 
-**Measured volume:** 60 blocks over 80 chars, 51,358 chars, in one real session. Each block is capped at `AGENT_TEXT_CAP` so one runaway block cannot dominate memory, and the payload caps again on top.
+**Decided 2026-08-11, replacing an earlier draft of this task.** An earlier version filtered prose by a length floor of 80 characters. That was measured and rejected: length does not separate claims from narration. Across 8 real sessions, 79% of blocks clear 80 chars, and the 80-159 band is dominated by narration (`"Let me find your current resume and study its format"`, `"Now the rules engine and TikTok driver:"`). The spec's rule governs instead, and it is applied in Task 8, not here.
+
+**So this task captures every non-empty block and makes no selection.** Ingest stays dumb; `context::claims` applies the rule. That split is the same one the module structure already draws: extraction logic lives in `context.rs`, parsing lives in `ingest.rs`.
+
+Each block is capped at `AGENT_TEXT_CAP` so one runaway block cannot dominate memory, and the payload caps again on top.
 
 - [ ] **Step 1: Write the failing test**
 
 ```rust
 #[test]
-fn agent_prose_is_captured_and_short_blocks_are_skipped() {
-    // These are the agent's claims about what it did. The reviewer verifies
-    // them against the diff, which is the highest-yield automated review
-    // question available. Short blocks are conversational filler ("Done.",
-    // "Let me check.") and carry no verifiable assertion.
+fn every_non_empty_agent_prose_block_is_captured() {
+    // No length filter here on purpose: selecting which prose is a claim is
+    // Task 8's job, using the spec's rule (last block before a human turn).
+    // Measurement showed length is a bad proxy, so ingest makes no judgment
+    // and keeps everything with text in it.
     let long = "x".repeat(100);
     let line = format!(
-        r#"{{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{{"content":[{{"type":"text","text":"{long}"}},{{"type":"text","text":"ok"}}]}}}}"#
+        r#"{{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{{"content":[{{"type":"text","text":"{long}"}},{{"type":"text","text":"ok"}},{{"type":"text","text":"   "}}]}}}}"#
     );
     let s = ingest_str(&line, Lane::Main);
 
-    assert_eq!(s.agent_texts.len(), 1, "only the long block is a claim");
+    assert_eq!(s.agent_texts.len(), 2, "both blocks with text, not the blank");
     assert_eq!(s.agent_texts[0].text.chars().count(), 100);
+    assert_eq!(s.agent_texts[1].text, "ok");
 }
 
 #[test]
 fn a_runaway_prose_block_is_capped() {
+    use crate::ingest::AGENT_TEXT_CAP;
     // One block must not be able to dominate memory. The cap is on the
     // stored copy only; nothing downstream counts characters for a metric,
     // so truncation here cannot skew a number the way EDIT_CAP would have.
@@ -666,7 +672,7 @@ fn a_runaway_prose_block_is_capped() {
 
 - [ ] **Step 2: Run it to verify it fails**
 
-Run: `cargo test -p sumcp-core agent_prose_is_captured_and_short_blocks_are_skipped`
+Run: `cargo test -p sumcp-core every_non_empty_agent_prose_block_is_captured`
 Expected: FAIL, `no field 'agent_texts'`.
 
 - [ ] **Step 3: Add the model type and constants**
@@ -695,11 +701,14 @@ pub struct AgentText {
 In `ingest.rs`, beside `const EDIT_CAP: usize = 2000;`:
 
 ```rust
-/// Shortest prose block kept as a claim. Below this it is conversational
-/// filler ("Done.", "Let me check.") with no verifiable assertion in it.
-const AGENT_TEXT_MIN: usize = 80;
 /// Longest prose block stored. Unlike `EDIT_CAP`, truncating here cannot skew
 /// any metric: nothing counts these characters, they are only quoted.
+///
+/// There is deliberately no MINIMUM. A length floor was measured as a proxy
+/// for "is this a verifiable claim" and rejected: across 8 real sessions the
+/// 80-159 character band is mostly narration ("Now the rules engine and
+/// TikTok driver:"), not assertion. Selection happens in `context::claims`
+/// using the spec's rule instead.
 pub(crate) const AGENT_TEXT_CAP: usize = 4000;
 ```
 
@@ -721,8 +730,10 @@ In the content-block loop, add an arm alongside `Some("tool_use")` and `Some("to
                     Some("text")
                         if v.get("type").and_then(Value::as_str) == Some("assistant") =>
                     {
+                        // Whitespace-only blocks carry nothing and would only
+                        // pad the list Task 8 selects from.
                         if let Some(t) = block.get("text").and_then(Value::as_str)
-                            && t.chars().count() >= AGENT_TEXT_MIN
+                            && !t.trim().is_empty()
                         {
                             agent_texts.push(AgentText {
                                 // `chars().take()` not `[..n]`: slicing a
@@ -978,19 +989,35 @@ Expected: FAIL, `cannot find function 'decisions'`.
 pub struct DecisionOut {
     /// The question, verbatim.
     pub question: String,
-    /// What the human chose. `None` when the session ended unanswered.
+    /// What the human chose. `None` when the session ended unanswered, or
+    /// when one call asked two questions with identical text and its answers
+    /// map therefore cannot disambiguate them.
     pub chosen: Option<String>,
     /// The options that were turned down. When the answer was free text
     /// matching no option, every option is here, which is the correct
     /// reading: nothing on the menu was picked.
     pub rejected: Vec<String>,
-    /// Source line, for citation.
+    /// The asking action's index, so `evidence(idxs)` resolves this decision
+    /// to the raw transcript. Empty when no action matches, which is
+    /// possible if the asking call was deduped away as a replay.
+    pub idxs: Vec<Idx>,
+    /// Source line, kept alongside `idxs` because it is the key the index was
+    /// resolved from and it stays meaningful if resolution fails.
     pub line_no: usize,
     /// Which transcript of the work unit it came from.
     pub session_ix: u16,
 }
 
 /// Extract the recorded human decisions.
+///
+/// WHY THE INDEX IS RESOLVED HERE AND NOT AT INGEST (decided 2026-08-11 after
+/// an adversarial review): both `merge_sessions` and `merge_work_unit`
+/// globally renumber `Action::idx` after interleaving, so an index captured
+/// during parsing would be stale by the time anything read it, and a stale
+/// citation is worse than an absent one. `Decision` therefore stores only
+/// `(session_ix, line_no)`, which never changes, and the index is looked up
+/// here against the already-merged session. Correct by construction, with no
+/// remapping step to forget.
 pub fn decisions(s: &Session) -> Vec<DecisionOut> {
     s.decisions
         .iter()
@@ -1005,6 +1032,12 @@ pub fn decisions(s: &Session) -> Vec<DecisionOut> {
                 // no choice was made at all.
                 .filter(|o| d.answer.as_deref().is_some_and(|a| a != o.as_str()))
                 .cloned()
+                .collect(),
+            idxs: s
+                .actions
+                .iter()
+                .filter(|a| a.session_ix == d.session_ix && a.line_no == d.line_no)
+                .map(|a| a.idx)
                 .collect(),
             line_no: d.line_no,
             session_ix: d.session_ix,
@@ -1208,35 +1241,59 @@ then fixed is not unfinished work."
 - Consumes: `Session::agent_texts` (Task 4).
 - Produces: `sumcp_core::context::claims(&Session) -> Vec<Claim>` where `Claim { text: String, line_no: usize, session_ix: u16 }`. Task 10 reads this.
 
-**Design note carried from the spec's open questions:** every prose block is reported, with a count, and the reviewer chooses. Selecting among them would be a judgment this design has committed to avoiding. If the volume proves unusable in the experiment, the selection rule becomes a real design problem rather than an afterthought.
+**The selection rule, from the spec and confirmed against real data (decided 2026-08-11):** a claim is **the last assistant prose block before each human turn**, plus the final block of the session if no human turn followed it.
+
+That is where an agent summarizes what it did. Narration ("Let me check the tests", "Now the rules engine") happens mid-turn and is followed by more prose, so it is never the last block before the human speaks.
+
+Measured on four real sessions: 172 blocks yields 18 claims, 22 yields 3, 6 yields 4. The text selected reads like `"Committed, merged, and pushed."` and `"Updated both places the paper is linked to"`, which are checkable assertions. This also resolves the spec's open question about unusable claim volume: the rule is the answer, not a cap.
+
+**Note the boundary rule:** only a *human* turn closes a claim window. A harness-injected turn (task notification, hook output) is not the agent handing work back, so it must not split a window. `UserText::is_human` already carries this distinction, and Task 5's `scope` uses the same field for the same reason.
 
 - [ ] **Step 1: Write the failing test**
 
 ```rust
     #[test]
-    fn claims_are_reported_in_source_order_without_selection() {
-        // No filtering beyond the length floor applied at ingest. Choosing
-        // which claims "matter" is a judgment this tool does not make.
-        let a = "a".repeat(100);
-        let b = "b".repeat(100);
-        let l1 = format!(
-            r#"{{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{{"content":[{{"type":"text","text":"{a}"}}]}}}}"#
-        );
-        let l2 = format!(
-            r#"{{"type":"assistant","timestamp":"2026-01-01T00:00:01Z","message":{{"content":[{{"type":"text","text":"{b}"}}]}}}}"#
-        );
-        let s = ingest_str(&format!("{l1}\n{l2}"), Lane::Main);
+    fn a_claim_is_the_last_prose_block_before_each_human_turn() {
+        // Mid-turn narration is followed by more prose, so it is never last.
+        // The summary the agent writes before handing back IS the claim.
+        let n1 = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"text","text":"Let me check the tests."}]}}"#;
+        let sum1 = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:01Z","message":{"content":[{"type":"text","text":"Added the cache and its tests, 5 passing."}]}}"#;
+        let human = r#"{"type":"user","timestamp":"2026-01-01T00:00:02Z","origin":{"kind":"human"},"message":{"content":"now wire it up"}}"#;
+        let sum2 = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:03Z","message":{"content":[{"type":"text","text":"Wired into the loader."}]}}"#;
+        let s = ingest_str(&format!("{n1}\n{sum1}\n{human}\n{sum2}"), Lane::Main);
 
         let c = claims(&s);
-        assert_eq!(c.len(), 2);
-        assert!(c[0].text.starts_with('a'), "source order preserved");
-        assert!(c[1].text.starts_with('b'));
+        assert_eq!(c.len(), 2, "one per window, not one per block");
+        assert_eq!(c[0].text, "Added the cache and its tests, 5 passing.");
+        assert_eq!(c[1].text, "Wired into the loader.", "trailing window counts");
+    }
+
+    #[test]
+    fn a_harness_turn_does_not_close_a_claim_window() {
+        // A task notification is not the agent handing work back to a human,
+        // so splitting on it would promote mid-turn narration into a claim.
+        let n1 = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"text","text":"Starting the migration."}]}}"#;
+        let note = r#"{"type":"user","timestamp":"2026-01-01T00:00:01Z","origin":{"kind":"task-notification"},"message":{"content":"<task-notification>done</task-notification>"}}"#;
+        let sum = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:02Z","message":{"content":[{"type":"text","text":"Migration complete, 12 rows moved."}]}}"#;
+        let s = ingest_str(&format!("{n1}\n{note}\n{sum}"), Lane::Main);
+
+        let c = claims(&s);
+        assert_eq!(c.len(), 1, "the notification did not close a window");
+        assert_eq!(c[0].text, "Migration complete, 12 rows moved.");
+    }
+
+    #[test]
+    fn a_session_with_no_human_turn_still_yields_its_final_claim() {
+        let only = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"text","text":"Done, nothing to change."}]}}"#;
+        let s = ingest_str(only, Lane::Main);
+
+        assert_eq!(claims(&s).len(), 1);
     }
 ```
 
 - [ ] **Step 2: Run it to verify it fails**
 
-Run: `cargo test -p sumcp-core claims_are_reported_in_source_order`
+Run: `cargo test -p sumcp-core a_claim_is_the_last_prose_block_before_each_human_turn`
 Expected: FAIL, `cannot find function 'claims'`.
 
 - [ ] **Step 3: Implement**
@@ -1256,19 +1313,57 @@ pub struct Claim {
 
 /// Extract the agent's claims about what it did.
 ///
-/// Every captured prose block is returned, in source order. There is
-/// deliberately no selection: deciding which claims are "worth verifying"
-/// would be a judgment, and this module makes none. The payload caps the
-/// list and reports the true total, so the reviewer knows what it is seeing.
+/// A claim is the LAST prose block before each human turn, plus the final
+/// block of the session when no human turn followed it. That is where an
+/// agent summarizes; mid-turn narration is always followed by more prose and
+/// so is never last.
+///
+/// This is a positional rule, not a content judgment, which is what keeps it
+/// deterministic. An earlier draft filtered by length instead and was
+/// rejected on measurement: across 8 real sessions the 80-159 character band
+/// is mostly narration, so length does not separate assertion from chatter.
 pub fn claims(s: &Session) -> Vec<Claim> {
-    s.agent_texts
+    // Human turn boundaries, as source line numbers. Only HUMAN turns close a
+    // window: a harness-injected turn is not the agent handing work back, and
+    // splitting on one would promote narration into a claim.
+    let mut boundaries: Vec<usize> = s
+        .user_texts
         .iter()
-        .map(|t| Claim {
-            text: t.text.clone(),
-            line_no: t.line_no,
-            session_ix: t.session_ix,
-        })
-        .collect()
+        .filter(|u| u.is_human)
+        .map(|u| u.line_no)
+        .collect();
+    boundaries.sort_unstable();
+
+    let mut out = Vec::new();
+    let mut last: Option<&crate::model::AgentText> = None;
+    let mut next_boundary = 0usize;
+
+    for t in &s.agent_texts {
+        // Cross every boundary this block sits after, emitting the block that
+        // was last before each one. A window with no prose in it emits
+        // nothing, which is correct: the agent said nothing to claim.
+        while next_boundary < boundaries.len() && t.line_no > boundaries[next_boundary] {
+            if let Some(prev) = last.take() {
+                out.push(Claim {
+                    text: prev.text.clone(),
+                    line_no: prev.line_no,
+                    session_ix: prev.session_ix,
+                });
+            }
+            next_boundary += 1;
+        }
+        last = Some(t);
+    }
+    // The trailing window: prose after the final human turn, or a session
+    // that never had one.
+    if let Some(prev) = last {
+        out.push(Claim {
+            text: prev.text.clone(),
+            line_no: prev.line_no,
+            session_ix: prev.session_ix,
+        });
+    }
+    out
 }
 ```
 
@@ -1290,157 +1385,41 @@ the payload caps the list and reports the true total instead."
 
 ---
 
-## Task 9: Extract `constraints` (the one heuristic block)
+## Task 9: CUT (do not implement)
 
-**Files:**
-- Modify: `crates/sumcp-core/src/context.rs`
+**Cut 2026-08-11 by human decision, before any implementation.** The heading
+is retained so task numbering, briefs, and ledger entries stay aligned with
+the rest of the plan.
 
-**Interfaces:**
-- Consumes: `crate::score::all_findings` (existing, `pub fn all_findings(s: &Session) -> Vec<Finding>`), `Session::actions`.
-- Produces: `sumcp_core::context::constraints(&Session) -> Vec<Constraint>` where `Constraint { what: String, why: String, idxs: Vec<Idx>, exact: bool }`. Task 10 reads this. `exact` is always `false`.
+**What it was:** a `constraints` block extracting "approaches tried and
+abandoned" from two shapes, a command that errored and was never rerun, and
+content changed then changed back.
 
-**Why this is heuristic:** "an approach was tried and abandoned" is an inference from shape, not a recorded fact. Two shapes support it: content that was changed and changed back (`FindingKind::TrueRevert`, already computed), and a command that errored and was never rerun. Both carry the repo's heuristic labelling, and the payload must surface it.
+**Why it was cut:**
 
-- [ ] **Step 1: Write the failing test**
+1. **Exact-string command matching does not survive real retries.** A retry is
+   rarely byte-identical: `cargo test`, then `cargo test -p sumcp-core`, then
+   `cargo test --release`. Each variant would be treated as a separate command
+   that errored and was never rerun, so the block would report three abandoned
+   approaches where a developer sees one that eventually passed. Noisy on the
+   cases it fires on, and silent on the ones it should catch.
+2. **It was the only heuristic block in a design whose entire purpose is
+   reducing false positives.** Shipping the one component most likely to
+   generate them, into an experiment measuring exactly that, would confound
+   the result it exists to produce.
 
-```rust
-    #[test]
-    fn a_command_that_errored_and_was_never_rerun_is_a_constraint() {
-        // The reviewer's most useless output is recommending something that
-        // was already tried and failed. This is the shape that catches it.
-        let fail = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"tool_use","id":"b1","name":"Bash","input":{"command":"cargo add sqlite"}}]}}"#;
-        let fail_r = r#"{"type":"user","timestamp":"2026-01-01T00:00:01Z","message":{"content":[{"type":"tool_result","tool_use_id":"b1","is_error":true}]},"toolUseResult":{"stderr":"no matching package"}}"#;
-        let s = ingest_str(&format!("{fail}\n{fail_r}"), Lane::Main);
+**Consequences elsewhere in this plan, all already applied:**
 
-        let c = constraints(&s);
-        assert_eq!(c.len(), 1);
-        assert_eq!(c[0].what, "cargo add sqlite");
-        assert!(c[0].why.contains("no matching package"));
-        assert!(!c[0].exact, "this is an inference from shape, never exact");
-    }
+- Task 10's `review_context` payload has no `constraints` key and no
+  `exact: false` field. All four remaining blocks are exact facts.
+- The Global Constraint "`exact: false` requires a `note`" retains no consumer
+  in this build. It still binds anything added later.
+- `FindingKind::TrueRevert` is untouched and still computed by the existing
+  signal layer. Nothing was deleted from the crate.
 
-    #[test]
-    fn constraints_are_always_labelled_heuristic() {
-        // The repo-wide rule: exact == false requires a stated reason. A
-        // constraint that claimed to be exact would be lying about how it
-        // was derived.
-        let fail = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"tool_use","id":"b1","name":"Bash","input":{"command":"make"}}]}}"#;
-        let fail_r = r#"{"type":"user","timestamp":"2026-01-01T00:00:01Z","message":{"content":[{"type":"tool_result","tool_use_id":"b1","is_error":true}]}}"#;
-        let s = ingest_str(&format!("{fail}\n{fail_r}"), Lane::Main);
-
-        assert!(constraints(&s).iter().all(|c| !c.exact && !c.why.is_empty()));
-    }
-```
-
-- [ ] **Step 2: Run it to verify it fails**
-
-Run: `cargo test -p sumcp-core a_command_that_errored_and_was_never_rerun`
-Expected: FAIL, `cannot find function 'constraints'`.
-
-- [ ] **Step 3: Implement**
-
-```rust
-use crate::model::FindingKind;
-
-/// Something that was attempted and did not work.
-///
-/// HEURISTIC by construction: "abandoned" is inferred from shape, never
-/// recorded. `exact` is always `false` and `why` is always populated, which
-/// is the same contract `Finding` holds elsewhere in this crate.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Constraint {
-    /// What was attempted, verbatim (a command, or a file path).
-    pub what: String,
-    /// The recorded reason it did not work.
-    pub why: String,
-    /// Action indices proving it.
-    pub idxs: Vec<Idx>,
-    /// Always `false`. Present so a payload cannot serialize this block
-    /// without carrying its own honesty label.
-    pub exact: bool,
-}
-
-/// Extract approaches that were tried and abandoned.
-pub fn constraints(s: &Session) -> Vec<Constraint> {
-    let mut out = Vec::new();
-
-    // Shape one: a command that errored and was never run again. If it had
-    // been rerun, the last-run-wins rule in `incomplete` would cover it and
-    // it would not be an abandoned approach.
-    let mut last_error: BTreeMap<String, (Idx, String)> = BTreeMap::new();
-    let mut rerun_ok: BTreeMap<String, bool> = BTreeMap::new();
-    for a in &s.actions {
-        if a.kind == ActionKind::Bash
-            && let Some(cmd) = a.command.as_deref()
-        {
-            match a.is_error {
-                Some(true) => {
-                    last_error.insert(
-                        cmd.to_string(),
-                        (a.idx, a.error.clone().unwrap_or_default()),
-                    );
-                    rerun_ok.insert(cmd.to_string(), false);
-                }
-                Some(false) => {
-                    rerun_ok.insert(cmd.to_string(), true);
-                }
-                None => {}
-            }
-        }
-    }
-    for (cmd, (idx, err)) in last_error {
-        if rerun_ok.get(&cmd) == Some(&false) {
-            out.push(Constraint {
-                what: cmd,
-                why: err,
-                idxs: vec![idx],
-                exact: false,
-            });
-        }
-    }
-
-    // Shape two: content changed and changed back. The existing revert signal
-    // already computes this, so we read its findings rather than recomputing
-    // the comparison and risking a second, subtly different definition.
-    for f in crate::score::all_findings(s) {
-        if f.kind == FindingKind::TrueRevert {
-            out.push(Constraint {
-                what: f.file.clone().unwrap_or_else(|| "(no file)".to_string()),
-                why: f
-                    .note
-                    .clone()
-                    .unwrap_or_else(|| "content was changed and changed back".to_string()),
-                idxs: f.idxs.clone(),
-                exact: false,
-            });
-        }
-    }
-
-    out
-}
-```
-
-- [ ] **Step 4: Run the tests**
-
-Run: `cargo test -p sumcp-core context::`
-Expected: PASS, 10 tests.
-
-If `FindingKind::TrueRevert` does not exist under that exact name, run `grep -n "TrueRevert\|Revert" crates/sumcp-core/src/model.rs` and use the actual variant. Do not invent one.
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add crates/sumcp-core/src/context.rs
-git commit -m "feat: extract constraints, the one heuristic block
-
-Two shapes support 'tried and abandoned': a command that errored and was
-never rerun, and content changed then changed back. The second reads the
-existing revert finding rather than recomputing the comparison, so there is
-only ever one definition of a revert in this crate.
-
-exact is hardcoded false and why is always populated, matching the Finding
-contract the rest of the crate holds."
-```
+**Revisit when** the precision experiment has a result. If contextualized
+review wins, an abandoned-approach block becomes worth designing properly,
+with a matching rule derived from real retry data rather than string equality.
 
 ---
 
@@ -1450,7 +1429,7 @@ contract the rest of the crate holds."
 - Modify: `crates/sumcp-core/src/payloads.rs`
 
 **Interfaces:**
-- Consumes: `context::{scope, decisions, incomplete, claims, constraints}` (Tasks 5 to 9), and the existing `session_block(&SessionMeta) -> (Value, bool)` and `shrink_to_fit(cap, start, build)` helpers.
+- Consumes: `context::{scope, decisions, incomplete, claims}` (Tasks 5 to 8; Task 9 was cut), and the existing `session_block(&SessionMeta) -> (Value, bool)` and `shrink_to_fit(cap, start, build)` helpers.
 - Produces: `payloads::review_context(s: &Session, meta: &SessionMeta) -> Value`. Tasks 13 and 14 call this.
 
 - [ ] **Step 1: Write the failing test**
@@ -1548,15 +1527,15 @@ Add the function:
 ```rust
 /// Recorded session context for a reviewing agent (`v: 3`).
 ///
-/// Five blocks, four of them exact and one heuristic. Every list is a capped
-/// sample and every corresponding total is unconditional, so "3 shown" can
-/// never be read as "3 happened".
+/// Four blocks, all exact. (A fifth heuristic `constraints` block was cut on
+/// 2026-08-11; see the plan's Task 9.) Every list is a capped sample and every
+/// corresponding total is unconditional, so "3 shown" can never be read as
+/// "3 happened".
 pub fn review_context(s: &Session, meta: &SessionMeta) -> Value {
     let scope = crate::context::scope(s);
     let decisions = crate::context::decisions(s);
     let incomplete = crate::context::incomplete(s);
     let claims = crate::context::claims(s);
-    let constraints = crate::context::constraints(s);
     let (session, id_cut) = session_block(meta);
 
     // The true counts, computed once and never subject to the cap below.
@@ -1566,15 +1545,13 @@ pub fn review_context(s: &Session, meta: &SessionMeta) -> Value {
         "decisions": decisions.len(),
         "unfinished_tasks": incomplete.unfinished_tasks.len(),
         "failing_commands": incomplete.failing_commands.len(),
-        "claims": claims.len(),
-        "constraints": constraints.len()
+        "claims": claims.len()
     });
     let longest = scope
         .requests
         .len()
         .max(decisions.len())
         .max(claims.len())
-        .max(constraints.len())
         .max(incomplete.unfinished_tasks.len())
         .max(incomplete.failing_commands.len());
 
@@ -1595,15 +1572,11 @@ pub fn review_context(s: &Session, meta: &SessionMeta) -> Value {
                 "question": elide_middle(&d.question, QUOTE_MAX),
                 "chosen": d.chosen.as_ref().map(|c| elide_middle(c, QUOTE_MAX)),
                 "rejected": d.rejected,
+                // idxs, not just a line number: the Global Constraint is that
+                // every item is dereferenceable, and `evidence()` takes Idx.
+                // A bare line number is not something a reviewer can resolve.
+                "idxs": d.idxs.iter().take(FINDING_IDXS_MAX).collect::<Vec<_>>(),
                 "line": d.line_no
-            })).collect::<Vec<_>>(),
-            "constraints": constraints.iter().take(k).map(|c| json!({
-                "what": elide_middle(&c.what, QUOTE_MAX),
-                "why": elide_middle(&c.why, QUOTE_MAX),
-                "idxs": c.idxs.iter().take(FINDING_IDXS_MAX).collect::<Vec<_>>(),
-                // Never omitted: a heuristic block that did not say so would
-                // be indistinguishable from the four exact ones.
-                "exact": false
             })).collect::<Vec<_>>(),
             "incomplete": {
                 "unfinished_tasks": incomplete.unfinished_tasks.iter().take(k)
@@ -1644,10 +1617,11 @@ Expected: PASS. If `elide_middle` or `est_tokens` have different signatures, run
 git add crates/sumcp-core/src/payloads.rs
 git commit -m "feat: the review_context payload, v3
 
-Five blocks, four exact and one heuristic, every list capped and every total
-unconditional so 3 shown is never read as 3 happened. The exact: false flag
-on constraints is never omitted, because a heuristic block that did not say
-so would be indistinguishable from the exact ones.
+Four blocks, all exact, every list capped and every total unconditional so
+3 shown is never read as 3 happened. The heuristic constraints block was cut
+before implementation: exact-string command matching does not survive real
+retries, and it was the one component most likely to generate the false
+positives this design exists to reduce.
 
 Capped tighter than session_intent on purpose: this payload is pushed into
 the reviewer's context, and keeping the pushed payload small is what avoids
@@ -1939,7 +1913,7 @@ silently select the wrong sessions."
 - Consumes: `payloads::review_context` (Task 10), `payloads::session_intent` (Task 11).
 - Produces: two tools on the wire, `review_context` and `session_intent`.
 
-**Note on `commit_range`:** the MCP server resolves sessions by the calling session id, not by commit. The `commit_range` argument is accepted and, for this first build, is **recorded in the payload but does not change session selection**, because the server's session resolution is already work-unit scoped and cross-checking it against git would need the repo path the server does not have. The CLI (Task 14) is where a range genuinely selects. This limitation is disclosed in the tool description rather than hidden.
+**No `commit_range` on the MCP tools (decided 2026-08-11).** The server resolves sessions from the calling session id and has no repo path, so it cannot ask git anything. An earlier draft exposed the parameter anyway with a disclaimer in the description. That was cut: a parameter that silently ignores its input is worse than an absent one, because an agent that trusts the name gets the wrong scope and never learns it did. Range selection lives in the CLI (Task 14), where the working directory is known. The MCP tools gain it when the server can resolve a repo path.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1982,8 +1956,8 @@ In `tool_list()`, after the `evidence` entry:
 ```rust
         tool(
             "review_context",
-            "Recorded session context for reviewing a change: what was asked, what the human decided (and the options rejected), what was tried and failed, what was left unfinished, and what the agent claimed it did. Facts with citations, never judgments. Call session_intent for the full request text.",
-            serde_json::json!({"commit_range": {"type": "string", "description": "Informational only in this version: sessions are resolved from the calling session, not from git."}}),
+            "Recorded session context for reviewing a change: what was asked, what the human decided (and the options rejected), what was left unfinished, and what the agent claimed it did. Facts with citations, never judgments. Call session_intent for the full request text.",
+            serde_json::json!({}),
             &[],
         ),
         tool(
@@ -2024,10 +1998,11 @@ Expected: PASS, including `six_tools_answer_the_frozen_contract_over_stdio`. Tha
 git add crates/sumcp-mcp/src/server.rs crates/sumcp-mcp/tests/stdio.rs
 git commit -m "feat: register review_context and session_intent as MCP tools
 
-commit_range is accepted and recorded but does not yet change session
-selection: the server resolves sessions from the calling session and has no
-repo path to cross-check against git. Stated in the tool description rather
-than hidden, and the CLI is where a range genuinely selects."
+No commit_range parameter: the server resolves sessions from the calling
+session and has no repo path, so it cannot ask git anything. A parameter
+that silently ignores its input is worse than an absent one, because an
+agent that trusts the name gets the wrong scope and never learns it did.
+Range selection lives in the CLI, where the working directory is known."
 ```
 
 ---
@@ -2528,6 +2503,54 @@ knows the arm produces a bias indistinguishable from the effect."
 
 ---
 
+## Execution Protocol
+
+Standard subagent-driven development with **one substitution, decided by the
+human partner on 2026-08-11**: the per-task review gate is a **Codex
+adversarial review**, not a Claude task-reviewer subagent.
+
+Per task N:
+
+1. **Record the base.** `BASE=$(git rev-parse HEAD)` before dispatching
+   anything. Never use `HEAD~1` as the base: a task that lands more than one
+   commit would silently have all but the last dropped from review.
+2. **Extract the brief.** `scripts/task-brief docs/superpowers/plans/2026-08-10-review-context.md N`,
+   which prints a file path. The implementer reads that file; the plan is
+   never pasted into a dispatch prompt.
+3. **Dispatch one implementer subagent** with the brief path, a report-file
+   path, and the interfaces from earlier tasks that the brief cannot know.
+   One subagent at a time, never parallel: these tasks touch overlapping
+   files (`model.rs`, `ingest.rs`, `merge.rs`, `payloads.rs`).
+4. **Codex adversarial review of that task only:**
+
+   ```bash
+   node "$CODEX_COMPANION" adversarial-review --base "$BASE" <focus text>
+   ```
+
+   Scoping to `$BASE` is what makes this a per-task gate rather than a
+   whole-branch review. A working-tree target reviews nothing once the
+   implementer has committed, which is exactly how the first attempt at this
+   returned a vacuous `approve` on an empty diff.
+5. **Receive the review under `superpowers:receiving-code-review`.** Codex's
+   output is a set of suggestions to evaluate, not orders to follow. For each
+   finding: verify it against this codebase, check whether it breaks existing
+   behaviour, check whether the plan or spec deliberately chose otherwise.
+   Push back with technical reasoning where it is wrong. Dispatch a fix
+   subagent only for findings that survive that check.
+6. **A finding that contradicts the plan is the human's call.** Present the
+   finding beside the plan text that mandates it and ask which governs. Do
+   not let a fix silently overrule the plan, and do not dismiss a finding
+   because the plan mandated the behaviour.
+7. **Append one line to the ledger** at `.superpowers/sdd/progress.md`:
+   `Task N: complete (commits <base7>..<head7>, codex review <verdict>)`.
+
+**Codex has a conflict of interest here and it must be named.** This plan's
+entire thesis is that a reviewing agent produces better findings when given
+recorded session context. Codex is that reviewing agent. Its verdicts on the
+tool built to feed it are not disinterested, and an `approve` from it is not
+evidence the design works. Treat its findings as useful and its verdicts as
+uninformative.
+
 ## Verification
 
 After Task 16, before reporting completion:
@@ -2547,7 +2570,9 @@ After Task 16, before reporting completion:
 
 **Two known gaps, both deliberate and disclosed rather than silently dropped:**
 
-1. **`commit_range` does not select sessions in the MCP path** (Task 13). The server has no repo path. The CLI does it properly. Disclosed in the tool description and in the spec's open questions about session-to-commit mapping, which remains unresolved.
-2. **The spec's `claims` open question is unresolved by design.** Every prose block is reported. If 60 blocks per session proves unusable in the experiment, the selection rule becomes a real design problem, which is what the spec already says.
+1. **The MCP tools take no commit range** (Task 13). Session-to-commit mapping remains unresolved in the spec's open questions, and the CLI is the path where a range genuinely selects. This narrows the MCP surface rather than faking it.
+2. **Task 9 (`constraints`) is cut**, so this build ships no heuristic block. The spec describes five blocks; four are implemented. The reasoning is recorded under Task 9 and the spec's own heuristic labelling requirement is unaffected.
+
+**The spec's `claims` open question is now resolved**, not deferred: claims are the last prose block before each human turn, verified on real sessions (172 blocks yields 18 claims). The spec text should be updated to match when this lands.
 
 **Type consistency checked:** `Decision` (model, Task 2) vs `DecisionOut` (context, Task 6) are deliberately distinct types, one raw and one shaped for the payload. `Idx` is used in `FailingCommand` and `Constraint` and imported once in `context.rs`. `session_ix: u16` matches `Action::session_ix` throughout.

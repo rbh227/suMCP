@@ -125,12 +125,20 @@ The default payload. Small, pushed once at the start of a review.
 |---|---|---|
 | `scope` | the human's request, and the files actually touched in the sessions covered | exact |
 | `decisions` | `AskUserQuestion` question, options, and the option chosen | exact, structured |
-| `constraints` | approaches tried and abandoned, with the recorded failure | **heuristic** |
+| ~~`constraints`~~ | ~~approaches tried and abandoned, with the recorded failure~~ | **cut 2026-08-11, before implementation; see the plan's Task 9** |
 | `incomplete` | tasks created but never completed; test commands failing at session end | exact |
 | `claims` | agent prose asserting what it did, for verification against the diff | exact extraction |
 
-Every entry carries the action indices that prove it, so `evidence(idxs)`
-(already built) resolves any of them to a raw transcript excerpt.
+Citations are not uniform across blocks, which is what actually shipped
+(amended from this section's original claim that every entry carries action
+indices): `decisions` and `incomplete.failing_commands` carry the action
+indices that prove them, so `evidence(idxs)` (already built) resolves those
+two directly to a raw transcript excerpt. `scope.requests`,
+`incomplete.unfinished_tasks`, and `claims` have no action to point at
+(a human turn or a task-status transition is not itself an `Action`), so
+those three carry transcript + line number instead: a short session id
+alongside the source line, dereferenceable by a human or another tool
+reading the transcript directly, not by `evidence()`.
 
 Extraction rules, all deterministic:
 
@@ -147,11 +155,15 @@ Extraction rules, all deterministic:
   `is_error: true`.
 - **claims**: the last assistant `text` block before each human turn.
   Extracted, never interpreted.
-- **constraints**: the only heuristic block. Detected from existing signals:
-  `true_revert` (content changed and changed back), files created then
-  deleted, and errored Bash commands not subsequently repeated. Carries the
-  repo's standard heuristic label and confidence, exactly as
-  `signals/comprehension.rs` does today.
+- ~~**constraints**~~: cut 2026-08-11, before implementation (plan Task 9).
+  Exact-string command matching does not survive real retries (`cargo test`,
+  then `cargo test -p sumcp-core`, then `cargo test --release` would report
+  three abandoned approaches where a developer sees one that eventually
+  passed), and it was the only heuristic block in a design whose entire
+  purpose is reducing false positives, which would have confounded the
+  precision experiment it was meant to feed. Revisit if the experiment shows
+  contextualized review wins and a properly-derived retry rule becomes worth
+  designing.
 
 ### Tool 2: `session_intent(commit_range, [max_tokens])`
 
@@ -304,10 +316,21 @@ Declared before any run, following the discipline in
 Flagged as the weakest part of the plan. Findings per commit are sparse and
 Codex reviews are slow, so twenty commits will very likely produce intervals
 too wide to conclude anything, exactly as the 39-outcome corpus did in
-`docs/validation/2026-07-22-predictive-validity.md`. A power estimate is
-required **before** implementation, not after results are in hand. The
-mitigation is retrospective breadth: 176 commits in this repository alone,
-plus other projects, all with transcripts still on disk or archived.
+`docs/validation/2026-07-22-predictive-validity.md`. `scripts/power_estimate.py`
+was run before any implementation, treating 56.3% (arXiv:2607.03316) as arm
+A's invalid share and powering the finding-level design at alpha=0.05,
+two-sided, power=0.80. Result: detecting a 10 percentage point drop in
+invalid share (0.563 to 0.463) needs about 388 findings per arm, roughly 129
+commits at 3 findings each or 65 at 6. A 20 point drop needs about 94
+findings per arm, 31 commits at 3 findings each. Anything smaller than a 10
+point improvement is not runnable at a scale this project can realistically
+review twice. The mitigation is retrospective breadth: 176 commits in this
+repository alone, plus other projects, all with transcripts still on disk or
+archived, which puts the 10 to 20 point range within reach without changing
+the finding-level design. If the realized effect turns out smaller than 10
+points, the design must move to paired per-finding adjudication on the same
+findings across arms before more code is written, per the go/no-go in
+`scripts/power_estimate.py`.
 
 ## Architecture
 

@@ -24,10 +24,27 @@ pub fn merge_sessions(main: Session, subs: Vec<Session>, files_missing: u64) -> 
     let mut interrupts = main.interrupts;
     let auto_accept = main.auto_accept; // NOT OR'd — see spec §5
     let spawns = main.spawns;
+    // Main only: a subagent has no channel to ask the human anything, so a
+    // decision can only ever appear in the main transcript. Same reasoning
+    // that drops sub.user_texts.
+    let decisions = main.decisions;
+    // Extended, NOT main-only (unlike decisions and user_texts): a subagent
+    // can create tasks, and a task a subagent left unfinished is exactly as
+    // unfinished as one the main lane abandoned.
+    let mut task_events = main.task_events;
+    // Main only: subagent prose is internal reasoning the human never saw,
+    // and folding it in would multiply the payload's largest block for no
+    // reviewer benefit.
+    let agent_texts = main.agent_texts;
+    // Unlike agent_texts itself, the excluded COUNT is additive: every
+    // subagent's tally of prose it couldn't keep is real, disclosable scope,
+    // the same way subagent_files_missing sums across subagents below.
+    let mut agent_texts_excluded = main.agent_texts_excluded;
 
     // Fold every subagent's actions and additive counters in.
     for sub in subs {
         actions.extend(sub.actions);
+        task_events.extend(sub.task_events);
         tokens.input += sub.tokens.input;
         tokens.output += sub.tokens.output;
         tokens.cache_read += sub.tokens.cache_read;
@@ -38,6 +55,7 @@ pub fn merge_sessions(main: Session, subs: Vec<Session>, files_missing: u64) -> 
         parse_errors += sub.parse_errors;
         untimestamped_lines += sub.untimestamped_lines;
         interrupts += sub.interrupts;
+        agent_texts_excluded += sub.agent_texts_excluded;
         // sub.user_texts, sub.auto_accept, sub.spawns intentionally ignored.
     }
 
@@ -66,6 +84,10 @@ pub fn merge_sessions(main: Session, subs: Vec<Session>, files_missing: u64) -> 
         interrupts,
         auto_accept,
         spawns,
+        decisions,
+        task_events,
+        agent_texts,
+        agent_texts_excluded,
         // This merge combines a main transcript with its own subagents into a
         // single work unit's worth of data, so it does not own the transcript id
         // table. The assembly step fills in session_ids when it merges multiple
@@ -107,6 +129,14 @@ pub fn merge_work_unit(parts: Vec<(String, Session)>) -> Session {
     let mut interrupts = 0u64;
     let mut auto_accept = false;
     let mut spawns = Vec::new();
+    let mut decisions = Vec::new();
+    let mut task_events = Vec::new();
+    let mut agent_texts = Vec::new();
+    // Summed across parts the same way every other additive counter in this
+    // loop is: each part's own count of subagent prose it could not keep is
+    // real, disclosable scope regardless of which transcript in the unit it
+    // came from.
+    let mut agent_texts_excluded = 0u64;
     // Strictly the sum of the parts' own subagent-missing counts. A work-unit
     // MEMBER that failed to load is a different kind of gap (it is not a
     // subagent spawn) and is disclosed as `work_unit.members_unreadable`
@@ -136,6 +166,27 @@ pub fn merge_work_unit(parts: Vec<(String, Session)>) -> Session {
             u.session_ix = ix;
             user_texts.push(u);
         }
+        // Stamped like user_texts: a decision must be attributable to the
+        // transcript it came from, or the payload cannot cite it correctly
+        // in a multi-transcript work unit.
+        for mut d in part.decisions {
+            d.session_ix = ix;
+            decisions.push(d);
+        }
+        // Stamped like decisions: a task event must be attributable to the
+        // transcript it came from, or the payload cannot cite it correctly
+        // in a multi-transcript work unit.
+        for mut t in part.task_events {
+            t.session_ix = ix;
+            task_events.push(t);
+        }
+        // Stamped like decisions and task_events: an agent-text block must be
+        // attributable to the transcript it came from, or the payload cannot
+        // cite it correctly in a multi-transcript work unit.
+        for mut at in part.agent_texts {
+            at.session_ix = ix;
+            agent_texts.push(at);
+        }
         // First non-None cwd wins; every transcript in a unit is in the same
         // project, so they agree, but a synthetic session can have None.
         if cwd.is_none() {
@@ -154,6 +205,7 @@ pub fn merge_work_unit(parts: Vec<(String, Session)>) -> Session {
         auto_accept |= part.auto_accept;
         spawns.extend(part.spawns);
         subagent_files_missing += part.subagent_files_missing;
+        agent_texts_excluded += part.agent_texts_excluded;
     }
 
     // One sort of the whole concatenation: O(n log n) total, done once. Never
@@ -211,6 +263,10 @@ pub fn merge_work_unit(parts: Vec<(String, Session)>) -> Session {
         interrupts,
         auto_accept,
         spawns,
+        decisions,
+        task_events,
+        agent_texts,
+        agent_texts_excluded,
         subagent_files_missing,
         session_ids,
     }
@@ -256,6 +312,10 @@ mod tests {
             interrupts: 0,
             auto_accept: false,
             spawns: vec![],
+            decisions: vec![],
+            task_events: vec![],
+            agent_texts: vec![],
+            agent_texts_excluded: 0,
             session_ids: vec![],
             subagent_files_missing: 0,
         }
@@ -296,14 +356,14 @@ mod tests {
 
     #[test]
     fn keeps_only_main_user_texts_and_ors_nothing_for_auto_accept() {
-        use crate::model::UserText;
+        use crate::model::{TurnOrigin, UserText};
         let mut main = one(Lane::Main, "2026-01-01T00:00:02Z", 5, "/a");
         main.user_texts = vec![UserText {
             line_no: 1,
             text: "human says".into(),
             effective_ts: "2026-01-01T00:00:00Z".into(),
             session_ix: 0,
-            is_human: true,
+            origin: TurnOrigin::Human,
         }];
         main.auto_accept = false;
         let mut sub = one(Lane::Sub("x".into()), "2026-01-01T00:00:01Z", 3, "/b");
@@ -312,7 +372,7 @@ mod tests {
             text: "orchestrator prompt".into(),
             effective_ts: "2026-01-01T00:00:00Z".into(),
             session_ix: 0,
-            is_human: true,
+            origin: TurnOrigin::Human,
         }];
         sub.auto_accept = true; // a sub in auto-accept must NOT flip the merged flag
 
@@ -375,6 +435,24 @@ mod tests {
     }
 
     #[test]
+    fn merge_sessions_sums_a_subagents_excluded_count_into_main() {
+        // agent_texts_excluded is additive, unlike agent_texts itself (which
+        // stays main-only). A subagent's tally of prose it couldn't keep is
+        // real, disclosable scope and must survive the merge even though the
+        // strings behind it never do.
+        let mut main = one(Lane::Main, "2026-01-01T00:00:02Z", 5, "/a");
+        main.agent_texts_excluded = 2;
+        let mut sub = one(Lane::Sub("x".into()), "2026-01-01T00:00:01Z", 3, "/b");
+        sub.agent_texts_excluded = 5;
+
+        let merged = merge_sessions(main, vec![sub], 0);
+        assert_eq!(
+            merged.agent_texts_excluded, 7,
+            "main's own count plus the subagent's, summed"
+        );
+    }
+
+    #[test]
     fn determinism_independent_of_subs_order() {
         let main = one(Lane::Main, "2026-01-01T00:00:03Z", 5, "/a");
         let s1 = one(Lane::Sub("a".into()), "2026-01-01T00:00:01Z", 1, "/b");
@@ -401,6 +479,10 @@ mod tests {
             interrupts: 0,
             auto_accept: false,
             spawns: vec![],
+            decisions: vec![],
+            task_events: vec![],
+            agent_texts: vec![],
+            agent_texts_excluded: 0,
             session_ids: vec![],
             subagent_files_missing: 0,
         };
@@ -471,7 +553,7 @@ mod tests {
 
     #[test]
     fn work_unit_merge_ors_auto_accept_and_keeps_every_user_text() {
-        use crate::model::UserText;
+        use crate::model::{TurnOrigin, UserText};
         // Unlike the subagent merge, which deliberately ignores a subagent's
         // user turns and auto-accept, every transcript in a work unit is a
         // real human-facing session, so both must carry.
@@ -481,7 +563,7 @@ mod tests {
             text: "first".into(),
             effective_ts: "2026-01-01T00:00:00Z".into(),
             session_ix: 0,
-            is_human: true,
+            origin: TurnOrigin::Human,
         }];
         a.auto_accept = false;
         let mut b = one(Lane::Main, "2026-01-01T00:00:02Z", 1, "/b");
@@ -490,7 +572,7 @@ mod tests {
             text: "second".into(),
             effective_ts: "2026-01-01T00:00:02Z".into(),
             session_ix: 0,
-            is_human: true,
+            origin: TurnOrigin::Human,
         }];
         b.auto_accept = true;
 
@@ -511,7 +593,7 @@ mod tests {
         // pushback_between would silently find nothing and Flip detection
         // would die for those transcripts with no error and no failing test
         // elsewhere: this test is the only thing pinning that behavior down.
-        use crate::model::UserText;
+        use crate::model::{TurnOrigin, UserText};
         let a = one(Lane::Main, "2026-01-01T00:00:01Z", 1, "/a");
         let mut b = one(Lane::Main, "2026-01-01T00:00:02Z", 1, "/b");
         b.user_texts = vec![UserText {
@@ -519,7 +601,7 @@ mod tests {
             text: "second transcript's user turn".into(),
             effective_ts: "2026-01-01T00:00:02Z".into(),
             session_ix: 0, // as ingest always leaves it; the merge must restamp
-            is_human: true,
+            origin: TurnOrigin::Human,
         }];
 
         let merged = merge_work_unit(vec![("a".into(), a), ("b".into(), b)]);
@@ -528,5 +610,41 @@ mod tests {
             merged.user_texts[0].session_ix, 1,
             "b's user text must carry b's slot (1), not the ingest-time default 0"
         );
+    }
+
+    #[test]
+    fn main_and_subagent_lanes_can_each_hold_task_id_1_without_colliding() {
+        // Each transcript's harness numbers task ids from 1 independently, so
+        // a subagent's task "1" and the main lane's task "1" are unrelated
+        // tasks that merely share a string id. `merge_sessions` concatenates
+        // the subagent's task_events into the main lane's without
+        // renumbering anything, so if identity were `id` alone, a later
+        // final-state replay keyed on it would silently merge these two
+        // distinct tasks into one. `lane` must keep them apart.
+        use crate::ingest::ingest_str;
+
+        let main_create = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"tool_use","id":"m1","name":"TaskCreate","input":{"subject":"Main lane task"}}]}}"#;
+        let main_result = r#"{"type":"user","timestamp":"2026-01-01T00:00:01Z","message":{"content":[{"type":"tool_result","tool_use_id":"m1"}]},"toolUseResult":{"task":{"id":"1","subject":"Main lane task"}}}"#;
+        let mut main = ingest_str(&format!("{main_create}\n{main_result}"), Lane::Main);
+        main.spawns = vec![Spawn {
+            agent_id: Some("x".into()),
+        }];
+
+        let sub_create = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"tool_use","id":"s1","name":"TaskCreate","input":{"subject":"Subagent lane task"}}]}}"#;
+        let sub_result = r#"{"type":"user","timestamp":"2026-01-01T00:00:01Z","message":{"content":[{"type":"tool_result","tool_use_id":"s1"}]},"toolUseResult":{"task":{"id":"1","subject":"Subagent lane task"}}}"#;
+        let sub = ingest_str(
+            &format!("{sub_create}\n{sub_result}"),
+            Lane::Sub("x".into()),
+        );
+
+        let merged = merge_sessions(main, vec![sub], 0);
+
+        assert_eq!(merged.task_events.len(), 2, "both tasks kept, not merged");
+        assert!(merged.task_events.iter().any(|t| t.id == "1"
+            && t.lane == Lane::Main
+            && t.subject.as_deref() == Some("Main lane task")));
+        assert!(merged.task_events.iter().any(|t| t.id == "1"
+            && t.lane == Lane::Sub("x".into())
+            && t.subject.as_deref() == Some("Subagent lane task")));
     }
 }
